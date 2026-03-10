@@ -25,7 +25,7 @@ template <typename data_t, typename kernel_t>
 __global__ void dev_apply_function(kernel_t func, uint_t count) {
   uint_t i;
 
-  i = blockIdx.x * blockDim.x + threadIdx.x;
+  i = ((uint_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < count) {
     if (func.check_conditional(i))
       func(i);
@@ -38,7 +38,7 @@ __global__ void dev_apply_function_with_cache(kernel_t func, uint_t count) {
   __shared__ thrust::complex<data_t> cache[_MAX_THD];
   uint_t i, idx;
 
-  i = blockIdx.x * blockDim.x + threadIdx.x;
+  i = ((uint_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count)
     return;
 
