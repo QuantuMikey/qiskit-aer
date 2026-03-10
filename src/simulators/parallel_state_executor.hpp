@@ -23,6 +23,77 @@
 
 #ifdef AER_MPI
 #include <mpi.h>
+#include <climits>
+#include <stdexcept>
+
+// ---------------------------------------------------------------------------
+// Safe MPI wrappers for large byte counts (fixes int32 overflow)
+//
+// MPI_Isend/MPI_Irecv take an 'int' count parameter, which overflows when
+// chunk sizes exceed ~2 GB with MPI_BYTE datatype. These wrappers use an
+// MPI derived datatype (1 MiB contiguous blocks) to reduce the element count
+// so it fits in int, while preserving the non-blocking async semantics.
+//
+// For transfers <= INT_MAX bytes, the original single MPI call is used.
+//
+// See: https://github.com/Qiskit/qiskit-aer/issues/XXXX
+// ---------------------------------------------------------------------------
+
+static inline void aer_mpi_isend(void *buf, uint_fast64_t count_bytes,
+                                 MPI_Datatype datatype, int dest, int tag,
+                                 MPI_Comm comm, MPI_Request *request) {
+  if (count_bytes <= (uint_fast64_t)INT_MAX) {
+    MPI_Isend(buf, (int)count_bytes, datatype, dest, tag, comm, request);
+  } else {
+    // Create a 1 MiB derived datatype to reduce count below INT_MAX.
+    // All Aer chunk buffers are sizeof(complex<data_t>) * 2^n bytes,
+    // which is always divisible by 1 MiB for chunks large enough to
+    // exceed INT_MAX. MPI_Type_free after Isend is safe per MPI standard:
+    // the implementation keeps the type alive until the transfer completes.
+    const int unit = 1 << 20; // 1 MiB
+    if (count_bytes % unit != 0) {
+      throw std::runtime_error(
+          "aer_mpi_isend: transfer size (" + std::to_string(count_bytes) +
+          " bytes) is not a multiple of 1 MiB");
+    }
+    uint_fast64_t num_units = count_bytes / unit;
+    if (num_units > (uint_fast64_t)INT_MAX) {
+      throw std::runtime_error(
+          "aer_mpi_isend: transfer size too large even with derived datatype");
+    }
+    MPI_Datatype bigtype;
+    MPI_Type_contiguous(unit, MPI_BYTE, &bigtype);
+    MPI_Type_commit(&bigtype);
+    MPI_Isend(buf, (int)num_units, bigtype, dest, tag, comm, request);
+    MPI_Type_free(&bigtype);
+  }
+}
+
+static inline void aer_mpi_irecv(void *buf, uint_fast64_t count_bytes,
+                                 MPI_Datatype datatype, int source, int tag,
+                                 MPI_Comm comm, MPI_Request *request) {
+  if (count_bytes <= (uint_fast64_t)INT_MAX) {
+    MPI_Irecv(buf, (int)count_bytes, datatype, source, tag, comm, request);
+  } else {
+    const int unit = 1 << 20; // 1 MiB
+    if (count_bytes % unit != 0) {
+      throw std::runtime_error(
+          "aer_mpi_irecv: transfer size (" + std::to_string(count_bytes) +
+          " bytes) is not a multiple of 1 MiB");
+    }
+    uint_fast64_t num_units = count_bytes / unit;
+    if (num_units > (uint_fast64_t)INT_MAX) {
+      throw std::runtime_error(
+          "aer_mpi_irecv: transfer size too large even with derived datatype");
+    }
+    MPI_Datatype bigtype;
+    MPI_Type_contiguous(unit, MPI_BYTE, &bigtype);
+    MPI_Type_commit(&bigtype);
+    MPI_Irecv(buf, (int)num_units, bigtype, source, tag, comm, request);
+    MPI_Type_free(&bigtype);
+  }
+}
+
 #endif
 
 namespace AER {
@@ -1314,13 +1385,13 @@ void ParallelStateExecutor<state_t>::apply_chunk_swap(const reg_t &qubits) {
         auto pRecv = Base::states_[iLocalChunk - Base::global_state_index_]
                          .qreg()
                          .recv_buffer(sizeRecv);
-        MPI_Irecv(pRecv, sizeRecv, MPI_BYTE, iProc, iPair,
+        aer_mpi_irecv(pRecv, sizeRecv, MPI_BYTE, iProc, iPair,
                   Base::distributed_comm_, &reqRecv);
 
         auto pSend = Base::states_[iLocalChunk - Base::global_state_index_]
                          .qreg()
                          .send_buffer(sizeSend);
-        MPI_Isend(pSend, sizeSend, MPI_BYTE, iProc, iPair,
+        aer_mpi_isend(pSend, sizeSend, MPI_BYTE, iProc, iPair,
                   Base::distributed_comm_, &reqSend);
 
         MPI_Wait(&reqSend, &st);
@@ -1461,19 +1532,19 @@ void ParallelStateExecutor<state_t>::apply_multi_chunk_swap(
 
         if (iProc1 == Base::distributed_rank_) {
           auto pRecv = Base::states_[iChunk1].qreg().recv_buffer(sizeRecv);
-          MPI_Irecv(pRecv + offset2, (sizeRecv >> nswap), MPI_BYTE, iProc2, tid,
+          aer_mpi_irecv(pRecv + offset2, (sizeRecv >> nswap), MPI_BYTE, iProc2, tid,
                     Base::distributed_comm_, &reqRecv[i2]);
 
           auto pSend = Base::states_[iChunk1].qreg().send_buffer(sizeSend);
-          MPI_Isend(pSend + offset2, (sizeSend >> nswap), MPI_BYTE, iProc2, tid,
+          aer_mpi_isend(pSend + offset2, (sizeSend >> nswap), MPI_BYTE, iProc2, tid,
                     Base::distributed_comm_, &reqSend[i2]);
         } else {
           auto pRecv = Base::states_[iChunk2].qreg().recv_buffer(sizeRecv);
-          MPI_Irecv(pRecv + offset1, (sizeRecv >> nswap), MPI_BYTE, iProc1, tid,
+          aer_mpi_irecv(pRecv + offset1, (sizeRecv >> nswap), MPI_BYTE, iProc1, tid,
                     Base::distributed_comm_, &reqRecv[i1]);
 
           auto pSend = Base::states_[iChunk2].qreg().send_buffer(sizeSend);
-          MPI_Isend(pSend + offset1, (sizeSend >> nswap), MPI_BYTE, iProc1, tid,
+          aer_mpi_isend(pSend + offset1, (sizeSend >> nswap), MPI_BYTE, iProc1, tid,
                     Base::distributed_comm_, &reqSend[i1]);
         }
 #endif
@@ -1677,13 +1748,13 @@ void ParallelStateExecutor<state_t>::apply_chunk_x(const uint_t qubit) {
         auto pSend = Base::states_[iLocalChunk - Base::global_state_index_]
                          .qreg()
                          .send_buffer(sizeSend);
-        MPI_Isend(pSend, sizeSend, MPI_BYTE, iProc, iPair,
+        aer_mpi_isend(pSend, sizeSend, MPI_BYTE, iProc, iPair,
                   Base::distributed_comm_, &reqSend);
 
         auto pRecv = Base::states_[iLocalChunk - Base::global_state_index_]
                          .qreg()
                          .recv_buffer(sizeRecv);
-        MPI_Irecv(pRecv, sizeRecv, MPI_BYTE, iProc, iPair,
+        aer_mpi_irecv(pRecv, sizeRecv, MPI_BYTE, iProc, iPair,
                   Base::distributed_comm_, &reqRecv);
 
         MPI_Wait(&reqSend, &st);
@@ -1710,7 +1781,7 @@ void ParallelStateExecutor<state_t>::send_chunk(uint_t local_chunk_index,
   iProc = get_process_by_chunk(global_pair_index);
 
   auto pSend = Base::states_[local_chunk_index].qreg().send_buffer(sizeSend);
-  MPI_Isend(pSend, sizeSend, MPI_BYTE, iProc,
+  aer_mpi_isend(pSend, sizeSend, MPI_BYTE, iProc,
             local_chunk_index + Base::global_state_index_,
             Base::distributed_comm_, &reqSend);
 
@@ -1732,7 +1803,7 @@ void ParallelStateExecutor<state_t>::recv_chunk(uint_t local_chunk_index,
   iProc = get_process_by_chunk(global_pair_index);
 
   auto pRecv = Base::states_[local_chunk_index].qreg().recv_buffer(sizeRecv);
-  MPI_Irecv(pRecv, sizeRecv, MPI_BYTE, iProc, global_pair_index,
+  aer_mpi_irecv(pRecv, sizeRecv, MPI_BYTE, iProc, global_pair_index,
             Base::distributed_comm_, &reqRecv);
 
   MPI_Wait(&reqRecv, &st);
@@ -1750,7 +1821,7 @@ void ParallelStateExecutor<state_t>::send_data(data_t *pSend, uint_t size,
 
   iProc = get_process_by_chunk(pairid);
 
-  MPI_Isend(pSend, size * sizeof(data_t), MPI_BYTE, iProc, myid,
+  aer_mpi_isend(pSend, (uint_fast64_t)size * sizeof(data_t), MPI_BYTE, iProc, myid,
             Base::distributed_comm_, &reqSend);
 
   MPI_Wait(&reqSend, &st);
@@ -1768,7 +1839,7 @@ void ParallelStateExecutor<state_t>::recv_data(data_t *pRecv, uint_t size,
 
   iProc = get_process_by_chunk(pairid);
 
-  MPI_Irecv(pRecv, size * sizeof(data_t), MPI_BYTE, iProc, pairid,
+  aer_mpi_irecv(pRecv, (uint_fast64_t)size * sizeof(data_t), MPI_BYTE, iProc, pairid,
             Base::distributed_comm_, &reqRecv);
 
   MPI_Wait(&reqRecv, &st);
