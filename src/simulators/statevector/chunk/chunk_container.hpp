@@ -435,8 +435,19 @@ void ChunkContainer<data_t>::Execute(Function func, uint_t iChunk,
           nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
           nt = QV_CUDA_NUM_THREADS;
         }
-        dev_apply_function_with_cache<data_t, Function>
-            <<<nb, nt, 0, strm>>>(func, ntotal);
+        // Use 2D grid when nb * nt would overflow unsigned 32-bit.
+        // CUDA/HIP compute gridDim.x * blockDim.x in 32-bit internally;
+        // overflow to 0 causes hipErrorInvalidConfiguration.
+        if (nb > (0xFFFFFFFFull / nt)) {
+          uint_t nb_x = 0xFFFFFFFFull / nt;
+          uint_t nb_y = (nb + nb_x - 1) / nb_x;
+          dim3 grid((unsigned int)nb_x, (unsigned int)nb_y, 1);
+          dev_apply_function_with_cache<data_t, Function>
+              <<<grid, nt, 0, strm>>>(func, ntotal);
+        } else {
+          dev_apply_function_with_cache<data_t, Function>
+              <<<nb, nt, 0, strm>>>(func, ntotal);
+        }
       }
     } else {
       nt = count * func.size(chunk_bits_);
@@ -447,7 +458,15 @@ void ChunkContainer<data_t>::Execute(Function func, uint_t iChunk,
           nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
           nt = QV_CUDA_NUM_THREADS;
         }
-        dev_apply_function<data_t, Function><<<nb, nt, 0, strm>>>(func, ntotal);
+        // Use 2D grid when nb * nt would overflow unsigned 32-bit.
+        if (nb > (0xFFFFFFFFull / nt)) {
+          uint_t nb_x = 0xFFFFFFFFull / nt;
+          uint_t nb_y = (nb + nb_x - 1) / nb_x;
+          dim3 grid((unsigned int)nb_x, (unsigned int)nb_y, 1);
+          dev_apply_function<data_t, Function><<<grid, nt, 0, strm>>>(func, ntotal);
+        } else {
+          dev_apply_function<data_t, Function><<<nb, nt, 0, strm>>>(func, ntotal);
+        }
       }
     }
     cudaError_t err = cudaGetLastError();
