@@ -531,8 +531,25 @@ void ChunkContainer<data_t>::ExecuteSum(double *pSum, Function func,
             nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
             nt = QV_CUDA_NUM_THREADS;
           }
-          dev_apply_function_sum_with_cache<data_t, Function>
-              <<<nb, nt, 0, strm>>>(buf, func, buf_size, ntotal);
+          // When nb * nt would overflow 32-bit, fall back to 2D per-chunk
+          // grid (same approach as the !pSum path), then sum across chunks
+          // on the host.
+          if (nb > (0xFFFFFFFFull / nt)) {
+            buf_size = reduce_buffer_size();
+            nt = 1ull << chunk_bits_;
+            ntotal = nt * count;
+            nb = 1;
+            if (nt > QV_CUDA_NUM_THREADS) {
+              nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
+              nt = QV_CUDA_NUM_THREADS;
+            }
+            dim3 grid(nb, count, 1);
+            dev_apply_function_sum_with_cache<data_t, Function>
+                <<<grid, nt, 0, strm>>>(buf, func, buf_size, ntotal);
+          } else {
+            dev_apply_function_sum_with_cache<data_t, Function>
+                <<<nb, nt, 0, strm>>>(buf, func, buf_size, ntotal);
+          }
         }
       } else {
         nt = size;
@@ -542,8 +559,25 @@ void ChunkContainer<data_t>::ExecuteSum(double *pSum, Function func,
             nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
             nt = QV_CUDA_NUM_THREADS;
           }
-          dev_apply_function_sum<data_t, Function>
-              <<<nb, nt, 0, strm>>>(buf, func, buf_size, ntotal);
+          // When nb * nt would overflow 32-bit, fall back to 2D per-chunk
+          // grid (same approach as the !pSum path), then sum across chunks
+          // on the host.
+          if (nb > (0xFFFFFFFFull / nt)) {
+            buf_size = reduce_buffer_size();
+            nt = func.size(chunk_bits_);
+            ntotal = nt * count;
+            nb = 1;
+            if (nt > QV_CUDA_NUM_THREADS) {
+              nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
+              nt = QV_CUDA_NUM_THREADS;
+            }
+            dim3 grid(nb, count, 1);
+            dev_apply_function_sum<data_t, Function>
+                <<<grid, nt, 0, strm>>>(buf, func, buf_size, ntotal);
+          } else {
+            dev_apply_function_sum<data_t, Function>
+                <<<nb, nt, 0, strm>>>(buf, func, buf_size, ntotal);
+          }
         }
       }
       cudaError_t err = cudaGetLastError();
@@ -562,7 +596,12 @@ void ChunkContainer<data_t>::ExecuteSum(double *pSum, Function func,
           nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
           nt = QV_CUDA_NUM_THREADS;
         }
-        dev_reduce_sum<<<nb, nt, 0, strm>>>(buf, n, buf_size);
+        if (buf_size > 0) {
+          dim3 grid(nb, count, 1);
+          dev_reduce_sum<<<grid, nt, 0, strm>>>(buf, n, buf_size);
+        } else {
+          dev_reduce_sum<<<nb, nt, 0, strm>>>(buf, n, buf_size);
+        }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -572,7 +611,22 @@ void ChunkContainer<data_t>::ExecuteSum(double *pSum, Function func,
           throw std::runtime_error(str.str());
         }
       }
-      cudaMemcpyAsync(pSum, buf, sizeof(double), cudaMemcpyDeviceToHost, strm);
+      if (buf_size > 0) {
+        // 2D per-chunk fallback: sum per-chunk results on host
+        // Each chunk's result is at buf[buf_size * c]
+        std::vector<double> chunk_sums(count);
+        for (uint_t c = 0; c < count; c++) {
+          cudaMemcpyAsync(&chunk_sums[c],
+                          buf + buf_size * c,
+                          sizeof(double), cudaMemcpyDeviceToHost, strm);
+        }
+        cudaStreamSynchronize(strm);
+        *pSum = 0.0;
+        for (uint_t c = 0; c < count; c++)
+          *pSum += chunk_sums[c];
+      } else {
+        cudaMemcpyAsync(pSum, buf, sizeof(double), cudaMemcpyDeviceToHost, strm);
+      }
     } else {
       buf_size = reduce_buffer_size();
 
@@ -711,8 +765,23 @@ void ChunkContainer<data_t>::ExecuteSum2(double *pSum, Function func,
           nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
           nt = QV_CUDA_NUM_THREADS;
         }
-        dev_apply_function_sum_complex<data_t, Function>
-            <<<nb, nt, 0, strm>>>(buf, func, buf_size, ntotal, init);
+        // When nb * nt would overflow 32-bit, fall back to 2D per-chunk grid
+        if (nb > (0xFFFFFFFFull / nt)) {
+          buf_size = reduce_buffer_size() / 2;
+          nt = func.size(chunk_bits_);
+          ntotal = nt * count;
+          nb = 1;
+          if (nt > QV_CUDA_NUM_THREADS) {
+            nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
+            nt = QV_CUDA_NUM_THREADS;
+          }
+          dim3 grid(nb, count, 1);
+          dev_apply_function_sum_complex<data_t, Function>
+              <<<grid, nt, 0, strm>>>(buf, func, buf_size, ntotal, init);
+        } else {
+          dev_apply_function_sum_complex<data_t, Function>
+              <<<nb, nt, 0, strm>>>(buf, func, buf_size, ntotal, init);
+        }
       }
       cudaError_t err = cudaGetLastError();
       if (err != cudaSuccess) {
@@ -730,7 +799,12 @@ void ChunkContainer<data_t>::ExecuteSum2(double *pSum, Function func,
           nb = (nt + QV_CUDA_NUM_THREADS - 1) / QV_CUDA_NUM_THREADS;
           nt = QV_CUDA_NUM_THREADS;
         }
-        dev_reduce_sum_complex<<<nb, nt, 0, strm>>>(buf, n, buf_size);
+        if (buf_size > 0) {
+          dim3 grid(nb, count, 1);
+          dev_reduce_sum_complex<<<grid, nt, 0, strm>>>(buf, n, buf_size);
+        } else {
+          dev_reduce_sum_complex<<<nb, nt, 0, strm>>>(buf, n, buf_size);
+        }
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -740,8 +814,24 @@ void ChunkContainer<data_t>::ExecuteSum2(double *pSum, Function func,
           throw std::runtime_error(str.str());
         }
       }
-      cudaMemcpyAsync(pSum, buf, sizeof(double) * 2, cudaMemcpyDeviceToHost,
-                      strm);
+      if (buf_size > 0) {
+        // 2D per-chunk fallback: sum per-chunk results on host
+        std::vector<thrust::complex<double>> chunk_sums(count);
+        for (uint_t c = 0; c < count; c++) {
+          cudaMemcpyAsync(&chunk_sums[c],
+                          buf + buf_size * c,
+                          sizeof(thrust::complex<double>),
+                          cudaMemcpyDeviceToHost, strm);
+        }
+        cudaStreamSynchronize(strm);
+        thrust::complex<double> total = 0.0;
+        for (uint_t c = 0; c < count; c++)
+          total += chunk_sums[c];
+        ((thrust::complex<double> *)pSum)[0] = total;
+      } else {
+        cudaMemcpyAsync(pSum, buf, sizeof(double) * 2, cudaMemcpyDeviceToHost,
+                        strm);
+      }
     } else {
       buf_size = reduce_buffer_size() / 2;
 
