@@ -1123,7 +1123,7 @@ dev_apply_register_blocked_gates(thrust::complex<data_t> *data, int num_gates,
   int nElem;
   thrust::complex<double> *matrix_load;
 
-  i = blockIdx.x * blockDim.x + threadIdx.x;
+  i = ((uint_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
   laneID = i & (_WS - 1);
 
   // index for this thread
@@ -1218,7 +1218,7 @@ dev_apply_shared_memory_blocked_gates(thrust::complex<data_t> *data,
   int nElem;
   thrust::complex<double> *matrix_load;
 
-  i = blockIdx.x * blockDim.x + threadIdx.x;
+  i = ((uint_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
 
   laneID = threadIdx.x;
 
@@ -1351,19 +1351,44 @@ void DeviceChunkContainer<data_t>::apply_blocked_gates(uint_t iChunk) {
 
   if (num_blocked_qubits_[iBlock] < 6) {
     // using register blocking (<=5 qubits)
-    dev_apply_register_blocked_gates<data_t>
-        <<<nb, nt,
-           num_blocked_matrix_[iChunk] * sizeof(thrust::complex<double>),
-           stream(iChunk)>>>(chunk_pointer(iChunk), num_blocked_gates_[iBlock],
-                             num_blocked_qubits_[iBlock],
-                             num_blocked_matrix_[iBlock], pQubits, pParams,
-                             pMatrix);
+    // Use 2D grid when nb * nt would overflow unsigned 32-bit.
+    if (nb > (0xFFFFFFFFull / nt)) {
+      uint_t nb_x = 0xFFFFFFFFull / nt;
+      uint_t nb_y = (nb + nb_x - 1) / nb_x;
+      dim3 grid((unsigned int)nb_x, (unsigned int)nb_y, 1);
+      dev_apply_register_blocked_gates<data_t>
+          <<<grid, nt,
+             num_blocked_matrix_[iChunk] * sizeof(thrust::complex<double>),
+             stream(iChunk)>>>(chunk_pointer(iChunk), num_blocked_gates_[iBlock],
+                               num_blocked_qubits_[iBlock],
+                               num_blocked_matrix_[iBlock], pQubits, pParams,
+                               pMatrix);
+    } else {
+      dev_apply_register_blocked_gates<data_t>
+          <<<nb, nt,
+             num_blocked_matrix_[iChunk] * sizeof(thrust::complex<double>),
+             stream(iChunk)>>>(chunk_pointer(iChunk), num_blocked_gates_[iBlock],
+                               num_blocked_qubits_[iBlock],
+                               num_blocked_matrix_[iBlock], pQubits, pParams,
+                               pMatrix);
+    }
   } else {
     // using shared memory blocking (<=10 qubits)
-    dev_apply_shared_memory_blocked_gates<data_t>
-        <<<nb, nt, 1024 * sizeof(thrust::complex<data_t>), stream(iChunk)>>>(
-            chunk_pointer(iChunk), num_blocked_gates_[iBlock],
-            num_blocked_qubits_[iBlock], pQubits, pParams, pMatrix);
+    // Use 2D grid when nb * nt would overflow unsigned 32-bit.
+    if (nb > (0xFFFFFFFFull / nt)) {
+      uint_t nb_x = 0xFFFFFFFFull / nt;
+      uint_t nb_y = (nb + nb_x - 1) / nb_x;
+      dim3 grid((unsigned int)nb_x, (unsigned int)nb_y, 1);
+      dev_apply_shared_memory_blocked_gates<data_t>
+          <<<grid, nt, 1024 * sizeof(thrust::complex<data_t>), stream(iChunk)>>>(
+              chunk_pointer(iChunk), num_blocked_gates_[iBlock],
+              num_blocked_qubits_[iBlock], pQubits, pParams, pMatrix);
+    } else {
+      dev_apply_shared_memory_blocked_gates<data_t>
+          <<<nb, nt, 1024 * sizeof(thrust::complex<data_t>), stream(iChunk)>>>(
+              chunk_pointer(iChunk), num_blocked_gates_[iBlock],
+              num_blocked_qubits_[iBlock], pQubits, pParams, pMatrix);
+    }
   }
 
 #endif
