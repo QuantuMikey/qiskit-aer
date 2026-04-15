@@ -520,7 +520,23 @@ if(AER_THRUST_SUPPORTED)
         message(STATUS "cotengra ${COTENGRA_VERSION} found")
 
         list(APPEND ROCM_EXTRA_DEFS -DAER_HIPTENSOR)
-        list(APPEND AER_LIBRARIES hiptensor::hiptensor)
+
+        # hipTensor target name varies by ROCm version.
+        # ROCm 6.4.x exports 'hiptensor' not 'hiptensor::hiptensor'.
+        if(TARGET hiptensor::hiptensor)
+          list(APPEND AER_LIBRARIES hiptensor::hiptensor)
+        elseif(TARGET hiptensor)
+          list(APPEND AER_LIBRARIES hiptensor)
+        else()
+          find_library(HIPTENSOR_LIB hiptensor
+            HINTS ${ROCM_PATH}/lib ${ROCM_PATH}/hiptensor/lib)
+          if(HIPTENSOR_LIB)
+            list(APPEND AER_LIBRARIES ${HIPTENSOR_LIB})
+            include_directories(${ROCM_PATH}/include)
+          else()
+            message(FATAL_ERROR "hipTensor package found but library not locatable")
+          endif()
+        endif()
       else()
         message(WARNING
           "AER_ENABLE_HIPTENSOR is set but hipTensor was not found. "
