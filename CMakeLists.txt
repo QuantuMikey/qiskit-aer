@@ -521,6 +521,12 @@ if(AER_THRUST_SUPPORTED)
 
         list(APPEND ROCM_EXTRA_DEFS -DAER_HIPTENSOR)
 
+        # hipTensor 1.5.0 headers use C++17 features (std::is_same_v,
+        # if constexpr) in internal/types_ext.hpp.  Override the C++14
+        # default set by Conan.
+        set(CMAKE_CXX_STANDARD 17)
+        set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
         # hipTensor target name varies by ROCm version.
         # ROCm 6.4.x exports 'hiptensor' not 'hiptensor::hiptensor'.
         if(TARGET hiptensor::hiptensor)
