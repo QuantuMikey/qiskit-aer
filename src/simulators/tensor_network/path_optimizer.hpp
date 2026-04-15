@@ -7,10 +7,6 @@
  * This code is licensed under the Apache License, Version 2.0. You may
  * obtain a copy of this license in the LICENSE.txt file in the root directory
  * of this source tree or at http://www.apache.org/licenses/LICENSE-2.0.
- *
- * Any modifications or derivative works of this code must retain this
- * copyright notice, and modified files need to carry a notice indicating
- * that they have been altered from the originals.
  */
 
 #ifndef _path_optimizer_hpp_
@@ -42,10 +38,6 @@ namespace py = pybind11;
 namespace AER {
 namespace TensorNetwork {
 
-//=============================================================================
-// Diagnostic logging
-//=============================================================================
-
 static bool path_verbose() {
   static bool checked = false;
   static bool enabled = false;
@@ -58,7 +50,7 @@ static bool path_verbose() {
 }
 
 //=============================================================================
-// 1. Data structures
+// Data structures
 //=============================================================================
 
 struct TensorSpec {
@@ -118,33 +110,27 @@ struct ContractionPlan {
     int64_t flops_bits;
     std::memcpy(&flops_bits, &total_flops, sizeof(double));
     data.push_back(flops_bits);
-
     data.push_back(peak_intermediate_elements);
 
     for (size_t i = 0; i < steps.size(); i++) {
       data.push_back(static_cast<int64_t>(steps[i].left));
       data.push_back(static_cast<int64_t>(steps[i].right));
     }
-
     for (size_t i = 0; i < sliced.size(); i++) {
       data.push_back(static_cast<int64_t>(sliced[i].mode));
       data.push_back(sliced[i].extent);
     }
-
     return data;
   }
 
   static ContractionPlan deserialize(const std::vector<int64_t> &data) {
     ContractionPlan plan;
     size_t pos = 0;
-
     int64_t num_steps = data[pos++];
     int64_t num_sliced_modes = data[pos++];
     plan.num_slices = static_cast<uint64_t>(data[pos++]);
-
     std::memcpy(&plan.total_flops, &data[pos], sizeof(double));
     pos++;
-
     plan.peak_intermediate_elements = data[pos++];
 
     plan.steps.resize(num_steps);
@@ -152,32 +138,31 @@ struct ContractionPlan {
       plan.steps[i].left = static_cast<uint64_t>(data[pos++]);
       plan.steps[i].right = static_cast<uint64_t>(data[pos++]);
     }
-
     plan.sliced.resize(num_sliced_modes);
     for (int64_t i = 0; i < num_sliced_modes; i++) {
       plan.sliced[i].mode = static_cast<int32_t>(data[pos++]);
       plan.sliced[i].extent = data[pos++];
     }
-
     return plan;
   }
 };
 
 //=============================================================================
-// 2. PathOptimizer abstract interface
+// PathOptimizer interface
 //=============================================================================
 
 class PathOptimizer {
 public:
   virtual ~PathOptimizer() = default;
-
   virtual ContractionPlan find_path(const NetworkDescription &network,
                                     uint64_t memory_limit_bytes,
                                     uint64_t seed) = 0;
 };
 
 //=============================================================================
-// 3. CotengPathOptimizer — cotengra HyperOptimizer via pybind11
+// CotengPathOptimizer — cotengra via pybind11
+//   FIX: cotengrust requires string mode labels, not int.
+//   We convert int32_t modes to str at the Python boundary.
 //=============================================================================
 
 #ifdef AER_HIPTENSOR
@@ -201,24 +186,35 @@ public:
                             uint64_t memory_limit_bytes,
                             uint64_t seed) override {
     py::gil_scoped_acquire gil;
-
     auto ctg = py::module_::import("cotengra");
 
+    // Convert int mode labels to strings — cotengrust requires PyString
     py::list inputs;
     for (size_t i = 0; i < network.tensors.size(); i++) {
-      py::tuple modes = py::cast(network.tensors[i].modes);
-      inputs.append(modes);
+      py::list mode_strs;
+      for (size_t j = 0; j < network.tensors[i].modes.size(); j++) {
+        mode_strs.append(py::str(std::to_string(network.tensors[i].modes[j])));
+      }
+      inputs.append(py::tuple(mode_strs));
     }
-    py::tuple output = py::cast(network.output_modes);
 
+    py::list output_strs;
+    for (size_t i = 0; i < network.output_modes.size(); i++) {
+      output_strs.append(py::str(std::to_string(network.output_modes[i])));
+    }
+    py::tuple output = py::tuple(output_strs);
+
+    // size_dict: string keys
+    py::dict sizes;
     auto size_dict = network.build_size_dict();
-    py::dict sizes = py::cast(size_dict);
+    for (auto it = size_dict.begin(); it != size_dict.end(); ++it) {
+      sizes[py::str(std::to_string(it->first))] = it->second;
+    }
 
     uint64_t target_elements = memory_limit_bytes / element_size_bytes_;
 
     py::dict slicing_opts;
     slicing_opts["target_size"] = target_elements;
-
     py::dict reconf_opts;
 
     py::object tree;
@@ -258,11 +254,14 @@ private:
       plan.steps.push_back(step);
     }
 
+    // sliced_inds: keys are strings (mode labels), convert back to int
     py::dict sliced_inds = tree.attr("sliced_inds");
     plan.num_slices = 1;
     for (auto &item : sliced_inds) {
       SliceInfo si;
-      si.mode = item.first.cast<int32_t>();
+      // Mode label is a string — convert back to int32_t
+      std::string mode_str = item.first.cast<std::string>();
+      si.mode = static_cast<int32_t>(std::stoi(mode_str));
       auto slice_info_obj = item.second;
       si.extent = slice_info_obj.attr("size").cast<int64_t>();
       plan.sliced.push_back(si);
@@ -290,7 +289,7 @@ private:
 #endif // AER_HIPTENSOR
 
 //=============================================================================
-// 4. GreedyPathOptimizer — C++ fallback, zero dependencies
+// GreedyPathOptimizer — C++ fallback
 //=============================================================================
 
 class GreedyPathOptimizer : public PathOptimizer {
@@ -310,12 +309,10 @@ public:
     for (int restart = 0; restart < num_restarts_; restart++) {
       ContractionPlan candidate =
           greedy_once(network, size_dict, seed + restart);
-      if (candidate.total_flops < best.total_flops) {
+      if (candidate.total_flops < best.total_flops)
         best = candidate;
-      }
     }
 
-    // Apply slicing if peak intermediate exceeds memory limit
     best.num_slices = 1;
     int64_t element_budget =
         static_cast<int64_t>(memory_limit_bytes / 16);
@@ -351,7 +348,6 @@ public:
               num_restarts_, best.steps.size(), best.sliced.size(),
               (unsigned long)best.num_slices, best.total_flops);
     }
-
     return best;
   }
 
@@ -364,9 +360,8 @@ private:
 
     std::vector<TensorSpec> working;
     working.reserve(network.tensors.size() * 2);
-    for (size_t i = 0; i < network.tensors.size(); i++) {
+    for (size_t i = 0; i < network.tensors.size(); i++)
       working.push_back(network.tensors[i]);
-    }
 
     std::vector<bool> alive(working.capacity(), false);
     for (size_t i = 0; i < network.tensors.size(); i++)
@@ -382,27 +377,18 @@ private:
       double best_cost = std::numeric_limits<double>::max();
 
       for (size_t i = 0; i < working.size(); i++) {
-        if (!alive[i])
-          continue;
+        if (!alive[i]) continue;
         for (size_t j = i + 1; j < working.size(); j++) {
-          if (!alive[j])
-            continue;
+          if (!alive[j]) continue;
 
           bool share = false;
-          for (size_t mi = 0; mi < working[i].modes.size(); mi++) {
-            for (size_t mj = 0; mj < working[j].modes.size(); mj++) {
-              if (working[i].modes[mi] == working[j].modes[mj]) {
+          for (size_t mi = 0; mi < working[i].modes.size() && !share; mi++)
+            for (size_t mj = 0; mj < working[j].modes.size() && !share; mj++)
+              if (working[i].modes[mi] == working[j].modes[mj])
                 share = true;
-                break;
-              }
-            }
-            if (share)
-              break;
-          }
 
           double cost = compute_cost(working[i], working[j], size_dict);
-          if (!share)
-            cost *= 1e6;
+          if (!share) cost *= 1e6;
           cost += noise(rng);
 
           if (cost < best_cost) {
@@ -425,26 +411,22 @@ private:
 
       alive[best_i] = false;
       alive[best_j] = false;
-      if (working.size() < working.capacity()) {
-        working.push_back(result);
-        alive[working.size() - 1] = true;
-      } else {
-        working.push_back(result);
+      working.push_back(result);
+      if (alive.size() < working.size())
         alive.push_back(true);
-      }
+      else
+        alive[working.size() - 1] = true;
     }
-
     return plan;
   }
 
   static double compute_cost(const TensorSpec &a, const TensorSpec &b,
-                             const std::map<int32_t, int64_t> &size_dict) {
+                             const std::map<int32_t, int64_t> &) {
     std::map<int32_t, int64_t> all_modes;
     for (size_t i = 0; i < a.modes.size(); i++)
       all_modes[a.modes[i]] = a.extents[i];
     for (size_t i = 0; i < b.modes.size(); i++)
       all_modes[b.modes[i]] = b.extents[i];
-
     double cost = 1.0;
     for (auto it = all_modes.begin(); it != all_modes.end(); ++it)
       cost *= static_cast<double>(it->second);
@@ -453,25 +435,18 @@ private:
 
   static TensorSpec contract_spec(const TensorSpec &a, const TensorSpec &b) {
     TensorSpec result;
-
     std::vector<int32_t> shared;
-    for (size_t i = 0; i < a.modes.size(); i++) {
-      for (size_t j = 0; j < b.modes.size(); j++) {
+    for (size_t i = 0; i < a.modes.size(); i++)
+      for (size_t j = 0; j < b.modes.size(); j++)
         if (a.modes[i] == b.modes[j]) {
           shared.push_back(a.modes[i]);
           break;
         }
-      }
-    }
 
     for (size_t i = 0; i < a.modes.size(); i++) {
       bool is_shared = false;
-      for (size_t s = 0; s < shared.size(); s++) {
-        if (a.modes[i] == shared[s]) {
-          is_shared = true;
-          break;
-        }
-      }
+      for (size_t s = 0; s < shared.size(); s++)
+        if (a.modes[i] == shared[s]) { is_shared = true; break; }
       if (!is_shared) {
         result.modes.push_back(a.modes[i]);
         result.extents.push_back(a.extents[i]);
@@ -479,24 +454,19 @@ private:
     }
     for (size_t i = 0; i < b.modes.size(); i++) {
       bool is_shared = false;
-      for (size_t s = 0; s < shared.size(); s++) {
-        if (b.modes[i] == shared[s]) {
-          is_shared = true;
-          break;
-        }
-      }
+      for (size_t s = 0; s < shared.size(); s++)
+        if (b.modes[i] == shared[s]) { is_shared = true; break; }
       if (!is_shared) {
         result.modes.push_back(b.modes[i]);
         result.extents.push_back(b.extents[i]);
       }
     }
-
     return result;
   }
 };
 
 //=============================================================================
-// 5. MPIParallelPathOptimizer
+// MPIParallelPathOptimizer
 //=============================================================================
 
 #ifdef AER_MPI
@@ -520,49 +490,35 @@ public:
     ContractionPlan local =
         inner_->find_path(network, memory_limit_bytes, seed + rank);
 
-    struct {
-      double cost;
-      int rank;
-    } local_result, global_result;
+    struct { double cost; int rank; } local_result, global_result;
     local_result.cost = local.total_flops;
     local_result.rank = rank;
-
     MPI_Allreduce(&local_result, &global_result, 1, MPI_DOUBLE_INT,
                   MPI_MINLOC, comm_);
 
-    if (path_verbose()) {
-      if (rank == 0) {
-        fprintf(stderr,
-                "[AER_TN_PATH] MPI parallel search: %d ranks, "
-                "best path from rank %d with %.2e FLOPs "
-                "(local rank 0 had %.2e FLOPs)\n",
-                size, global_result.rank, global_result.cost,
-                local.total_flops);
-      }
+    if (path_verbose() && rank == 0) {
+      fprintf(stderr,
+              "[AER_TN_PATH] MPI: %d ranks, best from rank %d (%.2e FLOPs)\n",
+              size, global_result.rank, global_result.cost);
     }
 
     std::vector<int64_t> path_data;
     int path_size = 0;
-
     if (rank == global_result.rank) {
       path_data = local.serialize();
       path_size = static_cast<int>(path_data.size());
     }
-
     MPI_Bcast(&path_size, 1, MPI_INT, global_result.rank, comm_);
     path_data.resize(path_size);
     MPI_Bcast(path_data.data(), path_size, MPI_INT64_T, global_result.rank,
               comm_);
-
     return ContractionPlan::deserialize(path_data);
   }
 };
 
 #endif // AER_MPI
 
-//------------------------------------------------------------------------------
-} // end namespace TensorNetwork
-} // end namespace AER
-//------------------------------------------------------------------------------
+} // namespace TensorNetwork
+} // namespace AER
 
 #endif // _path_optimizer_hpp_
