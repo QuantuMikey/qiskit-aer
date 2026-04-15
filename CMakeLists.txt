@@ -491,6 +491,42 @@ if(AER_THRUST_SUPPORTED)
     if(AER_ENABLE_CUQUANTUM)
       message(WARNING "Implementation of cuQuantum is not available for ROCm builds.")
     endif()
+
+    # --- hipTensor support for tensor network simulation on AMD GPUs ---
+    if(NOT DEFINED AER_ENABLE_HIPTENSOR)
+      if(DEFINED ENV{AER_ENABLE_HIPTENSOR})
+        set(AER_ENABLE_HIPTENSOR $ENV{AER_ENABLE_HIPTENSOR})
+      endif()
+    endif()
+
+    if(AER_ENABLE_HIPTENSOR)
+      find_package(hiptensor QUIET)
+      if(hiptensor_FOUND)
+        message(STATUS "hipTensor found — enabling tensor network support for ROCm")
+
+        # Verify cotengra is available (required for contraction path optimization)
+        execute_process(
+          COMMAND ${Python_EXECUTABLE} -c
+            "import cotengra; print(cotengra.__version__)"
+          RESULT_VARIABLE COTENGRA_RESULT
+          OUTPUT_VARIABLE COTENGRA_VERSION
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+          ERROR_QUIET)
+        if(NOT COTENGRA_RESULT EQUAL 0)
+          message(FATAL_ERROR
+            "AER_ENABLE_HIPTENSOR requires cotengra for contraction path "
+            "optimization. Install with: pip install cotengra>=0.7.0")
+        endif()
+        message(STATUS "cotengra ${COTENGRA_VERSION} found")
+
+        list(APPEND ROCM_EXTRA_DEFS -DAER_HIPTENSOR)
+        list(APPEND AER_LIBRARIES hiptensor::hiptensor)
+      else()
+        message(WARNING
+          "AER_ENABLE_HIPTENSOR is set but hipTensor was not found. "
+          "Tensor network support will not be available for ROCm builds.")
+      endif()
+    endif()
 	
 	else()
 		message(STATUS "No Thrust supported backend")

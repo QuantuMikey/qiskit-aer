@@ -330,7 +330,8 @@ void Controller::set_config(const Config &config) {
   }
 
   if (method_ == Method::tensor_network) {
-#if defined(AER_THRUST_CUDA) && defined(AER_CUTENSORNET)
+#if (defined(AER_THRUST_CUDA) && defined(AER_CUTENSORNET)) || \
+    (defined(AER_THRUST_ROCM) && defined(AER_HIPTENSOR))
     if (sim_device_ != Device::GPU)
 #endif
       throw std::runtime_error(

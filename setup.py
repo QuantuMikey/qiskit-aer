@@ -76,6 +76,15 @@ if ADD_CUDA_REQUIREMENTS and "gpu" in PACKAGE_NAME and "rocm" not in PACKAGE_NAM
     requirements.extend(requirements_cuda)
     classifiers.extend(classifiers_cuda)
 
+# ROCm tensor network dependencies
+# cotengra is required for contraction path optimization when using
+# method='tensor_network' on AMD GPUs with hipTensor.
+if "rocm" in PACKAGE_NAME:
+    requirements_rocm = [
+        "cotengra>=0.7.0",
+    ]
+    requirements.extend(requirements_rocm)
+
 VERSION_PATH = os.path.join(os.path.dirname(__file__), "qiskit_aer", "VERSION.txt")
 with open(VERSION_PATH, "r") as version_file:
     VERSION = version_file.read().strip()

@@ -32,6 +32,9 @@
 #if defined(AER_THRUST_CUDA) && defined(AER_CUTENSORNET)
 #include "simulators/tensor_network/tensor_net_contractor_cuTensorNet.hpp"
 #endif
+#if defined(AER_THRUST_ROCM) && defined(AER_HIPTENSOR)
+#include "simulators/tensor_network/tensor_net_contractor_hiptensor.hpp"
+#endif
 
 namespace AER {
 namespace TensorNetwork {
@@ -333,6 +336,9 @@ protected:
 #if defined(AER_THRUST_CUDA) && defined(AER_CUTENSORNET)
 #define create_contractor(contractor)                                          \
   contractor = new TensorNetContractor_cuTensorNet<data_t>
+#elif defined(AER_THRUST_ROCM) && defined(AER_HIPTENSOR)
+#define create_contractor(contractor)                                          \
+  contractor = new TensorNetContractor_HipTensor<data_t>
 #else
 #define create_contractor(contractor)                                          \
   contractor = new TensorNetContractorDummy<data_t>
