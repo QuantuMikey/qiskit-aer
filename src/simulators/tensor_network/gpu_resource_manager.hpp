@@ -16,23 +16,6 @@
 #ifndef _gpu_resource_manager_hpp_
 #define _gpu_resource_manager_hpp_
 
-/**
- * GPU resource management for hipTensor-based tensor network contraction.
- *
- * This file manages all GPU-side resources: device discovery, memory
- * allocation, hipTensor handles, contraction plan caching, and memory
- * pools. It has zero cotengra dependencies — it can be tested with
- * simple manual contractions without any path optimization.
- *
- * File layout:
- *   1. Diagnostic logging
- *   2. Error handling helpers
- *   3. ContractionSignature and HipTensorPlanCache
- *   4. MemoryPool with lifetime-based offset assignment
- *   5. GPUDevice — per-GPU state and operations
- *   6. GPUResourceManager — multi-GPU orchestration
- */
-
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -43,11 +26,12 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include <hip/hip_runtime.h>
-#include <hiptensor/hiptensor.h>
+#include <hiptensor/hiptensor.hpp>
 
 #include "misc/wrap_thrust.hpp"
 #include "simulators/statevector/chunk/thrust_kernels.hpp"
@@ -90,10 +74,6 @@ static bool memory_verbose() {
 // 2. Error handling helpers
 //=============================================================================
 
-/**
- * Check a HIP API return code. On failure, throw an exception with
- * the function name, error string, and device ID.
- */
 inline void check_hip(hipError_t err, const char *func, int device_id = -1) {
   if (err != hipSuccess) {
     std::stringstream ss;
@@ -104,15 +84,11 @@ inline void check_hip(hipError_t err, const char *func, int device_id = -1) {
   }
 }
 
-/**
- * Check a hipTensor API return code. On failure, throw an exception
- * with the function name and error code.
- */
 inline void check_hiptensor(hiptensorStatus_t err, const char *func,
                             int device_id = -1) {
   if (err != HIPTENSOR_STATUS_SUCCESS) {
     std::stringstream ss;
-    ss << "hipTensor error in " << func << ": error code " << (int)err;
+    ss << "hipTensor error in " << func << ": " << hiptensorGetErrorString(err);
     if (device_id >= 0)
       ss << " (device " << device_id << ")";
     throw std::runtime_error(ss.str());
@@ -123,21 +99,6 @@ inline void check_hiptensor(hiptensorStatus_t err, const char *func,
 // 3. ContractionSignature and HipTensorPlanCache
 //=============================================================================
 
-/**
- * Uniquely identifies a pairwise tensor contraction by shape.
- *
- * Two contractions with the same signature use the same hipTensor
- * kernels and workspace, so the plan can be reused. In quantum
- * circuits, most contractions have identical signatures because
- * gates produce tensors of the same rank and extent.
- *
- * The signature is a flat vector of int32 values:
- *   [num_modes_A, modes_A..., extents_A...,
- *    num_modes_B, modes_B..., extents_B...,
- *    num_modes_C, modes_C..., extents_C...]
- *
- * This is used as a hash key for the plan cache.
- */
 struct ContractionSignature {
   std::vector<int32_t> data;
 
@@ -146,23 +107,17 @@ struct ContractionSignature {
   }
 };
 
-// Hash function for ContractionSignature
 struct ContractionSignatureHash {
   size_t operator()(const ContractionSignature &sig) const {
-    // FNV-1a hash
     size_t hash = 14695981039346656037ULL;
-    for (auto v : sig.data) {
-      hash ^= static_cast<size_t>(v);
+    for (size_t i = 0; i < sig.data.size(); i++) {
+      hash ^= static_cast<size_t>(sig.data[i]);
       hash *= 1099511628211ULL;
     }
     return hash;
   }
 };
 
-/**
- * Build a contraction signature from the mode/extent lists of
- * two input tensors and one output tensor.
- */
 inline ContractionSignature
 build_signature(const std::vector<int32_t> &modes_a,
                 const std::vector<int64_t> &extents_a,
@@ -172,61 +127,42 @@ build_signature(const std::vector<int32_t> &modes_a,
                 const std::vector<int64_t> &extents_c) {
   ContractionSignature sig;
   sig.data.push_back(static_cast<int32_t>(modes_a.size()));
-  for (auto m : modes_a)
-    sig.data.push_back(m);
-  for (auto e : extents_a)
-    sig.data.push_back(static_cast<int32_t>(e));
+  for (size_t i = 0; i < modes_a.size(); i++)
+    sig.data.push_back(modes_a[i]);
+  for (size_t i = 0; i < extents_a.size(); i++)
+    sig.data.push_back(static_cast<int32_t>(extents_a[i]));
 
   sig.data.push_back(static_cast<int32_t>(modes_b.size()));
-  for (auto m : modes_b)
-    sig.data.push_back(m);
-  for (auto e : extents_b)
-    sig.data.push_back(static_cast<int32_t>(e));
+  for (size_t i = 0; i < modes_b.size(); i++)
+    sig.data.push_back(modes_b[i]);
+  for (size_t i = 0; i < extents_b.size(); i++)
+    sig.data.push_back(static_cast<int32_t>(extents_b[i]));
 
   sig.data.push_back(static_cast<int32_t>(modes_c.size()));
-  for (auto m : modes_c)
-    sig.data.push_back(m);
-  for (auto e : extents_c)
-    sig.data.push_back(static_cast<int32_t>(e));
+  for (size_t i = 0; i < modes_c.size(); i++)
+    sig.data.push_back(modes_c[i]);
+  for (size_t i = 0; i < extents_c.size(); i++)
+    sig.data.push_back(static_cast<int32_t>(extents_c[i]));
 
   return sig;
 }
 
-/**
- * A cached hipTensor contraction plan.
- *
- * Contains everything needed to execute a pairwise contraction
- * of a given shape: the plan itself, the workspace size it needs,
- * and all the descriptor/find objects that hipTensor requires.
- *
- * These are created during setup_contraction (planning phase) and
- * reused during contract (execution phase). No hipTensor plan
- * creation happens during the hot loop.
- */
 template <typename data_t> struct CachedPlan {
   hiptensorContractionDescriptor_t desc;
   hiptensorContractionFind_t find;
   hiptensorContractionPlan_t plan;
   uint64_t workspace_bytes;
 
-  // Tensor descriptors (needed by hipTensor API)
   hiptensorTensorDescriptor_t desc_a;
   hiptensorTensorDescriptor_t desc_b;
   hiptensorTensorDescriptor_t desc_c;
 };
 
-/**
- * Cache of hipTensor contraction plans, keyed by shape signature.
- *
- * Populated during setup_contraction by walking the contraction path
- * and creating plans for each unique signature. During contract,
- * every pairwise contraction is a cache hit.
- */
 template <typename data_t> class HipTensorPlanCache {
   std::unordered_map<ContractionSignature, CachedPlan<data_t>,
                      ContractionSignatureHash>
       cache_;
-  hiptensorHandle_t *handle_; // owned by GPUDevice, not by us
+  hiptensorHandle_t *handle_; // opaque pointer, owned by GPUDevice
   int device_id_;
 
 public:
@@ -237,16 +173,6 @@ public:
     device_id_ = device_id;
   }
 
-  /**
-   * Get or create a plan for the given contraction signature.
-   *
-   * On first call for a signature: creates hipTensor descriptors,
-   * queries workspace size, creates the plan. Subsequent calls
-   * return the cached plan immediately.
-   *
-   * Returns the maximum workspace size across all cached plans,
-   * which is needed for memory pool sizing.
-   */
   const CachedPlan<data_t> &
   get_or_create(const ContractionSignature &sig,
                 const std::vector<int32_t> &modes_a,
@@ -257,10 +183,6 @@ public:
                 const std::vector<int64_t> &extents_c) {
     auto it = cache_.find(sig);
     if (it != cache_.end()) {
-      if (gpu_verbose()) {
-        fprintf(stderr, "[AER_TN_GPU] plan cache hit (device %d)\n",
-                device_id_);
-      }
       return it->second;
     }
 
@@ -274,41 +196,42 @@ public:
     CachedPlan<data_t> cp;
     hipSetDevice(device_id_);
 
-    // Determine data type and compute type from template parameter
+    // Complex data types for hipTensor
     hipDataType hip_dtype;
     hiptensorComputeType_t compute_type;
     if (sizeof(data_t) == 8) {
       hip_dtype = HIP_C_64F;
-      compute_type = HIPTENSOR_COMPUTE_64F;
+      compute_type = HIPTENSOR_COMPUTE_C64F;
     } else {
       hip_dtype = HIP_C_32F;
-      compute_type = HIPTENSOR_COMPUTE_32F;
+      compute_type = HIPTENSOR_COMPUTE_C32F;
     }
 
-    // Create tensor descriptors
-    uint32_t align = 256; // alignment in bytes
+    uint32_t align = 256;
     check_hiptensor(
         hiptensorInitTensorDescriptor(
-            handle_, &cp.desc_a, modes_a.size(),
-            extents_a.data(), nullptr /* strides = row-major */,
+            handle_, &cp.desc_a,
+            static_cast<uint32_t>(modes_a.size()),
+            extents_a.data(), nullptr,
             hip_dtype, HIPTENSOR_OP_IDENTITY),
         "hiptensorInitTensorDescriptor(A)", device_id_);
 
     check_hiptensor(
         hiptensorInitTensorDescriptor(
-            handle_, &cp.desc_b, modes_b.size(),
+            handle_, &cp.desc_b,
+            static_cast<uint32_t>(modes_b.size()),
             extents_b.data(), nullptr,
             hip_dtype, HIPTENSOR_OP_IDENTITY),
         "hiptensorInitTensorDescriptor(B)", device_id_);
 
     check_hiptensor(
         hiptensorInitTensorDescriptor(
-            handle_, &cp.desc_c, modes_c.size(),
+            handle_, &cp.desc_c,
+            static_cast<uint32_t>(modes_c.size()),
             extents_c.data(), nullptr,
             hip_dtype, HIPTENSOR_OP_IDENTITY),
         "hiptensorInitTensorDescriptor(C)", device_id_);
 
-    // Create contraction descriptor
     check_hiptensor(
         hiptensorInitContractionDescriptor(
             handle_, &cp.desc,
@@ -319,13 +242,11 @@ public:
             compute_type),
         "hiptensorInitContractionDescriptor", device_id_);
 
-    // Find algorithm
     check_hiptensor(
         hiptensorInitContractionFind(handle_, &cp.find,
                                      HIPTENSOR_ALGO_DEFAULT),
         "hiptensorInitContractionFind", device_id_);
 
-    // Query workspace size
     cp.workspace_bytes = 0;
     check_hiptensor(
         hiptensorContractionGetWorkspaceSize(
@@ -333,7 +254,6 @@ public:
             HIPTENSOR_WORKSPACE_RECOMMENDED, &cp.workspace_bytes),
         "hiptensorContractionGetWorkspaceSize", device_id_);
 
-    // Create the plan
     check_hiptensor(
         hiptensorInitContractionPlan(handle_, &cp.plan, &cp.desc,
                                      &cp.find, cp.workspace_bytes),
@@ -343,19 +263,15 @@ public:
     return result.first->second;
   }
 
-  /**
-   * Maximum workspace size across all cached plans.
-   * Used to size the workspace region in the memory pool.
-   */
   uint64_t max_workspace_bytes() const {
     uint64_t max_ws = 0;
-    for (const auto &[sig, plan] : cache_)
-      max_ws = std::max(max_ws, plan.workspace_bytes);
+    for (auto it = cache_.begin(); it != cache_.end(); ++it) {
+      max_ws = std::max(max_ws, it->second.workspace_bytes);
+    }
     return max_ws;
   }
 
   size_t size() const { return cache_.size(); }
-
   void clear() { cache_.clear(); }
 };
 
@@ -363,50 +279,20 @@ public:
 // 4. MemoryPool with lifetime-based offset assignment
 //=============================================================================
 
-/**
- * An allocation within the memory pool.
- *
- * Each allocation has a byte offset into the pool, a size, and a
- * lifetime (the range of contraction steps during which this memory
- * is in use). Two allocations may share the same memory region only
- * if their lifetimes do not overlap.
- */
 struct PoolAllocation {
-  size_t offset;    // byte offset into the pool
-  size_t size;      // size in bytes
-  int birth_step;   // step that creates this intermediate
-  int death_step;   // last step that reads this intermediate
-  int tensor_index; // which intermediate tensor this is for
+  size_t offset;
+  size_t size;
+  int birth_step;
+  int death_step;
+  int tensor_index;
 };
 
-/**
- * Pre-allocated GPU memory pool with lifetime-based offset assignment.
- *
- * The pool is sized and laid out during setup_contraction (planning).
- * During contract (execution), every intermediate tensor is accessed
- * via its pre-computed offset — zero runtime allocation.
- *
- * The layout algorithm:
- *   1. For each intermediate tensor in the contraction path, compute
- *      its size, birth step (when created), and death step (when last
- *      consumed).
- *   2. Sort intermediates by size (largest first).
- *   3. For each intermediate, find the lowest offset where it fits
- *      without overlapping any other allocation that is alive at the
- *      same time.
- *   4. The pool size is max(offset + size) across all allocations.
- *   5. hipTensor workspace is included as a special allocation that
- *      is alive during every step.
- *
- * This is essentially register allocation for GPU memory.
- */
 class MemoryPool {
-  void *pool_ptr_;       // the single hipMalloc'd region
-  size_t pool_size_;     // total size in bytes
+  void *pool_ptr_;
+  size_t pool_size_;
   int device_id_;
   bool allocated_;
 
-  // Layout computed during plan_layout()
   std::vector<PoolAllocation> allocations_;
 
 public:
@@ -415,7 +301,6 @@ public:
 
   ~MemoryPool() { release(); }
 
-  // Non-copyable, movable
   MemoryPool(const MemoryPool &) = delete;
   MemoryPool &operator=(const MemoryPool &) = delete;
   MemoryPool(MemoryPool &&other) noexcept
@@ -426,37 +311,21 @@ public:
     other.allocated_ = false;
   }
 
-  /**
-   * Plan the memory layout for a set of intermediate tensors.
-   *
-   * Each intermediate is described by its size, birth step, and death step.
-   * The workspace is a special region alive during all steps.
-   *
-   * Call this during setup_contraction. After this returns, call
-   * allocate() to actually hipMalloc the pool.
-   *
-   * @param intermediates  List of (size_bytes, birth_step, death_step, index)
-   * @param workspace_bytes  hipTensor workspace size (alive during all steps)
-   * @param num_steps  Total number of contraction steps
-   */
   void plan_layout(
       const std::vector<std::tuple<size_t, int, int, int>> &intermediates,
       size_t workspace_bytes, int num_steps) {
     allocations_.clear();
 
-    // Start with workspace — alive during every step, offset 0
     if (workspace_bytes > 0) {
       PoolAllocation ws;
       ws.offset = 0;
       ws.size = workspace_bytes;
       ws.birth_step = 0;
       ws.death_step = num_steps - 1;
-      ws.tensor_index = -1; // sentinel: this is workspace, not a tensor
+      ws.tensor_index = -1;
       allocations_.push_back(ws);
     }
 
-    // Build list of intermediates sorted by size (largest first).
-    // Largest-first packing minimizes fragmentation.
     std::vector<size_t> order(intermediates.size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(),
@@ -465,30 +334,30 @@ public:
                        std::get<0>(intermediates[b]);
               });
 
-    for (size_t idx : order) {
-      auto [size, birth, death, tensor_idx] = intermediates[idx];
-      if (size == 0)
+    for (size_t oi = 0; oi < order.size(); oi++) {
+      size_t idx = order[oi];
+      size_t sz = std::get<0>(intermediates[idx]);
+      int birth = std::get<1>(intermediates[idx]);
+      int death = std::get<2>(intermediates[idx]);
+      int tensor_idx = std::get<3>(intermediates[idx]);
+      if (sz == 0)
         continue;
 
-      // Find the lowest offset where this allocation fits without
-      // overlapping any existing allocation with an overlapping lifetime.
-      size_t offset = find_offset(size, birth, death);
+      size_t offset = find_offset(sz, birth, death);
 
       PoolAllocation alloc;
       alloc.offset = offset;
-      alloc.size = size;
+      alloc.size = sz;
       alloc.birth_step = birth;
       alloc.death_step = death;
       alloc.tensor_index = tensor_idx;
       allocations_.push_back(alloc);
     }
 
-    // Pool size = max(offset + size) across all allocations
     pool_size_ = 0;
-    for (const auto &a : allocations_)
-      pool_size_ = std::max(pool_size_, a.offset + a.size);
+    for (size_t i = 0; i < allocations_.size(); i++)
+      pool_size_ = std::max(pool_size_, allocations_[i].offset + allocations_[i].size);
 
-    // Align pool size to 256 bytes
     pool_size_ = ((pool_size_ + 255) / 256) * 256;
 
     if (memory_verbose()) {
@@ -497,19 +366,9 @@ public:
               "pool size %zu bytes (%.2f MB), workspace %zu bytes\n",
               allocations_.size(), pool_size_,
               pool_size_ / (1024.0 * 1024.0), workspace_bytes);
-      for (const auto &a : allocations_) {
-        fprintf(stderr,
-                "[AER_TN_MEMORY]   tensor %d: offset %zu, size %zu, "
-                "alive steps [%d, %d]\n",
-                a.tensor_index, a.offset, a.size, a.birth_step,
-                a.death_step);
-      }
     }
   }
 
-  /**
-   * Allocate the pool on the GPU. Call after plan_layout().
-   */
   void allocate(int device_id) {
     device_id_ = device_id;
     if (pool_size_ == 0)
@@ -519,23 +378,12 @@ public:
     check_hip(hipMalloc(&pool_ptr_, pool_size_), "hipMalloc(pool)",
               device_id_);
     allocated_ = true;
-
-    if (gpu_verbose()) {
-      fprintf(stderr,
-              "[AER_TN_GPU] allocated memory pool: %zu bytes (%.2f MB) "
-              "on device %d\n",
-              pool_size_, pool_size_ / (1024.0 * 1024.0), device_id_);
-    }
   }
 
-  /**
-   * Get a pointer to the memory region for a given tensor index.
-   * This is a constant-time lookup — no allocation happens.
-   */
   void *get_tensor_ptr(int tensor_index) const {
-    for (const auto &a : allocations_) {
-      if (a.tensor_index == tensor_index) {
-        return static_cast<char *>(pool_ptr_) + a.offset;
+    for (size_t i = 0; i < allocations_.size(); i++) {
+      if (allocations_[i].tensor_index == tensor_index) {
+        return static_cast<char *>(pool_ptr_) + allocations_[i].offset;
       }
     }
     std::stringstream ss;
@@ -544,25 +392,18 @@ public:
     throw std::runtime_error(ss.str());
   }
 
-  /**
-   * Get a pointer to the workspace region.
-   * Workspace has tensor_index = -1.
-   */
   void *get_workspace_ptr() const {
-    for (const auto &a : allocations_) {
-      if (a.tensor_index == -1)
-        return static_cast<char *>(pool_ptr_) + a.offset;
+    for (size_t i = 0; i < allocations_.size(); i++) {
+      if (allocations_[i].tensor_index == -1)
+        return static_cast<char *>(pool_ptr_) + allocations_[i].offset;
     }
-    return nullptr; // no workspace needed
+    return nullptr;
   }
 
-  /**
-   * Get the size of the workspace region.
-   */
   size_t get_workspace_size() const {
-    for (const auto &a : allocations_) {
-      if (a.tensor_index == -1)
-        return a.size;
+    for (size_t i = 0; i < allocations_.size(); i++) {
+      if (allocations_[i].tensor_index == -1)
+        return allocations_[i].size;
     }
     return 0;
   }
@@ -582,35 +423,24 @@ public:
   }
 
 private:
-  /**
-   * Find the lowest offset where an allocation of the given size
-   * fits without overlapping any existing allocation whose lifetime
-   * overlaps [birth, death].
-   *
-   * Simple first-fit algorithm: try offset 0, check for conflicts,
-   * if conflict found jump past the conflicting allocation, repeat.
-   */
   size_t find_offset(size_t size, int birth, int death) {
     size_t offset = 0;
     bool placed = false;
 
     while (!placed) {
       placed = true;
-      for (const auto &existing : allocations_) {
-        // Check lifetime overlap
+      for (size_t i = 0; i < allocations_.size(); i++) {
         bool lifetime_overlap =
-            (birth <= existing.death_step && death >= existing.birth_step);
+            (birth <= allocations_[i].death_step &&
+             death >= allocations_[i].birth_step);
         if (!lifetime_overlap)
           continue;
 
-        // Check spatial overlap at this offset
         bool spatial_overlap =
-            (offset < existing.offset + existing.size &&
-             offset + size > existing.offset);
+            (offset < allocations_[i].offset + allocations_[i].size &&
+             offset + size > allocations_[i].offset);
         if (spatial_overlap) {
-          // Jump past this allocation and try again
-          offset = existing.offset + existing.size;
-          // Align to 256 bytes
+          offset = allocations_[i].offset + allocations_[i].size;
           offset = ((offset + 255) / 256) * 256;
           placed = false;
           break;
@@ -626,83 +456,64 @@ private:
 // 5. GPUDevice — per-GPU state and operations
 //=============================================================================
 
-/**
- * Represents a single GPU (GCD on MI250X) and its resources.
- *
- * Created by GPUResourceManager during discovery. Holds the HIP
- * stream, hipTensor handle, plan cache, and memory pool for this GPU.
- */
 template <typename data_t> class GPUDevice {
   int device_id_;
   std::string architecture_;
   size_t total_memory_;
   size_t free_memory_;
   hipStream_t stream_;
-  hiptensorHandle_t ht_handle_;
+  hiptensorHandle_t *ht_handle_; // opaque pointer from hiptensorCreate
   bool handle_valid_;
 
   HipTensorPlanCache<data_t> plan_cache_;
   MemoryPool pool_;
 
-  // Peer access capability with other devices
   std::vector<bool> peer_access_;
 
-  // Input tensor data stored on this device
   void *tensor_data_ptr_;
   size_t tensor_data_size_;
 
-  // Output buffer
   thrust::device_vector<thrust::complex<data_t>> dev_out_;
 
-  // Sampling buffers
   thrust::device_vector<double> sampling_rnds_;
   thrust::device_vector<uint64_t> sampling_out_;
 
 public:
   GPUDevice()
       : device_id_(-1), total_memory_(0), free_memory_(0), stream_(nullptr),
-        handle_valid_(false), tensor_data_ptr_(nullptr), tensor_data_size_(0) {}
+        ht_handle_(nullptr), handle_valid_(false),
+        tensor_data_ptr_(nullptr), tensor_data_size_(0) {}
 
   ~GPUDevice() { release(); }
 
-  // Non-copyable
   GPUDevice(const GPUDevice &) = delete;
   GPUDevice &operator=(const GPUDevice &) = delete;
 
-  /**
-   * Initialize this device. Queries properties, creates stream and
-   * hipTensor handle. Called once during GPUResourceManager::discover().
-   */
   void init(int device_id, int total_device_count) {
     device_id_ = device_id;
     hipSetDevice(device_id_);
 
-    // Query architecture
     hipDeviceProp_t props;
     check_hip(hipGetDeviceProperties(&props, device_id_),
               "hipGetDeviceProperties", device_id_);
     architecture_ = props.gcnArchName;
     total_memory_ = props.totalGlobalMem;
 
-    // Query current free memory
     size_t total;
     check_hip(hipMemGetInfo(&free_memory_, &total), "hipMemGetInfo",
               device_id_);
 
-    // Create stream
     check_hip(
         hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
         "hipStreamCreateWithFlags", device_id_);
 
-    // Create hipTensor handle
+    // hiptensorCreate takes hiptensorHandle_t** and allocates the handle
     check_hiptensor(hiptensorCreate(&ht_handle_), "hiptensorCreate",
                     device_id_);
     handle_valid_ = true;
 
-    // Initialize plan cache with our handle
-    plan_cache_.init(&ht_handle_, device_id_);
+    plan_cache_.init(ht_handle_, device_id_);
 
-    // Query peer access to all other devices
     peer_access_.resize(total_device_count, false);
     for (int other = 0; other < total_device_count; other++) {
       if (other == device_id_)
@@ -721,32 +532,17 @@ public:
     }
   }
 
-  /**
-   * Copy input tensor data from host to this GPU.
-   * Call after init(), before setup_contraction.
-   *
-   * The data is stored as a contiguous array of all tensor elements
-   * concatenated. The per-tensor offsets (pointers into this array)
-   * are returned so the contraction engine knows where each tensor
-   * starts.
-   *
-   * @param tensors  The input tensors (host-side data)
-   * @param add_sp_tensors  Whether to include superop tensors
-   * @return Per-tensor device pointers
-   */
   std::vector<void *> copy_tensor_data(
       const std::vector<std::shared_ptr<Tensor<data_t>>> &tensors,
       bool add_sp_tensors) {
     hipSetDevice(device_id_);
 
-    // Compute total size
     size_t total_elements = 0;
-    for (const auto &t : tensors) {
-      if (add_sp_tensors || !t->sp_tensor())
-        total_elements += t->tensor().size();
+    for (size_t i = 0; i < tensors.size(); i++) {
+      if (add_sp_tensors || !tensors[i]->sp_tensor())
+        total_elements += tensors[i]->tensor().size();
     }
 
-    // Allocate
     size_t total_bytes = total_elements * sizeof(std::complex<data_t>);
     if (tensor_data_size_ < total_bytes) {
       if (tensor_data_ptr_)
@@ -756,46 +552,31 @@ public:
       tensor_data_size_ = total_bytes;
     }
 
-    // Copy each tensor's data contiguously
     std::vector<void *> ptrs;
     size_t offset = 0;
-    for (const auto &t : tensors) {
-      if (add_sp_tensors || !t->sp_tensor()) {
+    for (size_t i = 0; i < tensors.size(); i++) {
+      if (add_sp_tensors || !tensors[i]->sp_tensor()) {
         void *dst = static_cast<char *>(tensor_data_ptr_) +
                     offset * sizeof(std::complex<data_t>);
         ptrs.push_back(dst);
         check_hip(
-            hipMemcpyAsync(dst, t->tensor().data(),
-                           t->tensor().size() * sizeof(std::complex<data_t>),
+            hipMemcpyAsync(dst, tensors[i]->tensor().data(),
+                           tensors[i]->tensor().size() * sizeof(std::complex<data_t>),
                            hipMemcpyHostToDevice, stream_),
             "hipMemcpyAsync(tensor_data)", device_id_);
-        offset += t->tensor().size();
+        offset += tensors[i]->tensor().size();
       }
     }
 
     hipStreamSynchronize(stream_);
 
-    // Update free memory after tensor copy
     size_t total;
     check_hip(hipMemGetInfo(&free_memory_, &total), "hipMemGetInfo",
               device_id_);
 
-    if (gpu_verbose()) {
-      fprintf(stderr,
-              "[AER_TN_GPU] copied %zu tensors (%zu elements, %.2f MB) "
-              "to device %d, %.1f GB free\n",
-              ptrs.size(), total_elements,
-              total_bytes / (1024.0 * 1024.0), device_id_,
-              free_memory_ / (1024.0 * 1024.0 * 1024.0));
-    }
-
     return ptrs;
   }
 
-  /**
-   * Copy tensor data from another GPU to this one.
-   * Uses peer-to-peer if available, otherwise stages through host.
-   */
   void copy_tensor_data_from(const GPUDevice<data_t> &src) {
     hipSetDevice(device_id_);
 
@@ -809,16 +590,14 @@ public:
     }
 
     if (peer_access_[src.device_id_]) {
-      // Direct GPU-to-GPU copy
       if (hipDeviceEnablePeerAccess(src.device_id_, 0) != hipSuccess)
-        hipGetLastError(); // ignore "already enabled" error
+        hipGetLastError();
       check_hip(
           hipMemcpyPeerAsync(tensor_data_ptr_, device_id_,
                              src.tensor_data_ptr_, src.device_id_, bytes,
                              stream_),
           "hipMemcpyPeerAsync", device_id_);
     } else {
-      // Stage through host
       std::vector<char> host_buf(bytes);
       hipSetDevice(src.device_id_);
       check_hip(
@@ -835,17 +614,11 @@ public:
     hipStreamSynchronize(stream_);
   }
 
-  /**
-   * Allocate the output buffer for contraction results.
-   */
   void allocate_output(size_t num_elements) {
     hipSetDevice(device_id_);
     dev_out_.resize(num_elements);
   }
 
-  /**
-   * Allocate sampling buffers (random numbers and output indices).
-   */
   void allocate_sampling_buffers(size_t num_samples) {
     hipSetDevice(device_id_);
     sampling_rnds_.resize(num_samples);
@@ -860,10 +633,6 @@ public:
     sampling_out_.shrink_to_fit();
   }
 
-  /**
-   * Execute a single pairwise contraction using a cached plan.
-   * All pointers are pre-computed offsets — no allocation or lookup.
-   */
   void execute_contraction(const CachedPlan<data_t> &plan, void *ptr_a,
                            void *ptr_b, void *ptr_c, void *workspace,
                            uint64_t workspace_size) {
@@ -871,16 +640,14 @@ public:
     std::complex<data_t> alpha(1.0, 0.0);
     std::complex<data_t> beta(0.0, 0.0);
 
+    // ht_handle_ is already hiptensorHandle_t* — pass directly
     check_hiptensor(
-        hiptensorContraction(&ht_handle_, &plan.plan, &alpha, ptr_a, ptr_b,
+        hiptensorContraction(ht_handle_, &plan.plan, &alpha, ptr_a, ptr_b,
                              &beta, ptr_c, ptr_c, workspace, workspace_size,
                              stream_),
         "hiptensorContraction", device_id_);
   }
 
-  /**
-   * Copy contraction output from GPU to host.
-   */
   void get_output(std::vector<std::complex<data_t>> &out) {
     hipSetDevice(device_id_);
     size_t n = dev_out_.size();
@@ -895,10 +662,6 @@ public:
     hipStreamSynchronize(stream_);
   }
 
-  /**
-   * Compute the trace of the output tensor.
-   * Sum of diagonal elements: output[i * stride + i] for all i.
-   */
   double trace_output(uint64_t num_qubits) {
     hipSetDevice(device_id_);
     uint64_t stride = (1ULL << num_qubits) + 1;
@@ -921,7 +684,10 @@ public:
     return peer_access_[other_device];
   }
   hipStream_t stream() const { return stream_; }
-  hiptensorHandle_t *handle() { return &ht_handle_; }
+
+  // Returns the opaque handle pointer for hipTensor API calls
+  hiptensorHandle_t *handle() { return ht_handle_; }
+
   HipTensorPlanCache<data_t> &plan_cache() { return plan_cache_; }
   MemoryPool &pool() { return pool_; }
 
@@ -952,7 +718,9 @@ public:
     deallocate_sampling_buffers();
 
     if (handle_valid_) {
-      hiptensorDestroy(&ht_handle_);
+      // hiptensorDestroy takes hiptensorHandle_t* directly
+      hiptensorDestroy(ht_handle_);
+      ht_handle_ = nullptr;
       handle_valid_ = false;
     }
     if (stream_) {
@@ -961,10 +729,6 @@ public:
     }
   }
 
-  /**
-   * Refresh the free memory reading.
-   * Call after any allocation to get an accurate budget.
-   */
   void refresh_free_memory() {
     hipSetDevice(device_id_);
     size_t total;
@@ -977,34 +741,17 @@ public:
 // 6. GPUResourceManager — multi-GPU orchestration
 //=============================================================================
 
-/**
- * Discovers available GPUs, manages per-GPU resources, and provides
- * the interface used by the contractor to set up and execute contractions.
- *
- * Created once per TensorNetContractor_HipTensor instance. Discovers
- * GPUs at construction time. All GPU-specific state is accessed through
- * this manager.
- */
 template <typename data_t> class GPUResourceManager {
   std::vector<std::unique_ptr<GPUDevice<data_t>>> devices_;
-  std::vector<int> device_ids_; // IDs of usable devices
+  std::vector<int> device_ids_;
 
 public:
   GPUResourceManager() = default;
   ~GPUResourceManager() = default;
 
-  // Non-copyable
   GPUResourceManager(const GPUResourceManager &) = delete;
   GPUResourceManager &operator=(const GPUResourceManager &) = delete;
 
-  /**
-   * Discover available GPUs. Only GPUs with sufficient free memory
-   * are included. Called once at contractor construction.
-   *
-   * @param target_gpus  If non-empty, only consider these device IDs.
-   *                     If empty, discover all available devices.
-   * @param min_memory   Minimum free memory in bytes to consider a GPU usable.
-   */
   void discover(const std::vector<uint64_t> &target_gpus = {},
                 size_t min_memory = 256 * 1024 * 1024) {
     int device_count = 0;
@@ -1016,22 +763,21 @@ public:
           "at least one AMD GPU with hipTensor support.");
     }
 
-    // Determine which devices to probe
     std::vector<int> candidates;
     if (!target_gpus.empty()) {
-      for (auto id : target_gpus)
-        candidates.push_back(static_cast<int>(id));
+      for (size_t i = 0; i < target_gpus.size(); i++)
+        candidates.push_back(static_cast<int>(target_gpus[i]));
     } else {
       for (int i = 0; i < device_count; i++)
         candidates.push_back(i);
     }
 
-    // Initialize each candidate device and check usability
-    for (int dev_id : candidates) {
+    for (size_t ci = 0; ci < candidates.size(); ci++) {
+      int dev_id = candidates[ci];
       if (dev_id >= device_count)
         continue;
 
-      auto device = std::make_unique<GPUDevice<data_t>>();
+      auto device = std::unique_ptr<GPUDevice<data_t>>(new GPUDevice<data_t>());
       try {
         device->init(dev_id, device_count);
       } catch (const std::runtime_error &e) {
@@ -1069,38 +815,21 @@ public:
     }
   }
 
-  /**
-   * Query the minimum free memory across all devices.
-   * Used as the memory limit for the path optimizer.
-   * Called after tensor data has been copied to the primary device.
-   */
   size_t min_free_memory() const {
     size_t min_mem = std::numeric_limits<size_t>::max();
-    for (const auto &dev : devices_) {
-      min_mem = std::min(min_mem, dev->free_memory());
+    for (size_t i = 0; i < devices_.size(); i++) {
+      min_mem = std::min(min_mem, devices_[i]->free_memory());
     }
     return min_mem;
   }
 
-  /**
-   * Query hipTensor workspace for the worst-case intermediate tensor
-   * on the primary device. Used in the two-pass memory planning
-   * to determine the real budget for the path optimizer.
-   *
-   * @param max_intermediate_elements  Size of the largest plausible
-   *                                   intermediate tensor in elements.
-   * @return Workspace size in bytes.
-   */
   uint64_t query_workspace_for_size(int64_t max_intermediate_elements) {
     if (devices_.empty())
       return 0;
 
-    auto &primary = devices_[0];
-    hipSetDevice(primary->device_id());
+    GPUDevice<data_t> &primary = *devices_[0];
+    hipSetDevice(primary.device_id());
 
-    // Build a dummy contraction descriptor for the worst-case shape.
-    // We use a simple square matrix contraction as the workspace estimate
-    // because hipTensor's workspace depends mainly on the output size.
     int64_t n = static_cast<int64_t>(
         std::sqrt(static_cast<double>(max_intermediate_elements)));
     if (n < 2) n = 2;
@@ -1112,7 +841,7 @@ public:
 
     hipDataType hip_dtype = (sizeof(data_t) == 8) ? HIP_C_64F : HIP_C_32F;
     hiptensorComputeType_t compute_type =
-        (sizeof(data_t) == 8) ? HIPTENSOR_COMPUTE_64F : HIPTENSOR_COMPUTE_32F;
+        (sizeof(data_t) == 8) ? HIPTENSOR_COMPUTE_C64F : HIPTENSOR_COMPUTE_C32F;
 
     hiptensorTensorDescriptor_t da, db, dc;
     hiptensorContractionDescriptor_t desc;
@@ -1120,23 +849,21 @@ public:
     uint64_t workspace = 0;
     uint32_t align = 256;
 
-    // These calls may fail for unusual shapes — in that case,
-    // return a conservative estimate.
     auto status = hiptensorInitTensorDescriptor(
-        primary->handle(), &da, 2, extents.data(), nullptr,
+        primary.handle(), &da, 2, extents.data(), nullptr,
         hip_dtype, HIPTENSOR_OP_IDENTITY);
     if (status != HIPTENSOR_STATUS_SUCCESS)
       return 64 * 1024 * 1024; // 64 MB conservative fallback
 
     hiptensorInitTensorDescriptor(
-        primary->handle(), &db, 2, extents.data(), nullptr,
+        primary.handle(), &db, 2, extents.data(), nullptr,
         hip_dtype, HIPTENSOR_OP_IDENTITY);
     hiptensorInitTensorDescriptor(
-        primary->handle(), &dc, 2, extents.data(), nullptr,
+        primary.handle(), &dc, 2, extents.data(), nullptr,
         hip_dtype, HIPTENSOR_OP_IDENTITY);
 
     status = hiptensorInitContractionDescriptor(
-        primary->handle(), &desc,
+        primary.handle(), &desc,
         &da, modes_a.data(), align,
         &db, modes_b.data(), align,
         &dc, modes_c.data(), align,
@@ -1145,10 +872,10 @@ public:
     if (status != HIPTENSOR_STATUS_SUCCESS)
       return 64 * 1024 * 1024;
 
-    hiptensorInitContractionFind(primary->handle(), &find,
+    hiptensorInitContractionFind(primary.handle(), &find,
                                  HIPTENSOR_ALGO_DEFAULT);
     hiptensorContractionGetWorkspaceSize(
-        primary->handle(), &desc, &find,
+        primary.handle(), &desc, &find,
         HIPTENSOR_WORKSPACE_RECOMMENDED, &workspace);
 
     if (memory_verbose()) {
