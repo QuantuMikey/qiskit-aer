@@ -56,12 +56,63 @@ static bool tn_verbose() {
   return enabled;
 }
 
+// Extra verbose diagnostic mode — dumps modes/extents per tensor per step
+static bool tn_debug() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_DEBUG");
+    enabled = (val != nullptr && std::string(val) == "1");
+    checked = true;
+  }
+  return enabled;
+}
+
+//=============================================================================
+// Diagnostic helpers
+//=============================================================================
+
+inline std::string modes_to_str(const std::vector<int32_t> &modes) {
+  std::stringstream ss;
+  ss << "[";
+  for (size_t i = 0; i < modes.size(); i++) {
+    if (i > 0) ss << ",";
+    ss << modes[i];
+  }
+  ss << "]";
+  return ss.str();
+}
+
+inline std::string extents_to_str(const std::vector<int64_t> &extents) {
+  std::stringstream ss;
+  ss << "[";
+  for (size_t i = 0; i < extents.size(); i++) {
+    if (i > 0) ss << ",";
+    ss << extents[i];
+  }
+  ss << "]";
+  return ss.str();
+}
+
+template <typename data_t>
+void dump_device_tensor(const char *label, void *dev_ptr, int64_t num_elements,
+                        int max_print = 8) {
+  if (!tn_debug()) return;
+  std::vector<std::complex<data_t>> host(num_elements);
+  hipMemcpy(host.data(), dev_ptr,
+            num_elements * sizeof(std::complex<data_t>),
+            hipMemcpyDeviceToHost);
+  fprintf(stderr, "[AER_TN_DEBUG] %s [%ld elements]:", label, (long)num_elements);
+  int n_print = (int)std::min<int64_t>(num_elements, max_print);
+  for (int i = 0; i < n_print; i++) {
+    fprintf(stderr, " (%.3f,%.3fi)", host[i].real(), host[i].imag());
+  }
+  if (num_elements > max_print) fprintf(stderr, " ...");
+  fprintf(stderr, "\n");
+}
+
 //=============================================================================
 // Helper: compute result modes/extents of a pairwise contraction
-//   Non-final steps: unshared from A, then unshared from B (natural order).
-//   Final step: must be overridden to match network output_modes so that
-//   hipTensor produces the output in the canonical qubit order expected
-//   by Aer's state-vector sampling.
 //=============================================================================
 
 inline void compute_contraction_result(
@@ -235,9 +286,24 @@ void TensorNetContractor_HipTensor<data_t>::set_network(
   build_network_description();
   pool_ready_ = false;
 
-  if (tn_verbose())
-    fprintf(stderr, "[AER_TN] set_network: %zu tensors on %zu GPU(s)\n",
-            input_tensors_.size(), gpu_mgr_.num_devices());
+  if (tn_verbose()) {
+    fprintf(stderr, "[AER_TN] set_network: %zu tensors on %zu GPU(s) (add_sp=%d, input_count=%zu)\n",
+            input_tensors_.size(), gpu_mgr_.num_devices(),
+            (int)add_sp_tensors, tensors.size());
+  }
+
+  if (tn_debug()) {
+    fprintf(stderr, "[AER_TN_DEBUG] input tensors:\n");
+    for (size_t i = 0; i < input_tensors_.size(); i++) {
+      auto modes = input_tensors_[i]->modes();
+      auto extents = input_tensors_[i]->extents();
+      fprintf(stderr, "[AER_TN_DEBUG]   T%zu: sp=%d modes=%s extents=%s size=%zu\n",
+              i, (int)input_tensors_[i]->sp_tensor(),
+              modes_to_str(modes).c_str(),
+              extents_to_str(extents).c_str(),
+              input_tensors_[i]->tensor().size());
+    }
+  }
 }
 
 template <typename data_t>
@@ -261,6 +327,10 @@ void TensorNetContractor_HipTensor<data_t>::set_additional_tensors(
                              additional_ptrs.begin(), additional_ptrs.end());
   build_network_description();
   pool_ready_ = false;
+
+  if (tn_verbose())
+    fprintf(stderr, "[AER_TN] set_additional_tensors: %zu additional (%zu total)\n",
+            tensors.size(), input_tensors_.size());
 }
 
 template <typename data_t>
@@ -287,6 +357,12 @@ void TensorNetContractor_HipTensor<data_t>::set_output(
   for (size_t i = 0; i < extents_out_.size(); i++)
     out_size_ *= extents_out_[i];
   gpu_mgr_.primary().allocate_output(out_size_);
+
+  if (tn_verbose())
+    fprintf(stderr, "[AER_TN] set_output: modes=%s extents=%s size=%zu\n",
+            modes_to_str(modes_out_).c_str(),
+            extents_to_str(extents_out_).c_str(),
+            (size_t)out_size_);
 }
 
 template <typename data_t>
@@ -391,23 +467,71 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
   for (size_t i = 0; i < num_inputs; i++)
     all_specs_[i] = sliced_input_specs_[i];
 
-  // Walk path. For the FINAL step, force output modes/extents to match
-  // network output order — hipTensor will permute internally so the
-  // resulting tensor is laid out in canonical qubit order for sampling.
+  if (tn_debug()) {
+    fprintf(stderr, "[AER_TN_DEBUG] setup_pool_and_cache: %zu inputs, %zu steps\n",
+            num_inputs, num_steps);
+    fprintf(stderr, "[AER_TN_DEBUG] output_modes=%s output_extents=%s\n",
+            modes_to_str(modes_out_).c_str(),
+            extents_to_str(extents_out_).c_str());
+    for (size_t i = 0; i < num_inputs; i++) {
+      fprintf(stderr, "[AER_TN_DEBUG]   input[%zu]: modes=%s extents=%s num_el=%ld\n",
+              i, modes_to_str(all_specs_[i].modes).c_str(),
+              extents_to_str(all_specs_[i].extents).c_str(),
+              (long)all_specs_[i].num_elements());
+    }
+  }
+
+  // Walk path to compute intermediate shapes.
   for (size_t step = 0; step < num_steps; step++) {
     uint64_t left = plan_.steps[step].left;
     uint64_t right = plan_.steps[step].right;
     size_t result_idx = num_inputs + step;
 
     if (step == num_steps - 1) {
-      // Final step: use network output modes directly
-      all_specs_[result_idx].modes = modes_out_;
-      all_specs_[result_idx].extents = extents_out_;
+      // Final step: force output to match network output modes/extents.
+      // Verify mode SET matches (permutation allowed).
+      std::vector<int32_t> natural_modes;
+      std::vector<int64_t> natural_extents;
+      compute_contraction_result(
+          all_specs_[left].modes, all_specs_[left].extents,
+          all_specs_[right].modes, all_specs_[right].extents,
+          natural_modes, natural_extents);
+
+      std::set<int32_t> natural_set(natural_modes.begin(), natural_modes.end());
+      std::set<int32_t> output_set(modes_out_.begin(), modes_out_.end());
+
+      if (natural_set != output_set) {
+        if (tn_debug()) {
+          fprintf(stderr,
+                  "[AER_TN_DEBUG] WARNING: final step modes %s don't match output %s\n",
+                  modes_to_str(natural_modes).c_str(),
+                  modes_to_str(modes_out_).c_str());
+        }
+        // Fall back to natural modes — let downstream handle
+        all_specs_[result_idx].modes = natural_modes;
+        all_specs_[result_idx].extents = natural_extents;
+      } else {
+        // Use output order (hipTensor will permute)
+        all_specs_[result_idx].modes = modes_out_;
+        all_specs_[result_idx].extents = extents_out_;
+      }
     } else {
       compute_contraction_result(
           all_specs_[left].modes, all_specs_[left].extents,
           all_specs_[right].modes, all_specs_[right].extents,
           all_specs_[result_idx].modes, all_specs_[result_idx].extents);
+    }
+
+    if (tn_debug()) {
+      fprintf(stderr,
+              "[AER_TN_DEBUG]   step %zu: T%ld x T%ld -> T%zu   "
+              "modes_l=%s modes_r=%s modes_c=%s num_el=%ld%s\n",
+              step, (long)left, (long)right, result_idx,
+              modes_to_str(all_specs_[left].modes).c_str(),
+              modes_to_str(all_specs_[right].modes).c_str(),
+              modes_to_str(all_specs_[result_idx].modes).c_str(),
+              (long)all_specs_[result_idx].num_elements(),
+              (step == num_steps - 1) ? " (FINAL)" : "");
     }
   }
 
@@ -601,6 +725,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   size_t num_inputs = sliced_input_specs_.size();
   size_t num_steps = plan_.steps.size();
 
+  if (tn_debug())
+    fprintf(stderr, "[AER_TN_DEBUG] contract_single_slice(slice=%lu, dev=%d)\n",
+            (unsigned long)slice_index, device_idx);
+
   std::vector<void *> projected_ptrs;
   project_slice(slice_index, projected_ptrs);
 
@@ -610,6 +738,15 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
 
   void *workspace = dev.pool().get_workspace_ptr();
   uint64_t ws_size = dev.pool().get_workspace_size();
+
+  if (tn_debug()) {
+    for (size_t i = 0; i < num_inputs; i++) {
+      char label[64];
+      snprintf(label, sizeof(label), "  input[%zu]", i);
+      dump_device_tensor<data_t>(label, all_ptrs[i],
+                                  sliced_input_specs_[i].num_elements(), 4);
+    }
+  }
 
   for (size_t step = 0; step < num_steps; step++) {
     uint64_t left = plan_.steps[step].left;
@@ -629,14 +766,44 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
 
     all_ptrs[result_idx] = dev.pool().get_tensor_ptr(static_cast<int>(result_idx));
 
+    if (tn_debug()) {
+      fprintf(stderr,
+              "[AER_TN_DEBUG]   step %zu exec: "
+              "A_ptr=%p B_ptr=%p C_ptr=%p ws=%p ws_sz=%lu modes_c=%s\n",
+              step, all_ptrs[left], all_ptrs[right], all_ptrs[result_idx],
+              workspace, (unsigned long)ws_size,
+              modes_to_str(all_specs_[result_idx].modes).c_str());
+    }
+
     dev.execute_contraction(plan,
         all_ptrs[left], all_ptrs[right], all_ptrs[result_idx],
         workspace, ws_size, false);
+
+    if (tn_debug()) {
+      hipStreamSynchronize(dev.stream());
+      char label[64];
+      snprintf(label, sizeof(label), "  after step %zu (T%zu)", step, result_idx);
+      dump_device_tensor<data_t>(label, all_ptrs[result_idx],
+                                  all_specs_[result_idx].num_elements(), 8);
+    }
   }
 
-  // Accumulate final result (which is in output_modes order) into output buffer
   size_t final_idx = num_inputs + num_steps - 1;
   void *final_ptr = all_ptrs[final_idx];
+  int64_t final_elements = all_specs_[final_idx].num_elements();
+
+  if (tn_debug())
+    fprintf(stderr,
+            "[AER_TN_DEBUG]   accumulate final_ptr=%p (%ld el) into out_buf (%lu el)\n",
+            final_ptr, (long)final_elements, (unsigned long)out_size_);
+
+  // Verify shape match before thrust::transform
+  if (final_elements != (int64_t)out_size_) {
+    fprintf(stderr,
+            "[AER_TN] ERROR: final tensor size %ld != out_size_ %lu\n",
+            (long)final_elements, (unsigned long)out_size_);
+    return;
+  }
 
   thrust::transform(
       thrust_gpu::par.on(dev.stream()),
@@ -645,6 +812,19 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       static_cast<thrust::complex<data_t> *>(final_ptr),
       dev.output_buffer().begin(),
       thrust::plus<thrust::complex<data_t>>());
+
+  if (tn_debug()) {
+    hipStreamSynchronize(dev.stream());
+    std::vector<std::complex<data_t>> host(out_size_);
+    hipMemcpy(host.data(),
+              thrust::raw_pointer_cast(dev.output_buffer().data()),
+              out_size_ * sizeof(std::complex<data_t>),
+              hipMemcpyDeviceToHost);
+    fprintf(stderr, "[AER_TN_DEBUG]   output_buffer after accumulate:");
+    for (size_t i = 0; i < std::min<size_t>(out_size_, 8); i++)
+      fprintf(stderr, " (%.3f,%.3fi)", host[i].real(), host[i].imag());
+    fprintf(stderr, "\n");
+  }
 }
 
 template <typename data_t>
