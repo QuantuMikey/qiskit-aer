@@ -49,6 +49,33 @@ static bool path_verbose() {
   return enabled;
 }
 
+// Read cotengra backend selection from AER_TN_OPTLIB env var.
+// Valid values: "optuna" (default), "cmaes", "sbplx", "sses".
+// Anything else falls through to "optuna".
+static std::string path_optlib() {
+  static bool checked = false;
+  static std::string cached;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_OPTLIB");
+    if (val != nullptr) {
+      std::string s(val);
+      if (s == "optuna" || s == "cmaes" || s == "sbplx" || s == "sses") {
+        cached = s;
+      } else {
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: AER_TN_OPTLIB='%s' not recognised, "
+                "falling back to 'optuna'. Valid values: optuna, cmaes, "
+                "sbplx, sses.\n", val);
+        cached = "optuna";
+      }
+    } else {
+      cached = "optuna";
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 //=============================================================================
 // Data structures
 //=============================================================================
@@ -203,6 +230,37 @@ class CotengPathOptimizer : public PathOptimizer {
       assign(network.output_modes[m]);
   }
 
+  // Build optlib_opts dict with the seed routed correctly for each backend.
+  //
+  // cotengra's HyperOptimizer forwards optlib_opts to the backend's setup()
+  // method. Each backend expects the seed in a different place:
+  //
+  //   optuna: {"sampler_opts": {"seed": N}}
+  //           → OptunaOptLib.setup() unpacks sampler_opts
+  //           → TPESampler(seed=N)
+  //   cmaes:  {"seed": N}
+  //           → CMAESOptLib.setup() absorbs via **cmaes_opts
+  //           → cmaes.CMA(seed=N)
+  //   sbplx:  (no seed) — backend doesn't accept a seed kwarg
+  //   sses:   (no seed) — evolutionary strategy without a named seed param
+  //
+  // Passing a seed to a backend that rejects it raises TypeError at
+  // HyperOptimizer construction. We silently omit it for the two backends
+  // that don't support it — reproducibility will be limited to whatever
+  // those backends' internal state provides (process-level RNG usually).
+  py::dict build_optlib_opts(const std::string &optlib, uint64_t seed) {
+    py::dict optlib_opts;
+    if (optlib == "optuna") {
+      py::dict sampler_opts;
+      sampler_opts["seed"] = seed;
+      optlib_opts["sampler_opts"] = sampler_opts;
+    } else if (optlib == "cmaes") {
+      optlib_opts["seed"] = seed;
+    }
+    // sbplx, sses: return empty dict — these backends don't accept a seed.
+    return optlib_opts;
+  }
+
 public:
   CotengPathOptimizer(const std::string &minimize = "combo",
                       int max_repeats = 128, double max_time = 60.0,
@@ -256,6 +314,8 @@ public:
     py::object tree;
 
     if (preset_ == "random-greedy") {
+      // RandomGreedyOptimizer takes seed as a direct named kwarg — no backend
+      // routing required.
       auto opt = ctg.attr("RandomGreedyOptimizer")(
           py::arg("max_repeats") = max_repeats_,
           py::arg("max_time") = max_time_,
@@ -263,11 +323,26 @@ public:
           py::arg("progbar") = false);
       tree = opt.attr("search")(inputs, output, sizes);
     } else {
+      // HyperOptimizer path: backend is chosen by AER_TN_OPTLIB env var.
+      // Seed must be routed through optlib_opts in a backend-specific way
+      // (see build_optlib_opts above). Passing py::arg("seed") directly to
+      // HyperOptimizer would leak into **kwargs and eventually hit
+      // optuna.create_study(seed=...) which rejects that kwarg.
+      std::string optlib = path_optlib();
+      py::dict optlib_opts = build_optlib_opts(optlib, seed);
+
+      if (path_verbose()) {
+        fprintf(stderr,
+                "[AER_TN_PATH] HyperOptimizer: optlib='%s', seed=%lu\n",
+                optlib.c_str(), (unsigned long)seed);
+      }
+
       auto opt = ctg.attr("HyperOptimizer")(
           py::arg("minimize") = minimize_,
           py::arg("max_repeats") = max_repeats_,
           py::arg("max_time") = max_time_,
-          py::arg("seed") = seed,
+          py::arg("optlib") = optlib,
+          py::arg("optlib_opts") = optlib_opts,
           py::arg("slicing_opts") = slicing_opts,
           py::arg("reconf_opts") = reconf_opts,
           py::arg("progbar") = false);
