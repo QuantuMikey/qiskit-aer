@@ -56,7 +56,6 @@ static bool tn_verbose() {
   return enabled;
 }
 
-// Extra verbose diagnostic mode — dumps modes/extents per tensor per step
 static bool tn_debug() {
   static bool checked = false;
   static bool enabled = false;
@@ -248,6 +247,16 @@ private:
   double sample_measure_on_primary(reg_t &samples, std::vector<double> &rnds,
                                    uint_t num_qubits);
   std::unique_ptr<PathOptimizer> create_optimizer();
+
+  // Drop tensors whose modes never connect to any other tensor or to the
+  // output. Aer's initialize() creates "super qubit" tensors with
+  // sp_tensor_=false (set() not set_conj()), so our sp-filter misses them.
+  // When add_sp_tensors=false, these remain as orphans with dangling modes.
+  // cuTensorNet prunes them internally; we must do it explicitly.
+  // Returns vector<bool> mask: keep[i]=true means keep tensor i.
+  std::vector<bool> compute_orphan_mask(
+      const std::vector<std::shared_ptr<Tensor<data_t>>> &tensors,
+      const std::set<int32_t> &output_modes_set) const;
 };
 
 //=============================================================================
@@ -265,6 +274,32 @@ template <typename data_t>
 TensorNetContractor_HipTensor<data_t>::~TensorNetContractor_HipTensor() {}
 
 template <typename data_t>
+std::vector<bool>
+TensorNetContractor_HipTensor<data_t>::compute_orphan_mask(
+    const std::vector<std::shared_ptr<Tensor<data_t>>> &tensors,
+    const std::set<int32_t> &output_modes_set) const {
+  // Count mode occurrences across all tensors + output (count output once).
+  std::map<int32_t, int> mode_count;
+  for (const auto &t : tensors) {
+    for (int32_t m : t->modes()) mode_count[m]++;
+  }
+  for (int32_t m : output_modes_set) mode_count[m]++;
+
+  // A tensor is "connected" if at least one of its modes has count >= 2
+  // (i.e., shared with another tensor or with the output). An isolated tensor
+  // whose ALL modes have count==1 is an orphan.
+  std::vector<bool> keep(tensors.size(), true);
+  for (size_t i = 0; i < tensors.size(); i++) {
+    bool has_shared_mode = false;
+    for (int32_t m : tensors[i]->modes()) {
+      if (mode_count[m] >= 2) { has_shared_mode = true; break; }
+    }
+    if (!has_shared_mode) keep[i] = false;
+  }
+  return keep;
+}
+
+template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::set_network(
     const std::vector<std::shared_ptr<Tensor<data_t>>> &tensors,
     bool add_sp_tensors) {
@@ -272,9 +307,37 @@ void TensorNetContractor_HipTensor<data_t>::set_network(
   add_sp_tensors_ = add_sp_tensors;
   num_additional_tensors_ = 0;
 
+  // Stage 1: Apply Aer's sp_tensor filter
+  std::vector<std::shared_ptr<Tensor<data_t>>> sp_filtered;
+  sp_filtered.reserve(tensors.size());
   for (size_t i = 0; i < tensors.size(); i++)
     if (add_sp_tensors || !tensors[i]->sp_tensor())
-      input_tensors_.push_back(tensors[i]);
+      sp_filtered.push_back(tensors[i]);
+
+  // Stage 2: Drop orphan tensors.
+  // Orphans arise because Aer's initialize() creates "super qubit" tensors
+  // with sp_tensor_=false (via set() not set_conj()). When add_sp_tensors=false
+  // requested (save_statevector path), the sp filter lets these through, but
+  // their modes are disconnected from the rest of the network. cuTensorNet
+  // prunes them internally; we must do it explicitly or contracting them as
+  // disconnected scalar factors zeroes out the output.
+  std::set<int32_t> output_modes_set(modes_out_.begin(), modes_out_.end());
+  std::vector<bool> keep = compute_orphan_mask(sp_filtered, output_modes_set);
+
+  size_t dropped = 0;
+  for (size_t i = 0; i < sp_filtered.size(); i++) {
+    if (keep[i]) {
+      input_tensors_.push_back(sp_filtered[i]);
+    } else {
+      dropped++;
+      if (tn_debug()) {
+        fprintf(stderr,
+                "[AER_TN_DEBUG] dropping orphan tensor (sp=%d) modes=%s\n",
+                (int)sp_filtered[i]->sp_tensor(),
+                modes_to_str(sp_filtered[i]->modes()).c_str());
+      }
+    }
+  }
   num_base_tensors_ = input_tensors_.size();
 
   if (gpu_mgr_.num_devices() == 0) {
@@ -287,13 +350,15 @@ void TensorNetContractor_HipTensor<data_t>::set_network(
   pool_ready_ = false;
 
   if (tn_verbose()) {
-    fprintf(stderr, "[AER_TN] set_network: %zu tensors on %zu GPU(s) (add_sp=%d, input_count=%zu)\n",
+    fprintf(stderr,
+            "[AER_TN] set_network: %zu tensors on %zu GPU(s) "
+            "(add_sp=%d, input_count=%zu, sp_filtered=%zu, orphans_dropped=%zu)\n",
             input_tensors_.size(), gpu_mgr_.num_devices(),
-            (int)add_sp_tensors, tensors.size());
+            (int)add_sp_tensors, tensors.size(), sp_filtered.size(), dropped);
   }
 
   if (tn_debug()) {
-    fprintf(stderr, "[AER_TN_DEBUG] input tensors:\n");
+    fprintf(stderr, "[AER_TN_DEBUG] input tensors (after filter):\n");
     for (size_t i = 0; i < input_tensors_.size(); i++) {
       auto modes = input_tensors_[i]->modes();
       auto extents = input_tensors_[i]->extents();
@@ -488,8 +553,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     size_t result_idx = num_inputs + step;
 
     if (step == num_steps - 1) {
-      // Final step: force output to match network output modes/extents.
-      // Verify mode SET matches (permutation allowed).
+      // Final step: output modes must match network output modes.
       std::vector<int32_t> natural_modes;
       std::vector<int64_t> natural_extents;
       compute_contraction_result(
@@ -507,11 +571,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
                   modes_to_str(natural_modes).c_str(),
                   modes_to_str(modes_out_).c_str());
         }
-        // Fall back to natural modes — let downstream handle
         all_specs_[result_idx].modes = natural_modes;
         all_specs_[result_idx].extents = natural_extents;
       } else {
-        // Use output order (hipTensor will permute)
         all_specs_[result_idx].modes = modes_out_;
         all_specs_[result_idx].extents = extents_out_;
       }
@@ -535,7 +597,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     }
   }
 
-  // Tensor lifetimes
   std::vector<int> last_used(num_total, -1);
   for (size_t step = 0; step < num_steps; step++) {
     last_used[plan_.steps[step].left] = static_cast<int>(step);
@@ -544,7 +605,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
   if (num_steps > 0)
     last_used[num_inputs + num_steps - 1] = static_cast<int>(num_steps - 1);
 
-  // Pre-populate plan cache
   for (size_t step = 0; step < num_steps; step++) {
     uint64_t left = plan_.steps[step].left;
     uint64_t right = plan_.steps[step].right;
@@ -562,7 +622,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
         all_specs_[result_idx].modes, all_specs_[result_idx].extents);
   }
 
-  // Memory pool
   size_t element_bytes = 2 * sizeof(data_t);
   std::vector<std::tuple<size_t, int, int, int>> intermediates;
 
@@ -797,7 +856,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
             "[AER_TN_DEBUG]   accumulate final_ptr=%p (%ld el) into out_buf (%lu el)\n",
             final_ptr, (long)final_elements, (unsigned long)out_size_);
 
-  // Verify shape match before thrust::transform
   if (final_elements != (int64_t)out_size_) {
     fprintf(stderr,
             "[AER_TN] ERROR: final tensor size %ld != out_size_ %lu\n",
