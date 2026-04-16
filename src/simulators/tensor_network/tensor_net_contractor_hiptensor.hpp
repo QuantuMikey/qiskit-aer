@@ -335,6 +335,20 @@ void TensorNetContractor_HipTensor<data_t>::set_network(
                 "[AER_TN_DEBUG] dropping orphan tensor (sp=%d) modes=%s\n",
                 (int)sp_filtered[i]->sp_tensor(),
                 modes_to_str(sp_filtered[i]->modes()).c_str());
+        // Dump the orphan's actual values — if these are [1,0] they're benign
+        // basis projectors we can safely drop. Anything else means we're
+        // dropping meaningful data and this filter is too aggressive.
+        const auto &data = sp_filtered[i]->tensor();
+        size_t n = data.size();
+        size_t n_print = std::min<size_t>(n, 16);
+        fprintf(stderr,
+                "[AER_TN_DEBUG]   orphan values [%zu total]:", n);
+        for (size_t k = 0; k < n_print; k++) {
+          fprintf(stderr, " (%.3f,%.3fi)",
+                  data[k].real(), data[k].imag());
+        }
+        if (n > n_print) fprintf(stderr, " ...");
+        fprintf(stderr, "\n");
       }
     }
   }
@@ -367,6 +381,20 @@ void TensorNetContractor_HipTensor<data_t>::set_network(
               modes_to_str(modes).c_str(),
               extents_to_str(extents).c_str(),
               input_tensors_[i]->tensor().size());
+      // Dump HOST-SIDE values (before hipMemcpy). If these match what we later
+      // see in "input[i]" from the GPU, upload is fine. If they differ, we
+      // have a copy bug. If the host values are already wrong for what the
+      // gate should be, the bug is upstream in qiskit-aer's TN construction
+      // or our tensor ingestion.
+      const auto &data = input_tensors_[i]->tensor();
+      size_t n = data.size();
+      size_t n_print = std::min<size_t>(n, 32);
+      fprintf(stderr, "[AER_TN_DEBUG]     host values:");
+      for (size_t k = 0; k < n_print; k++) {
+        fprintf(stderr, " (%.3f,%.3fi)", data[k].real(), data[k].imag());
+      }
+      if (n > n_print) fprintf(stderr, " ...");
+      fprintf(stderr, "\n");
     }
   }
 }
@@ -802,8 +830,11 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     for (size_t i = 0; i < num_inputs; i++) {
       char label[64];
       snprintf(label, sizeof(label), "  input[%zu]", i);
+      // Print up to 32 elements so 4-leg gates (e.g. CNOT's 16 values) are
+      // fully visible — crucial for distinguishing identity from CNOT since
+      // they share first 4 values [1, 0, 0, 0].
       dump_device_tensor<data_t>(label, all_ptrs[i],
-                                  sliced_input_specs_[i].num_elements(), 4);
+                                  sliced_input_specs_[i].num_elements(), 32);
     }
   }
 
@@ -843,7 +874,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       char label[64];
       snprintf(label, sizeof(label), "  after step %zu (T%zu)", step, result_idx);
       dump_device_tensor<data_t>(label, all_ptrs[result_idx],
-                                  all_specs_[result_idx].num_elements(), 8);
+                                  all_specs_[result_idx].num_elements(), 32);
     }
   }
 
