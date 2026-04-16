@@ -161,8 +161,9 @@ public:
 
 //=============================================================================
 // CotengPathOptimizer — cotengra via pybind11
-//   FIX: cotengrust requires string mode labels, not int.
-//   We convert int32_t modes to str at the Python boundary.
+//
+//   cotengrust requires SINGLE-CHARACTER string mode labels (einsum style).
+//   We map each unique int32_t mode to a char from a-z, A-Z (52 max).
 //=============================================================================
 
 #ifdef AER_HIPTENSOR
@@ -173,6 +174,34 @@ class CotengPathOptimizer : public PathOptimizer {
   double max_time_;
   std::string preset_;
   size_t element_size_bytes_;
+
+  // Mode label mapping: int32_t <-> single char (built per find_path call)
+  std::map<int32_t, char> mode_to_char_;
+  std::map<char, int32_t> char_to_mode_;
+
+  void build_mode_mapping(const NetworkDescription &network) {
+    mode_to_char_.clear();
+    char_to_mode_.clear();
+    // Sequence: a-z (0-25), A-Z (26-51)
+    const char *alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    int next_idx = 0;
+
+    auto assign = [&](int32_t mode) {
+      if (mode_to_char_.find(mode) != mode_to_char_.end()) return;
+      if (next_idx >= 52)
+        throw std::runtime_error("CotengPathOptimizer: >52 unique modes "
+                                 "(exceeds einsum character limit)");
+      char c = alphabet[next_idx++];
+      mode_to_char_[mode] = c;
+      char_to_mode_[c] = mode;
+    };
+
+    for (size_t t = 0; t < network.tensors.size(); t++)
+      for (size_t m = 0; m < network.tensors[t].modes.size(); m++)
+        assign(network.tensors[t].modes[m]);
+    for (size_t m = 0; m < network.output_modes.size(); m++)
+      assign(network.output_modes[m]);
+  }
 
 public:
   CotengPathOptimizer(const std::string &minimize = "combo",
@@ -188,27 +217,34 @@ public:
     py::gil_scoped_acquire gil;
     auto ctg = py::module_::import("cotengra");
 
-    // Convert int mode labels to strings — cotengrust requires PyString
+    // Build int → single-char mapping
+    build_mode_mapping(network);
+
+    // Convert inputs: each tensor's modes → tuple of single-char strings
     py::list inputs;
     for (size_t i = 0; i < network.tensors.size(); i++) {
-      py::list mode_strs;
+      py::list mode_chars;
       for (size_t j = 0; j < network.tensors[i].modes.size(); j++) {
-        mode_strs.append(py::str(std::to_string(network.tensors[i].modes[j])));
+        char c = mode_to_char_[network.tensors[i].modes[j]];
+        mode_chars.append(py::str(std::string(1, c)));
       }
-      inputs.append(py::tuple(mode_strs));
+      inputs.append(py::tuple(mode_chars));
     }
 
-    py::list output_strs;
+    // Convert output modes
+    py::list output_chars;
     for (size_t i = 0; i < network.output_modes.size(); i++) {
-      output_strs.append(py::str(std::to_string(network.output_modes[i])));
+      char c = mode_to_char_[network.output_modes[i]];
+      output_chars.append(py::str(std::string(1, c)));
     }
-    py::tuple output = py::tuple(output_strs);
+    py::tuple output = py::tuple(output_chars);
 
-    // size_dict: string keys
+    // Convert size_dict: single-char string keys
     py::dict sizes;
     auto size_dict = network.build_size_dict();
     for (auto it = size_dict.begin(); it != size_dict.end(); ++it) {
-      sizes[py::str(std::to_string(it->first))] = it->second;
+      char c = mode_to_char_[it->first];
+      sizes[py::str(std::string(1, c))] = it->second;
     }
 
     uint64_t target_elements = memory_limit_bytes / element_size_bytes_;
@@ -254,14 +290,20 @@ private:
       plan.steps.push_back(step);
     }
 
-    // sliced_inds: keys are strings (mode labels), convert back to int
+    // sliced_inds: keys are single-char strings — map back to int32_t
     py::dict sliced_inds = tree.attr("sliced_inds");
     plan.num_slices = 1;
     for (auto &item : sliced_inds) {
       SliceInfo si;
-      // Mode label is a string — convert back to int32_t
       std::string mode_str = item.first.cast<std::string>();
-      si.mode = static_cast<int32_t>(std::stoi(mode_str));
+      // Reverse map: single char → original int32_t mode
+      if (mode_str.size() == 1 &&
+          char_to_mode_.find(mode_str[0]) != char_to_mode_.end()) {
+        si.mode = char_to_mode_[mode_str[0]];
+      } else {
+        // Fallback: try parsing as integer
+        si.mode = static_cast<int32_t>(std::stoi(mode_str));
+      }
       auto slice_info_obj = item.second;
       si.extent = slice_info_obj.attr("size").cast<int64_t>();
       plan.sliced.push_back(si);
