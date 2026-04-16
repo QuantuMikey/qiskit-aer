@@ -58,6 +58,10 @@ static bool tn_verbose() {
 
 //=============================================================================
 // Helper: compute result modes/extents of a pairwise contraction
+//   Non-final steps: unshared from A, then unshared from B (natural order).
+//   Final step: must be overridden to match network output_modes so that
+//   hipTensor produces the output in the canonical qubit order expected
+//   by Aer's state-vector sampling.
 //=============================================================================
 
 inline void compute_contraction_result(
@@ -70,14 +74,12 @@ inline void compute_contraction_result(
   modes_c.clear();
   extents_c.clear();
 
-  // Find shared modes (contracted)
   std::set<int32_t> shared;
   for (size_t i = 0; i < modes_a.size(); i++)
     for (size_t j = 0; j < modes_b.size(); j++)
       if (modes_a[i] == modes_b[j])
         shared.insert(modes_a[i]);
 
-  // Result = unshared modes from A then unshared from B
   for (size_t i = 0; i < modes_a.size(); i++) {
     if (shared.find(modes_a[i]) == shared.end()) {
       modes_c.push_back(modes_a[i]);
@@ -148,16 +150,11 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   int myrank_;
   reg_t target_gpus_;
 
-  // Sliced tensor descriptions: input specs with sliced modes removed
   std::vector<TensorSpec> sliced_input_specs_;
-  // All tensor specs during path walk (inputs + intermediates)
   std::vector<TensorSpec> all_specs_;
-  // Sliced mode set for fast lookup
   std::set<int32_t> sliced_mode_set_;
-  // Whether pool is set up for current topology
   bool pool_ready_;
 
-  // VQE path reuse
   std::vector<std::vector<int32_t>> prev_modes_;
   std::vector<std::vector<int64_t>> prev_extents_;
   bool prev_valid_;
@@ -332,10 +329,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
     cache_topology();
   }
 
-  // Build sliced tensor specs (input specs with sliced modes removed)
   build_sliced_specs();
 
-  // Set up memory pool and plan cache if not already done
   if (!pool_ready_) {
     setup_pool_and_cache(0);
     pool_ready_ = true;
@@ -392,33 +387,40 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
   size_t num_steps = plan_.steps.size();
   size_t num_total = num_inputs + num_steps;
 
-  // Walk the path to compute all intermediate shapes
   all_specs_.resize(num_total);
   for (size_t i = 0; i < num_inputs; i++)
     all_specs_[i] = sliced_input_specs_[i];
 
+  // Walk path. For the FINAL step, force output modes/extents to match
+  // network output order — hipTensor will permute internally so the
+  // resulting tensor is laid out in canonical qubit order for sampling.
   for (size_t step = 0; step < num_steps; step++) {
     uint64_t left = plan_.steps[step].left;
     uint64_t right = plan_.steps[step].right;
     size_t result_idx = num_inputs + step;
 
-    compute_contraction_result(
-        all_specs_[left].modes, all_specs_[left].extents,
-        all_specs_[right].modes, all_specs_[right].extents,
-        all_specs_[result_idx].modes, all_specs_[result_idx].extents);
+    if (step == num_steps - 1) {
+      // Final step: use network output modes directly
+      all_specs_[result_idx].modes = modes_out_;
+      all_specs_[result_idx].extents = extents_out_;
+    } else {
+      compute_contraction_result(
+          all_specs_[left].modes, all_specs_[left].extents,
+          all_specs_[right].modes, all_specs_[right].extents,
+          all_specs_[result_idx].modes, all_specs_[result_idx].extents);
+    }
   }
 
-  // Compute tensor lifetimes: last step each tensor is used as input
+  // Tensor lifetimes
   std::vector<int> last_used(num_total, -1);
   for (size_t step = 0; step < num_steps; step++) {
     last_used[plan_.steps[step].left] = static_cast<int>(step);
     last_used[plan_.steps[step].right] = static_cast<int>(step);
   }
-  // Final result lives until the end
   if (num_steps > 0)
     last_used[num_inputs + num_steps - 1] = static_cast<int>(num_steps - 1);
 
-  // Pre-populate plan cache for all unique contraction signatures
+  // Pre-populate plan cache
   for (size_t step = 0; step < num_steps; step++) {
     uint64_t left = plan_.steps[step].left;
     uint64_t right = plan_.steps[step].right;
@@ -436,8 +438,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
         all_specs_[result_idx].modes, all_specs_[result_idx].extents);
   }
 
-  // Build memory pool layout for intermediates
-  size_t element_bytes = 2 * sizeof(data_t); // sizeof(complex<data_t>)
+  // Memory pool
+  size_t element_bytes = 2 * sizeof(data_t);
   std::vector<std::tuple<size_t, int, int, int>> intermediates;
 
   for (size_t step = 0; step < num_steps; step++) {
@@ -505,10 +507,6 @@ void TensorNetContractor_HipTensor<data_t>::deallocate_sampling_buffers() {
   gpu_mgr_.primary().deallocate_sampling_buffers();
 }
 
-//=============================================================================
-// Private implementation
-//=============================================================================
-
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::build_network_description() {
   network_desc_.tensors.clear();
@@ -571,8 +569,6 @@ TensorNetContractor_HipTensor<data_t>::create_optimizer() {
   return inner;
 }
 
-// ---- Core contraction loop ----
-
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract_all() {
   for (int idev = 0; idev < num_devices_used_; idev++) {
@@ -583,7 +579,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
 
     hipSetDevice(gpu_mgr_.device(idev).device_id());
 
-    // Zero output buffer for accumulation
     auto &out_buf = gpu_mgr_.device(idev).output_buffer();
     thrust::fill(thrust_gpu::par.on(gpu_mgr_.device(idev).stream()),
                  out_buf.begin(), out_buf.begin() + out_size_,
@@ -606,11 +601,9 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   size_t num_inputs = sliced_input_specs_.size();
   size_t num_steps = plan_.steps.size();
 
-  // Get projected pointers for this slice
   std::vector<void *> projected_ptrs;
   project_slice(slice_index, projected_ptrs);
 
-  // Build pointer array: inputs from projected_ptrs, intermediates from pool
   std::vector<void *> all_ptrs(num_inputs + num_steps, nullptr);
   for (size_t i = 0; i < num_inputs; i++)
     all_ptrs[i] = projected_ptrs[i];
@@ -618,13 +611,11 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   void *workspace = dev.pool().get_workspace_ptr();
   uint64_t ws_size = dev.pool().get_workspace_size();
 
-  // Walk the contraction path
   for (size_t step = 0; step < num_steps; step++) {
     uint64_t left = plan_.steps[step].left;
     uint64_t right = plan_.steps[step].right;
     size_t result_idx = num_inputs + step;
 
-    // Get or retrieve cached plan
     auto sig = build_signature(
         all_specs_[left].modes, all_specs_[left].extents,
         all_specs_[right].modes, all_specs_[right].extents,
@@ -636,21 +627,17 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         all_specs_[right].modes, all_specs_[right].extents,
         all_specs_[result_idx].modes, all_specs_[result_idx].extents);
 
-    // Get result pointer from memory pool
     all_ptrs[result_idx] = dev.pool().get_tensor_ptr(static_cast<int>(result_idx));
 
-    // Execute contraction: D = alpha * A * B + beta * C (beta=0)
     dev.execute_contraction(plan,
         all_ptrs[left], all_ptrs[right], all_ptrs[result_idx],
         workspace, ws_size, false);
   }
 
-  // Accumulate final result into output buffer
+  // Accumulate final result (which is in output_modes order) into output buffer
   size_t final_idx = num_inputs + num_steps - 1;
   void *final_ptr = all_ptrs[final_idx];
-  auto *out_raw = thrust::raw_pointer_cast(dev.output_buffer().data());
 
-  // output_buffer += final_result (buffer was zeroed in contract_all)
   thrust::transform(
       thrust_gpu::par.on(dev.stream()),
       dev.output_buffer().begin(),
@@ -667,7 +654,6 @@ void TensorNetContractor_HipTensor<data_t>::project_slice(
 
   if (plan_.sliced.empty()) return;
 
-  // Decompose slice_index into per-mode values
   std::vector<int64_t> slice_values(plan_.sliced.size());
   uint_t remaining = slice_index;
   for (int i = static_cast<int>(plan_.sliced.size()) - 1; i >= 0; i--) {
@@ -675,24 +661,20 @@ void TensorNetContractor_HipTensor<data_t>::project_slice(
     remaining /= plan_.sliced[i].extent;
   }
 
-  // Build mode -> slice_value map
   std::map<int32_t, int64_t> slice_map;
   for (size_t i = 0; i < plan_.sliced.size(); i++)
     slice_map[plan_.sliced[i].mode] = slice_values[i];
 
   size_t element_bytes = 2 * sizeof(data_t);
 
-  // For each input tensor, compute pointer offset from sliced modes
   for (size_t t = 0; t < network_desc_.tensors.size(); t++) {
     const TensorSpec &spec = network_desc_.tensors[t];
     int64_t offset_elements = 0;
 
-    // Compute row-major strides for the ORIGINAL (unsliced) tensor
     std::vector<int64_t> strides(spec.modes.size(), 1);
     for (int i = static_cast<int>(spec.modes.size()) - 2; i >= 0; i--)
       strides[i] = strides[i + 1] * spec.extents[i + 1];
 
-    // Add offset for each sliced mode present in this tensor
     for (size_t m = 0; m < spec.modes.size(); m++) {
       auto it = slice_map.find(spec.modes[m]);
       if (it != slice_map.end())
@@ -704,8 +686,6 @@ void TensorNetContractor_HipTensor<data_t>::project_slice(
                           offset_elements * element_bytes;
   }
 }
-
-// ---- Multi-GPU accumulation ----
 
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::accumulate_across_gpus() {
@@ -765,8 +745,6 @@ void TensorNetContractor_HipTensor<data_t>::accumulate_across_mpi() {
   hipStreamSynchronize(gpu_mgr_.primary().stream());
 #endif
 }
-
-// ---- Sampling ----
 
 template <typename data_t>
 double TensorNetContractor_HipTensor<data_t>::sample_measure_on_primary(
