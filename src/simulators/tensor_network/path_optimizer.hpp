@@ -230,37 +230,6 @@ class CotengPathOptimizer : public PathOptimizer {
       assign(network.output_modes[m]);
   }
 
-  // Build optlib_opts dict with the seed routed correctly for each backend.
-  //
-  // cotengra's HyperOptimizer forwards optlib_opts to the backend's setup()
-  // method. Each backend expects the seed in a different place:
-  //
-  //   optuna: {"sampler_opts": {"seed": N}}
-  //           → OptunaOptLib.setup() unpacks sampler_opts
-  //           → TPESampler(seed=N)
-  //   cmaes:  {"seed": N}
-  //           → CMAESOptLib.setup() absorbs via **cmaes_opts
-  //           → cmaes.CMA(seed=N)
-  //   sbplx:  (no seed) — backend doesn't accept a seed kwarg
-  //   sses:   (no seed) — evolutionary strategy without a named seed param
-  //
-  // Passing a seed to a backend that rejects it raises TypeError at
-  // HyperOptimizer construction. We silently omit it for the two backends
-  // that don't support it — reproducibility will be limited to whatever
-  // those backends' internal state provides (process-level RNG usually).
-  py::dict build_optlib_opts(const std::string &optlib, uint64_t seed) {
-    py::dict optlib_opts;
-    if (optlib == "optuna") {
-      py::dict sampler_opts;
-      sampler_opts["seed"] = seed;
-      optlib_opts["sampler_opts"] = sampler_opts;
-    } else if (optlib == "cmaes") {
-      optlib_opts["seed"] = seed;
-    }
-    // sbplx, sses: return empty dict — these backends don't accept a seed.
-    return optlib_opts;
-  }
-
 public:
   CotengPathOptimizer(const std::string &minimize = "combo",
                       int max_repeats = 128, double max_time = 60.0,
@@ -314,8 +283,7 @@ public:
     py::object tree;
 
     if (preset_ == "random-greedy") {
-      // RandomGreedyOptimizer takes seed as a direct named kwarg — no backend
-      // routing required.
+      // RandomGreedyOptimizer takes seed as a direct named kwarg — no routing.
       auto opt = ctg.attr("RandomGreedyOptimizer")(
           py::arg("max_repeats") = max_repeats_,
           py::arg("max_time") = max_time_,
@@ -323,13 +291,37 @@ public:
           py::arg("progbar") = false);
       tree = opt.attr("search")(inputs, output, sizes);
     } else {
-      // HyperOptimizer path: backend is chosen by AER_TN_OPTLIB env var.
-      // Seed must be routed through optlib_opts in a backend-specific way
-      // (see build_optlib_opts above). Passing py::arg("seed") directly to
-      // HyperOptimizer would leak into **kwargs and eventually hit
-      // optuna.create_study(seed=...) which rejects that kwarg.
+      // HyperOptimizer path: backend chosen by AER_TN_OPTLIB env var.
+      //
+      // *** Seed routing — cotengra 0.7.5 specific ***
+      //
+      // cotengra 0.7.5's HyperOptimizer.__init__ signature names its **kwargs
+      // variable literally `optlib_opts`. Any extra kwargs we pass at the top
+      // level land in that dict, which is then unpacked into the backend's
+      // init function via:
+      //
+      //     self._optimizer["init"](self, methods, space, **optlib_opts)
+      //
+      // For the optuna backend, the init function is:
+      //
+      //     def optuna_init_optimizers(self, methods, space,
+      //                                sampler="TPESampler",
+      //                                sampler_opts=None,
+      //                                **create_study_opts):
+      //         sampler = getattr(optuna.samplers, sampler)(**sampler_opts)
+      //         ...
+      //
+      // So passing sampler_opts={"seed": N} as a top-level kwarg to
+      // HyperOptimizer flows into TPESampler(seed=N) — exactly where optuna
+      // expects the seed. Anything else would leak into create_study_opts and
+      // then to optuna.create_study(), causing TypeError.
+      //
+      // For the cmaes backend, the 0.7.5 init function is expected to accept
+      // seed via its **kwargs which then flows to cmaes.CMA(seed=N). Passing
+      // seed= at the top level should work — if it doesn't, we'll iterate.
+      //
+      // For sbplx and sses we silently omit the seed (they don't support it).
       std::string optlib = path_optlib();
-      py::dict optlib_opts = build_optlib_opts(optlib, seed);
 
       if (path_verbose()) {
         fprintf(stderr,
@@ -337,15 +329,31 @@ public:
                 optlib.c_str(), (unsigned long)seed);
       }
 
-      auto opt = ctg.attr("HyperOptimizer")(
-          py::arg("minimize") = minimize_,
-          py::arg("max_repeats") = max_repeats_,
-          py::arg("max_time") = max_time_,
-          py::arg("optlib") = optlib,
-          py::arg("optlib_opts") = optlib_opts,
-          py::arg("slicing_opts") = slicing_opts,
-          py::arg("reconf_opts") = reconf_opts,
-          py::arg("progbar") = false);
+      // Build the call args. We ALWAYS pass the standard named params. The
+      // seed-routing kwarg is added conditionally per backend using py::dict
+      // of extra kwargs merged in via py::kwargs.
+      py::dict kwargs;
+      kwargs["minimize"] = minimize_;
+      kwargs["max_repeats"] = max_repeats_;
+      kwargs["max_time"] = max_time_;
+      kwargs["optlib"] = optlib;
+      kwargs["slicing_opts"] = slicing_opts;
+      kwargs["reconf_opts"] = reconf_opts;
+      kwargs["progbar"] = false;
+
+      if (optlib == "optuna") {
+        // Flows to optuna_init_optimizers(sampler_opts=...) then TPESampler.
+        py::dict sampler_opts;
+        sampler_opts["seed"] = seed;
+        kwargs["sampler_opts"] = sampler_opts;
+      } else if (optlib == "cmaes") {
+        // Flows through **optlib_opts into cmaes backend's init kwargs, which
+        // forward to cmaes.CMA(seed=N).
+        kwargs["seed"] = seed;
+      }
+      // sbplx, sses: no seed kwarg (backends don't accept it).
+
+      auto opt = ctg.attr("HyperOptimizer")(**kwargs);
       tree = opt.attr("search")(inputs, output, sizes);
     }
 
