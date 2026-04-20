@@ -172,6 +172,52 @@ inline void compute_contraction_result(
 }
 
 //=============================================================================
+// Helper: remap mode IDs to a safe range for hipTensor.
+//
+// hipTensor 1.5.0 on gfx90a silently produces zero output when contraction
+// descriptors contain mode IDs in a large-negative range (observed with
+// cotengra-hashed IDs around -1.3e9). Small positive IDs always work. This
+// helper builds a deterministic remap for the combined A/B/C mode sets so
+// hipTensor sees only small positive integers. The mapping is derived from
+// the input order and is stable across calls that pass the same mode ID
+// sequence, so two identical calls produce identical remapped IDs (and
+// therefore identical plan cache signatures).
+//
+// Does not modify the inputs. Returns fresh remapped arrays in modes_a_out,
+// modes_b_out, modes_c_out. Extents are not remapped (they're unaffected).
+//
+// This is a workaround for a hipTensor/CK bug on AMD gfx90a. cuTensorNet on
+// NVIDIA does not exhibit the sensitivity.
+//=============================================================================
+
+inline void
+remap_modes_to_safe_range(const std::vector<int32_t> &modes_a,
+                          const std::vector<int32_t> &modes_b,
+                          const std::vector<int32_t> &modes_c,
+                          std::vector<int32_t> &modes_a_out,
+                          std::vector<int32_t> &modes_b_out,
+                          std::vector<int32_t> &modes_c_out) {
+  std::unordered_map<int32_t, int32_t> remap;
+  auto apply = [&](const std::vector<int32_t> &in, std::vector<int32_t> &out) {
+    out.clear();
+    out.reserve(in.size());
+    for (int32_t m : in) {
+      auto it = remap.find(m);
+      if (it == remap.end()) {
+        int32_t new_id = static_cast<int32_t>(remap.size()) + 1;
+        remap.emplace(m, new_id);
+        out.push_back(new_id);
+      } else {
+        out.push_back(it->second);
+      }
+    }
+  };
+  apply(modes_a, modes_a_out);
+  apply(modes_b, modes_b_out);
+  apply(modes_c, modes_c_out);
+}
+
+//=============================================================================
 // Helper: pad a pairwise contraction so hipTensor's M/N/K grammar holds.
 //
 // hipTensor / Composable Kernel enforce that every contraction has at least
@@ -802,24 +848,27 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     last_used[num_inputs + num_steps - 1] = static_cast<int>(num_steps - 1);
 
   for (size_t step = 0; step < num_steps; step++) {
-    uint64_t left = plan_.steps[step].left;
-    uint64_t right = plan_.steps[step].right;
-    size_t result_idx = num_inputs + step;
-
     // Use the padded per-step descriptor shape, not the raw all_specs_
     // (which for inputs may differ from what this specific plan needs).
     const PlanSpec &ps = step_plan_specs_[step];
 
+    // Remap mode IDs to a safe range (see remap_modes_to_safe_range above).
+    // Must use identical logic to contract_single_slice so cache
+    // signatures match between pre-population here and execution later.
+    std::vector<int32_t> modes_a_safe, modes_b_safe, modes_c_safe;
+    remap_modes_to_safe_range(ps.modes_a, ps.modes_b, ps.modes_c,
+                              modes_a_safe, modes_b_safe, modes_c_safe);
+
     auto sig = build_signature(
-        ps.modes_a, ps.extents_a,
-        ps.modes_b, ps.extents_b,
-        ps.modes_c, ps.extents_c);
+        modes_a_safe, ps.extents_a,
+        modes_b_safe, ps.extents_b,
+        modes_c_safe, ps.extents_c);
 
     dev.plan_cache().get_or_create(
         sig,
-        ps.modes_a, ps.extents_a,
-        ps.modes_b, ps.extents_b,
-        ps.modes_c, ps.extents_c);
+        modes_a_safe, ps.extents_a,
+        modes_b_safe, ps.extents_b,
+        modes_c_safe, ps.extents_c);
   }
 
   size_t element_bytes = 2 * sizeof(data_t);
@@ -1033,25 +1082,9 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     // cuTensorNet on NVIDIA does not exhibit this sensitivity. If AMD
     // fixes CK to handle the full int32 range, this remap becomes a
     // no-op and can be removed.
-    std::unordered_map<int32_t, int32_t> remap;
-    auto remap_modes = [&](const std::vector<int32_t> &in) {
-      std::vector<int32_t> out;
-      out.reserve(in.size());
-      for (int32_t m : in) {
-        auto it = remap.find(m);
-        if (it == remap.end()) {
-          int32_t new_id = static_cast<int32_t>(remap.size()) + 1;
-          remap.emplace(m, new_id);
-          out.push_back(new_id);
-        } else {
-          out.push_back(it->second);
-        }
-      }
-      return out;
-    };
-    std::vector<int32_t> modes_a_safe = remap_modes(ps.modes_a);
-    std::vector<int32_t> modes_b_safe = remap_modes(ps.modes_b);
-    std::vector<int32_t> modes_c_safe = remap_modes(ps.modes_c);
+    std::vector<int32_t> modes_a_safe, modes_b_safe, modes_c_safe;
+    remap_modes_to_safe_range(ps.modes_a, ps.modes_b, ps.modes_c,
+                              modes_a_safe, modes_b_safe, modes_c_safe);
 
     // Cache signature uses the remapped IDs so identical remapped
     // descriptors hit the cache. Two different original signatures that

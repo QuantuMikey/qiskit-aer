@@ -164,6 +164,21 @@ template <typename data_t> struct CachedPlan {
   hiptensorTensorDescriptor_t desc_a;
   hiptensorTensorDescriptor_t desc_b;
   hiptensorTensorDescriptor_t desc_c;
+
+  // Persistent copies of the mode and extent arrays we hand to hipTensor.
+  // hiptensorInitContractionDescriptor and hiptensorInitTensorDescriptor
+  // retain the caller-provided pointers (modes_a.data(), extents_a.data(),
+  // etc.) rather than copying. If we pass pointers to caller-local vectors
+  // those become dangling the moment the caller's stack frame unwinds, and
+  // any later use of this plan reads freed memory - observed as silent
+  // zero-output. Owning the arrays here keeps them alive for the plan's
+  // lifetime.
+  std::vector<int32_t> modes_a_storage;
+  std::vector<int32_t> modes_b_storage;
+  std::vector<int32_t> modes_c_storage;
+  std::vector<int64_t> extents_a_storage;
+  std::vector<int64_t> extents_b_storage;
+  std::vector<int64_t> extents_c_storage;
 };
 
 template <typename data_t> class HipTensorPlanCache {
@@ -239,6 +254,20 @@ public:
     }
     CachedPlan<data_t> &cp = *slot;
 
+    // Copy the mode and extent arrays into persistent storage owned by the
+    // CachedPlan. hipTensor retains the pointers we pass to
+    // hiptensorInitTensorDescriptor and hiptensorInitContractionDescriptor
+    // rather than deep-copying; if we hand it pointers into caller-local
+    // vectors, those pointers dangle the moment the caller returns. Copying
+    // into cp's own storage and handing hipTensor cp's pointers keeps them
+    // valid for the plan's full lifetime.
+    cp.modes_a_storage = modes_a;
+    cp.modes_b_storage = modes_b;
+    cp.modes_c_storage = modes_c;
+    cp.extents_a_storage = extents_a;
+    cp.extents_b_storage = extents_b;
+    cp.extents_c_storage = extents_c;
+
     hipSetDevice(device_id_);
 
     hipDataType hip_dtype;
@@ -253,26 +282,26 @@ public:
 
     uint32_t align = TENSOR_POINTER_ALIGN;
     check_hiptensor(hiptensorInitTensorDescriptor(
-        handle_, &cp.desc_a, static_cast<uint32_t>(modes_a.size()),
-        extents_a.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
+        handle_, &cp.desc_a, static_cast<uint32_t>(cp.modes_a_storage.size()),
+        cp.extents_a_storage.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
         "hiptensorInitTensorDescriptor(A)", device_id_);
 
     check_hiptensor(hiptensorInitTensorDescriptor(
-        handle_, &cp.desc_b, static_cast<uint32_t>(modes_b.size()),
-        extents_b.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
+        handle_, &cp.desc_b, static_cast<uint32_t>(cp.modes_b_storage.size()),
+        cp.extents_b_storage.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
         "hiptensorInitTensorDescriptor(B)", device_id_);
 
     check_hiptensor(hiptensorInitTensorDescriptor(
-        handle_, &cp.desc_c, static_cast<uint32_t>(modes_c.size()),
-        extents_c.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
+        handle_, &cp.desc_c, static_cast<uint32_t>(cp.modes_c_storage.size()),
+        cp.extents_c_storage.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
         "hiptensorInitTensorDescriptor(C)", device_id_);
 
     check_hiptensor(hiptensorInitContractionDescriptor(
         handle_, &cp.desc,
-        &cp.desc_a, modes_a.data(), align,
-        &cp.desc_b, modes_b.data(), align,
-        &cp.desc_c, modes_c.data(), align,
-        &cp.desc_c, modes_c.data(), align,
+        &cp.desc_a, cp.modes_a_storage.data(), align,
+        &cp.desc_b, cp.modes_b_storage.data(), align,
+        &cp.desc_c, cp.modes_c_storage.data(), align,
+        &cp.desc_c, cp.modes_c_storage.data(), align,
         compute_type),
         "hiptensorInitContractionDescriptor", device_id_);
 
