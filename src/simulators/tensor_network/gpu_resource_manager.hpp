@@ -43,17 +43,27 @@ namespace TensorNetwork {
 // Alignment
 //=============================================================================
 // Alignment we promise hipTensor for every tensor pointer we hand it (A, B, C,
-// and D). Must be:
-//   1. A value hipTensor / Composable Kernel accepts (128 and 256 are both
-//      accepted on gfx9-family MI-series GPUs running hipTensor 1.5).
-//   2. Actually satisfied by every pointer we pass — both input tensor slabs
-//      (from hipMalloc, which returns 256-byte-aligned memory on ROCm) and
-//      intermediate-pool offsets. The pool's find_offset() and plan_layout()
-//      round offsets up to this same value, which is why promising an
-//      alignment stricter than the pool's granularity would be a subtle lie
-//      to the library.
-// Keep TENSOR_POINTER_ALIGN and the pool's offset rounding synced.
-static constexpr uint32_t TENSOR_POINTER_ALIGN = 256;
+// and D). Must be a value that is actually satisfied by every pointer we pass —
+// both input tensor slabs and intermediate-pool offsets.
+//
+// hiptensorGetAlignmentRequirement, when queried on a real pool pointer for
+// HIP_C_64F, returns 16 (one complex-double element width). That is the true
+// hardware requirement for Composable Kernel's bilinear kernels on gfx90a.
+//
+// Prior versions of this file used 256, which was wrong: the pool's
+// find_offset() only rounds up to this value on overlap bumps, not on every
+// allocation, so closely-packed intermediates end up at offsets like +0x80 or
+// +0xc0 within a 256-byte-aligned base. Telling hipTensor align=256 while
+// passing a 128-byte-aligned pointer caused the kernel to compute wrong
+// byte offsets for downstream reads and silently produced zero output
+// beyond the first contraction (manifested as the Gate 1.5 Bell-state
+// failure: step 0 correct, step 1+ all zero).
+//
+// 16 matches both the library's actual requirement and what the pool
+// naturally produces when sizing allocations in element-granular units.
+// If a future hardware target raises this, also update the find_offset()
+// rounding in the memory pool to match.
+static constexpr uint32_t TENSOR_POINTER_ALIGN = 16;
 
 //=============================================================================
 // Diagnostic logging
