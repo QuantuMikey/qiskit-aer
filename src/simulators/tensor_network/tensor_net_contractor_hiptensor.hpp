@@ -22,6 +22,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 #include <hip/hip_runtime.h>
@@ -1019,16 +1020,55 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     // shapes, so the lookup is O(1) after the first slice.
     const PlanSpec &ps = step_plan_specs_[step];
 
+    // ---- Mode ID remap ----
+    // hipTensor / Composable Kernel silently produces zero output when
+    // mode IDs are large negative (observed experimentally with
+    // cotengra-hashed IDs in the -1.3e9 range). Small positive mode IDs
+    // always work. Remap A/B/C mode IDs into {1, 2, 3, ...} per-step so
+    // the descriptor hipTensor sees only contains safe values. The
+    // semantic mode IDs stay in ps.modes_* for all other bookkeeping
+    // (plan cache signature, debug logging, all_specs_).
+    //
+    // This is a workaround for a bug in hipTensor 1.5.0 on gfx90a.
+    // cuTensorNet on NVIDIA does not exhibit this sensitivity. If AMD
+    // fixes CK to handle the full int32 range, this remap becomes a
+    // no-op and can be removed.
+    std::unordered_map<int32_t, int32_t> remap;
+    auto remap_modes = [&](const std::vector<int32_t> &in) {
+      std::vector<int32_t> out;
+      out.reserve(in.size());
+      for (int32_t m : in) {
+        auto it = remap.find(m);
+        if (it == remap.end()) {
+          int32_t new_id = static_cast<int32_t>(remap.size()) + 1;
+          remap.emplace(m, new_id);
+          out.push_back(new_id);
+        } else {
+          out.push_back(it->second);
+        }
+      }
+      return out;
+    };
+    std::vector<int32_t> modes_a_safe = remap_modes(ps.modes_a);
+    std::vector<int32_t> modes_b_safe = remap_modes(ps.modes_b);
+    std::vector<int32_t> modes_c_safe = remap_modes(ps.modes_c);
+
+    // Cache signature uses the remapped IDs so identical remapped
+    // descriptors hit the cache. Two different original signatures that
+    // remap to the same sequence of small-positive IDs with identical
+    // extents would cache-collide, but since mode identity within a
+    // descriptor is determined only by position + extent, this is the
+    // correct semantics for hipTensor anyway.
     auto sig = build_signature(
-        ps.modes_a, ps.extents_a,
-        ps.modes_b, ps.extents_b,
-        ps.modes_c, ps.extents_c);
+        modes_a_safe, ps.extents_a,
+        modes_b_safe, ps.extents_b,
+        modes_c_safe, ps.extents_c);
 
     const CachedPlan<data_t> &plan = dev.plan_cache().get_or_create(
         sig,
-        ps.modes_a, ps.extents_a,
-        ps.modes_b, ps.extents_b,
-        ps.modes_c, ps.extents_c);
+        modes_a_safe, ps.extents_a,
+        modes_b_safe, ps.extents_b,
+        modes_c_safe, ps.extents_c);
 
     all_ptrs[result_idx] = dev.pool().get_tensor_ptr(static_cast<int>(result_idx));
 
