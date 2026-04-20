@@ -14,6 +14,8 @@
 
 #ifdef AER_THRUST_ROCM
 
+#include <atomic>
+#include <climits>
 #include <complex>
 #include <cstdlib>
 #include <map>
@@ -62,6 +64,30 @@ static bool tn_debug() {
   if (!checked) {
     const char *val = std::getenv("AER_TN_DEBUG");
     enabled = (val != nullptr && std::string(val) == "1");
+    checked = true;
+  }
+  return enabled;
+}
+
+// hipTensor requires every contraction descriptor to have at least one free
+// mode on A (the M group), at least one free mode on B (the N group), and at
+// least one shared mode (the K group). Pairwise contractions that the
+// cotengra-generated path produces for small quantum circuits routinely
+// violate this (e.g., matrix-times-vector with no free B modes). When they
+// do, hipTensor's plan validation accepts the descriptor, but no registered
+// CK kernel matches the shape — hiptensorContraction returns SUCCESS and
+// leaves the output buffer untouched. Padding each offending operand with
+// a dummy mode of extent 1 makes the descriptor grammar-compliant without
+// touching device memory (extent-1 dims are layout-free).
+//
+// This kill-switch lets you bisect: unset it to reproduce the pre-fix
+// behavior. Default is enabled.
+static bool tn_mnk_padding_enabled() {
+  static bool checked = false;
+  static bool enabled = true;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_DISABLE_MNK_PADDING");
+    enabled = !(val != nullptr && std::string(val) == "1");
     checked = true;
   }
   return enabled;
@@ -145,6 +171,76 @@ inline void compute_contraction_result(
 }
 
 //=============================================================================
+// Helper: pad a pairwise contraction so hipTensor's M/N/K grammar holds.
+//
+// hipTensor / Composable Kernel enforce that every contraction has at least
+// one free mode on A (M), one free mode on B (N), and one shared mode (K).
+// If a natural pairwise contraction violates this (common for rank-1 tensors
+// in quantum circuits: statevector legs, small intermediates), we add a
+// dummy mode of extent 1 to the appropriate operand plus the output. Extent-
+// 1 modes don't change memory layout, so we don't need to touch any device
+// data — only the descriptors passed to hiptensorInitTensorDescriptor.
+//
+// All three tensors' modes/extents are modified in place. If padding was
+// applied, the returned pair of ints tells the caller how many dummy modes
+// were appended to C so it can strip them back off if the caller tracks
+// semantic (unpadded) modes separately. Returned as (num_dummies_on_C).
+//
+// Dummy modes are drawn from a distinct range (below DUMMY_MODE_BASE) so
+// they can never collide with legitimate mode IDs produced by TensorNet's
+// mode_index_ counter (which starts at 0 and increments upward; the int32
+// "large negative" values we see in logs come from hashing, but they stay
+// above INT32_MIN + 2^30). Using INT32_MIN + small-positive-counter for
+// dummies keeps them well clear.
+//=============================================================================
+
+inline int
+pad_contraction_mnk(std::vector<int32_t> &modes_a, std::vector<int64_t> &extents_a,
+                    std::vector<int32_t> &modes_b, std::vector<int64_t> &extents_b,
+                    std::vector<int32_t> &modes_c, std::vector<int64_t> &extents_c) {
+  // Allocator for dummy mode IDs. Process-lifetime counter — collisions across
+  // concurrent TensorNetContractor instances are impossible because each plan
+  // consumes its own dummies and discards them after hiptensorContraction is
+  // called. Value is far from any mode_index_-generated real mode.
+  static std::atomic<int32_t> dummy_counter{INT32_MIN + 1};
+
+  std::set<int32_t> sa(modes_a.begin(), modes_a.end());
+  std::set<int32_t> sb(modes_b.begin(), modes_b.end());
+
+  bool has_M = false, has_N = false, has_K = false;
+  for (int32_t m : modes_a) {
+    if (sb.count(m)) has_K = true; else has_M = true;
+  }
+  for (int32_t m : modes_b) {
+    if (!sa.count(m)) { has_N = true; break; }
+  }
+
+  int dummies_on_c = 0;
+  if (!has_K) {
+    // No shared mode: add a shared extent-1 dummy to both A and B.
+    // The dummy does NOT go on C (K modes are contracted away).
+    int32_t d = dummy_counter.fetch_add(1);
+    modes_a.push_back(d); extents_a.push_back(1);
+    modes_b.push_back(d); extents_b.push_back(1);
+  }
+  if (!has_M) {
+    // A has no free mode. Add a dummy free mode to A (and to C so it's not
+    // contracted). Extent 1 so total element count is unchanged.
+    int32_t d = dummy_counter.fetch_add(1);
+    modes_a.push_back(d); extents_a.push_back(1);
+    modes_c.push_back(d); extents_c.push_back(1);
+    dummies_on_c++;
+  }
+  if (!has_N) {
+    int32_t d = dummy_counter.fetch_add(1);
+    modes_b.push_back(d); extents_b.push_back(1);
+    modes_c.push_back(d); extents_c.push_back(1);
+    dummies_on_c++;
+  }
+  return dummies_on_c;
+}
+
+//=============================================================================
 // Sampling GPU kernel
 //=============================================================================
 
@@ -204,6 +300,16 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   std::vector<TensorSpec> all_specs_;
   std::set<int32_t> sliced_mode_set_;
   bool pool_ready_;
+
+  // Per-step descriptor shape used when submitting contractions to hipTensor.
+  // Each PlanSpec holds the (possibly MNK-padded) modes/extents for A, B, C.
+  // Input tensors may appear in multiple steps with different padding, which
+  // is why this is per-step, not per-tensor. Rebuilt on every setup_pool_and_cache.
+  struct PlanSpec {
+    std::vector<int32_t> modes_a, modes_b, modes_c;
+    std::vector<int64_t> extents_a, extents_b, extents_c;
+  };
+  std::vector<PlanSpec> step_plan_specs_;
 
   std::vector<std::vector<int32_t>> prev_modes_;
   std::vector<std::vector<int64_t>> prev_extents_;
@@ -575,52 +681,113 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
   }
 
   // Walk path to compute intermediate shapes.
+  //
+  // For each step we compute the natural (unpadded) output modes/extents.
+  // Then, if the step's contraction shape violates hipTensor's M/N/K
+  // grammar, we pad the inputs and the output with extent-1 dummy modes.
+  // The padded C is stored in all_specs_[result_idx] so downstream steps
+  // see the padded shape and stay consistent.
+  //
+  // We also record the per-step padded A/B/C modes in step_plan_specs_ so
+  // contract_single_slice can look up the exact descriptor shape for each
+  // hiptensorContraction call. Input tensors may appear in multiple steps
+  // with different padding, so we can't pad them in sliced_input_specs_.
+  step_plan_specs_.assign(num_steps, PlanSpec{});
+
   for (size_t step = 0; step < num_steps; step++) {
     uint64_t left = plan_.steps[step].left;
     uint64_t right = plan_.steps[step].right;
     size_t result_idx = num_inputs + step;
 
-    if (step == num_steps - 1) {
-      // Final step: output modes must match network output modes.
-      std::vector<int32_t> natural_modes;
-      std::vector<int64_t> natural_extents;
-      compute_contraction_result(
-          all_specs_[left].modes, all_specs_[left].extents,
-          all_specs_[right].modes, all_specs_[right].extents,
-          natural_modes, natural_extents);
+    // Natural (unpadded) A and B modes come from all_specs_ (which for inputs
+    // reflects sliced_input_specs_, and for earlier intermediates reflects
+    // their padded forms — that's fine, the padded form is just the valid
+    // shape with extent-1 dummies which don't affect downstream semantics).
+    std::vector<int32_t> modes_a = all_specs_[left].modes;
+    std::vector<int64_t> extents_a = all_specs_[left].extents;
+    std::vector<int32_t> modes_b = all_specs_[right].modes;
+    std::vector<int64_t> extents_b = all_specs_[right].extents;
 
-      std::set<int32_t> natural_set(natural_modes.begin(), natural_modes.end());
+    std::vector<int32_t> modes_c;
+    std::vector<int64_t> extents_c;
+    compute_contraction_result(modes_a, extents_a, modes_b, extents_b,
+                               modes_c, extents_c);
+
+    int dummies_on_c = 0;
+    if (tn_mnk_padding_enabled()) {
+      dummies_on_c = pad_contraction_mnk(modes_a, extents_a,
+                                         modes_b, extents_b,
+                                         modes_c, extents_c);
+    }
+
+    if (step == num_steps - 1) {
+      // Final step: the C we produce must match modes_out_ (plus any
+      // padding dummies, which are extent-1 and so don't affect element
+      // count or the output buffer's memory layout).
+      //
+      // Compare sets without the dummy modes — dummies live in the
+      // [INT32_MIN + 1, INT32_MIN + N] range.
+      std::set<int32_t> natural_set;
+      for (int32_t m : modes_c) {
+        if (m > INT32_MIN + (1 << 20)) natural_set.insert(m);
+      }
       std::set<int32_t> output_set(modes_out_.begin(), modes_out_.end());
 
       if (natural_set != output_set) {
         if (tn_debug()) {
           fprintf(stderr,
                   "[AER_TN_DEBUG] WARNING: final step modes %s don't match output %s\n",
-                  modes_to_str(natural_modes).c_str(),
+                  modes_to_str(modes_c).c_str(),
                   modes_to_str(modes_out_).c_str());
         }
-        all_specs_[result_idx].modes = natural_modes;
-        all_specs_[result_idx].extents = natural_extents;
+        // Fall back to the padded natural modes. Element count still
+        // equals num_elements() of modes_out_ because dummies are extent 1.
+        all_specs_[result_idx].modes = modes_c;
+        all_specs_[result_idx].extents = extents_c;
       } else {
-        all_specs_[result_idx].modes = modes_out_;
-        all_specs_[result_idx].extents = extents_out_;
+        // Use modes_out_ order for the real modes, keep any dummies
+        // appended. This matches the memory layout the caller expects
+        // (modes_out_ order) while preserving the padded descriptor.
+        std::vector<int32_t> final_modes = modes_out_;
+        std::vector<int64_t> final_extents = extents_out_;
+        // Append any dummy modes from modes_c that aren't in modes_out_.
+        for (size_t i = 0; i < modes_c.size(); i++) {
+          if (natural_set.count(modes_c[i]) == 0) {
+            final_modes.push_back(modes_c[i]);
+            final_extents.push_back(extents_c[i]);
+          }
+        }
+        // Rebuild modes_c/extents_c in the new order so the plan's C
+        // descriptor matches the physical layout we want.
+        modes_c = final_modes;
+        extents_c = final_extents;
+        all_specs_[result_idx].modes = final_modes;
+        all_specs_[result_idx].extents = final_extents;
       }
     } else {
-      compute_contraction_result(
-          all_specs_[left].modes, all_specs_[left].extents,
-          all_specs_[right].modes, all_specs_[right].extents,
-          all_specs_[result_idx].modes, all_specs_[result_idx].extents);
+      all_specs_[result_idx].modes = modes_c;
+      all_specs_[result_idx].extents = extents_c;
     }
+
+    // Record the exact per-plan descriptor shape for contract_single_slice.
+    step_plan_specs_[step].modes_a = modes_a;
+    step_plan_specs_[step].extents_a = extents_a;
+    step_plan_specs_[step].modes_b = modes_b;
+    step_plan_specs_[step].extents_b = extents_b;
+    step_plan_specs_[step].modes_c = modes_c;
+    step_plan_specs_[step].extents_c = extents_c;
 
     if (tn_debug()) {
       fprintf(stderr,
               "[AER_TN_DEBUG]   step %zu: T%ld x T%ld -> T%zu   "
-              "modes_l=%s modes_r=%s modes_c=%s num_el=%ld%s\n",
+              "modes_l=%s modes_r=%s modes_c=%s num_el=%ld%s%s\n",
               step, (long)left, (long)right, result_idx,
-              modes_to_str(all_specs_[left].modes).c_str(),
-              modes_to_str(all_specs_[right].modes).c_str(),
-              modes_to_str(all_specs_[result_idx].modes).c_str(),
+              modes_to_str(modes_a).c_str(),
+              modes_to_str(modes_b).c_str(),
+              modes_to_str(modes_c).c_str(),
               (long)all_specs_[result_idx].num_elements(),
+              (dummies_on_c > 0 || modes_a.size() > all_specs_[left].modes.size() ||
+               modes_b.size() > all_specs_[right].modes.size()) ? " [padded]" : "",
               (step == num_steps - 1) ? " (FINAL)" : "");
     }
   }
@@ -638,16 +805,20 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     uint64_t right = plan_.steps[step].right;
     size_t result_idx = num_inputs + step;
 
+    // Use the padded per-step descriptor shape, not the raw all_specs_
+    // (which for inputs may differ from what this specific plan needs).
+    const PlanSpec &ps = step_plan_specs_[step];
+
     auto sig = build_signature(
-        all_specs_[left].modes, all_specs_[left].extents,
-        all_specs_[right].modes, all_specs_[right].extents,
-        all_specs_[result_idx].modes, all_specs_[result_idx].extents);
+        ps.modes_a, ps.extents_a,
+        ps.modes_b, ps.extents_b,
+        ps.modes_c, ps.extents_c);
 
     dev.plan_cache().get_or_create(
         sig,
-        all_specs_[left].modes, all_specs_[left].extents,
-        all_specs_[right].modes, all_specs_[right].extents,
-        all_specs_[result_idx].modes, all_specs_[result_idx].extents);
+        ps.modes_a, ps.extents_a,
+        ps.modes_b, ps.extents_b,
+        ps.modes_c, ps.extents_c);
   }
 
   size_t element_bytes = 2 * sizeof(data_t);
@@ -843,18 +1014,41 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     uint64_t right = plan_.steps[step].right;
     size_t result_idx = num_inputs + step;
 
+    // Use the per-step padded descriptor shape we recorded in
+    // setup_pool_and_cache. The plan cache is keyed on these same
+    // shapes, so the lookup is O(1) after the first slice.
+    const PlanSpec &ps = step_plan_specs_[step];
+
     auto sig = build_signature(
-        all_specs_[left].modes, all_specs_[left].extents,
-        all_specs_[right].modes, all_specs_[right].extents,
-        all_specs_[result_idx].modes, all_specs_[result_idx].extents);
+        ps.modes_a, ps.extents_a,
+        ps.modes_b, ps.extents_b,
+        ps.modes_c, ps.extents_c);
 
     const CachedPlan<data_t> &plan = dev.plan_cache().get_or_create(
         sig,
-        all_specs_[left].modes, all_specs_[left].extents,
-        all_specs_[right].modes, all_specs_[right].extents,
-        all_specs_[result_idx].modes, all_specs_[result_idx].extents);
+        ps.modes_a, ps.extents_a,
+        ps.modes_b, ps.extents_b,
+        ps.modes_c, ps.extents_c);
 
     all_ptrs[result_idx] = dev.pool().get_tensor_ptr(static_cast<int>(result_idx));
+
+    // Defense in depth against two orthogonal failure modes:
+    //   1. The pool memory for this intermediate is freshly allocated or
+    //      aliased from a prior step, so its contents are undefined.
+    //   2. hiptensorContraction's C pointer aliases its D pointer (we pass
+    //      ptr_c for both with beta=0). Per the API spec C is only read
+    //      when beta!=0, but CK bilinear kernels have historically done an
+    //      RMW on the D tile regardless, and under -ffast-math (which the
+    //      Aer build uses) reading uninitialized memory can produce NaNs
+    //      that propagate via 0*NaN=NaN and get flushed to junk.
+    // Zeroing D before the call kills both hazards at microsecond cost.
+    {
+      size_t c_bytes =
+          static_cast<size_t>(all_specs_[result_idx].num_elements()) *
+          2 * sizeof(data_t);
+      check_hip(hipMemsetAsync(all_ptrs[result_idx], 0, c_bytes, dev.stream()),
+                "hipMemsetAsync(C pre-zero)", dev.device_id());
+    }
 
     if (tn_debug()) {
       fprintf(stderr,
@@ -862,7 +1056,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
               "A_ptr=%p B_ptr=%p C_ptr=%p ws=%p ws_sz=%lu modes_c=%s\n",
               step, all_ptrs[left], all_ptrs[right], all_ptrs[result_idx],
               workspace, (unsigned long)ws_size,
-              modes_to_str(all_specs_[result_idx].modes).c_str());
+              modes_to_str(ps.modes_c).c_str());
     }
 
     dev.execute_contraction(plan,

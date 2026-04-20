@@ -40,6 +40,22 @@ namespace AER {
 namespace TensorNetwork {
 
 //=============================================================================
+// Alignment
+//=============================================================================
+// Alignment we promise hipTensor for every tensor pointer we hand it (A, B, C,
+// and D). Must be:
+//   1. A value hipTensor / Composable Kernel accepts (128 and 256 are both
+//      accepted on gfx9-family MI-series GPUs running hipTensor 1.5).
+//   2. Actually satisfied by every pointer we pass — both input tensor slabs
+//      (from hipMalloc, which returns 256-byte-aligned memory on ROCm) and
+//      intermediate-pool offsets. The pool's find_offset() and plan_layout()
+//      round offsets up to this same value, which is why promising an
+//      alignment stricter than the pool's granularity would be a subtle lie
+//      to the library.
+// Keep TENSOR_POINTER_ALIGN and the pool's offset rounding synced.
+static constexpr uint32_t TENSOR_POINTER_ALIGN = 256;
+
+//=============================================================================
 // Diagnostic logging
 //=============================================================================
 
@@ -185,7 +201,7 @@ public:
       compute_type = HIPTENSOR_COMPUTE_C32F;
     }
 
-    uint32_t align = 256;
+    uint32_t align = TENSOR_POINTER_ALIGN;
     check_hiptensor(hiptensorInitTensorDescriptor(
         handle_, &cp.desc_a, static_cast<uint32_t>(modes_a.size()),
         extents_a.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
@@ -312,7 +328,7 @@ public:
     pool_size_ = 0;
     for (size_t i = 0; i < allocations_.size(); i++)
       pool_size_ = std::max(pool_size_, allocations_[i].offset + allocations_[i].size);
-    pool_size_ = ((pool_size_ + 255) / 256) * 256;
+    pool_size_ = ((pool_size_ + TENSOR_POINTER_ALIGN - 1) / TENSOR_POINTER_ALIGN) * TENSOR_POINTER_ALIGN;
 
     if (memory_verbose()) {
       fprintf(stderr, "[AER_TN_MEMORY] pool: %zu allocs, %zu bytes (%.2f MB)\n",
@@ -378,7 +394,7 @@ private:
                           offset + size > allocations_[i].offset);
         if (sp_overlap) {
           offset = allocations_[i].offset + allocations_[i].size;
-          offset = ((offset + 255) / 256) * 256;
+          offset = ((offset + TENSOR_POINTER_ALIGN - 1) / TENSOR_POINTER_ALIGN) * TENSOR_POINTER_ALIGN;
           placed = false;
           break;
         }
@@ -689,12 +705,18 @@ public:
     hiptensorContractionDescriptor_t desc;
     hiptensorContractionFind_t find;
     uint64_t workspace = 0;
-    uint32_t align = 256;
+    uint32_t align = TENSOR_POINTER_ALIGN;
 
     auto status = hiptensorInitTensorDescriptor(
         primary.handle(), &da, 2, extents.data(), nullptr,
         hip_dtype, HIPTENSOR_OP_IDENTITY);
-    if (status != HIPTENSOR_STATUS_SUCCESS) return 64 * 1024 * 1024;
+    if (status != HIPTENSOR_STATUS_SUCCESS) {
+      fprintf(stderr,
+              "[AER_TN_GPU] WARNING: workspace probe could not init tensor "
+              "descriptor (hipTensor status %d); falling back to 64 MB budget\n",
+              (int)status);
+      return 64 * 1024 * 1024;
+    }
 
     hiptensorInitTensorDescriptor(primary.handle(), &db, 2, extents.data(),
         nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY);
@@ -706,7 +728,13 @@ public:
         &da, modes_a.data(), align, &db, modes_b.data(), align,
         &dc, modes_c.data(), align, &dc, modes_c.data(), align,
         compute_type);
-    if (status != HIPTENSOR_STATUS_SUCCESS) return 64 * 1024 * 1024;
+    if (status != HIPTENSOR_STATUS_SUCCESS) {
+      fprintf(stderr,
+              "[AER_TN_GPU] WARNING: workspace probe could not init contraction "
+              "descriptor (hipTensor status %d); falling back to 64 MB budget\n",
+              (int)status);
+      return 64 * 1024 * 1024;
+    }
 
     hiptensorInitContractionFind(primary.handle(), &find, HIPTENSOR_ALGO_DEFAULT);
     hiptensorContractionGetWorkspaceSize(
