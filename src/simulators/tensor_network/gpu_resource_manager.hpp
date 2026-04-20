@@ -169,6 +169,10 @@ template <typename data_t> struct CachedPlan {
 template <typename data_t> class HipTensorPlanCache {
   std::unordered_map<ContractionSignature, CachedPlan<data_t>,
                      ContractionSignatureHash> cache_;
+  // Storage slot used only when AER_TN_DISABLE_PLAN_CACHE=1. Initialized
+  // fresh on every get_or_create call so the returned reference is valid
+  // until the next call. Not thread-safe, but neither is the cache itself.
+  CachedPlan<data_t> overwritten_slot_;
   hiptensorHandle_t *handle_;
   int device_id_;
 
@@ -188,17 +192,53 @@ public:
                 const std::vector<int64_t> &extents_b,
                 const std::vector<int32_t> &modes_c,
                 const std::vector<int64_t> &extents_c) {
-    auto it = cache_.find(sig);
-    if (it != cache_.end())
-      return it->second;
+    // Diagnostic kill switch: forces a fresh plan build on every call via
+    // an always-rebuilt slot outside the cache map. Useful when suspecting
+    // cache-relocation hazards; AER_TN_DISABLE_PLAN_CACHE=1 activates it.
+    const char *disable_cache_env = std::getenv("AER_TN_DISABLE_PLAN_CACHE");
+    bool cache_disabled =
+        (disable_cache_env != nullptr && std::string(disable_cache_env) == "1");
+
+    if (!cache_disabled) {
+      auto it = cache_.find(sig);
+      if (it != cache_.end())
+        return it->second;
+    }
 
     if (gpu_verbose()) {
       fprintf(stderr,
-              "[AER_TN_GPU] plan cache miss — A(%zu) x B(%zu) -> C(%zu) (dev %d)\n",
+              "[AER_TN_GPU] plan %s — A(%zu) x B(%zu) -> C(%zu) (dev %d)\n",
+              cache_disabled ? "rebuild (cache disabled)" : "cache miss",
               modes_a.size(), modes_b.size(), modes_c.size(), device_id_);
     }
 
-    CachedPlan<data_t> cp;
+    // CRITICAL LIFETIME RULE:
+    // hiptensorInitContractionDescriptor may store &desc_a / &desc_b / &desc_c
+    // inside the returned desc, and hiptensorInitContractionPlan may likewise
+    // store pointers into the descriptor members. If we initialize these
+    // objects on the stack and then copy them into the cache map, the map's
+    // copy ends up with internal pointers to the discarded stack frame —
+    // manifesting as silent zero-output on subsequent contractions because the
+    // plan internally dereferences freed / overwritten memory.
+    //
+    // Fix: insert an empty CachedPlan into the map FIRST, take a reference
+    // to the stored object, and initialize descriptors and plan directly on
+    // that stored object. All hipTensor-internal pointers then refer to the
+    // map entry's permanent heap address, which remains valid for the
+    // lifetime of the cache.
+    //
+    // For the diagnostic cache-disabled path we still need a stable storage
+    // slot. Use a persistent member (overwritten_slot_) so the returned
+    // reference is valid until the next call to get_or_create.
+    CachedPlan<data_t> *slot = nullptr;
+    if (cache_disabled) {
+      slot = &overwritten_slot_;
+    } else {
+      auto result = cache_.emplace(sig, CachedPlan<data_t>{});
+      slot = &result.first->second;
+    }
+    CachedPlan<data_t> &cp = *slot;
+
     hipSetDevice(device_id_);
 
     hipDataType hip_dtype;
@@ -250,8 +290,11 @@ public:
         handle_, &cp.plan, &cp.desc, &cp.find, cp.workspace_bytes),
         "hiptensorInitContractionPlan", device_id_);
 
-    auto result = cache_.emplace(sig, cp);
-    return result.first->second;
+    // cp is already stored in its final location (either the cache map
+    // entry or overwritten_slot_), so hipTensor's internal pointers into
+    // &cp.desc_a / &cp.desc_b / &cp.desc_c / &cp.desc / &cp.find are
+    // stable for the lifetime of that storage. No further copy needed.
+    return cp;
   }
 
   uint64_t max_workspace_bytes() const {
