@@ -189,8 +189,13 @@ public:
 //=============================================================================
 // CotengPathOptimizer — cotengra via pybind11
 //
-//   cotengrust requires SINGLE-CHARACTER string mode labels (einsum style).
-//   We map each unique int32_t mode to a char from a-z, A-Z (52 max).
+//   We need to hand cotengra an einsum-style description of the network,
+//   with a string label for each unique int32_t mode. cotengra/opt_einsum
+//   accept any hashable label; the canonical way to scale beyond the
+//   52-char a-zA-Z alphabet is cotengra.get_symbol(i), which returns a
+//   unique unicode character for any non-negative i — cotengra's own
+//   utils.lattice_equation uses this for 100+ index networks. We store
+//   labels as std::string (UTF-8) so a unicode char fits unchanged.
 //=============================================================================
 
 #ifdef AER_HIPTENSOR
@@ -202,25 +207,27 @@ class CotengPathOptimizer : public PathOptimizer {
   std::string preset_;
   size_t element_size_bytes_;
 
-  // Mode label mapping: int32_t <-> single char (built per find_path call)
-  std::map<int32_t, char> mode_to_char_;
-  std::map<char, int32_t> char_to_mode_;
+  // Mode label mapping: int32_t <-> UTF-8 string (built per find_path call).
+  // Labels come from cotengra.get_symbol(i): 'a'-'z' for i<26, 'A'-'Z' for
+  // 26<=i<52, then unicode chars thereafter. Stored as std::string because
+  // the unicode chars are multi-byte in UTF-8.
+  std::map<int32_t, std::string> mode_to_label_;
+  std::map<std::string, int32_t> label_to_mode_;
 
   void build_mode_mapping(const NetworkDescription &network) {
-    mode_to_char_.clear();
-    char_to_mode_.clear();
-    // Sequence: a-z (0-25), A-Z (26-51)
-    const char *alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    int next_idx = 0;
+    mode_to_label_.clear();
+    label_to_mode_.clear();
 
+    py::gil_scoped_acquire gil;
+    py::object get_symbol =
+        py::module_::import("cotengra").attr("get_symbol");
+
+    int next_idx = 0;
     auto assign = [&](int32_t mode) {
-      if (mode_to_char_.find(mode) != mode_to_char_.end()) return;
-      if (next_idx >= 52)
-        throw std::runtime_error("CotengPathOptimizer: >52 unique modes "
-                                 "(exceeds einsum character limit)");
-      char c = alphabet[next_idx++];
-      mode_to_char_[mode] = c;
-      char_to_mode_[c] = mode;
+      if (mode_to_label_.find(mode) != mode_to_label_.end()) return;
+      std::string label = get_symbol(next_idx++).cast<std::string>();
+      mode_to_label_[mode] = label;
+      label_to_mode_[label] = mode;
     };
 
     for (size_t t = 0; t < network.tensors.size(); t++)
@@ -244,34 +251,32 @@ public:
     py::gil_scoped_acquire gil;
     auto ctg = py::module_::import("cotengra");
 
-    // Build int → single-char mapping
+    // Build int → string label mapping
     build_mode_mapping(network);
 
-    // Convert inputs: each tensor's modes → tuple of single-char strings
+    // Convert inputs: each tensor's modes → tuple of label strings
     py::list inputs;
     for (size_t i = 0; i < network.tensors.size(); i++) {
-      py::list mode_chars;
+      py::list mode_labels;
       for (size_t j = 0; j < network.tensors[i].modes.size(); j++) {
-        char c = mode_to_char_[network.tensors[i].modes[j]];
-        mode_chars.append(py::str(std::string(1, c)));
+        mode_labels.append(
+            py::str(mode_to_label_[network.tensors[i].modes[j]]));
       }
-      inputs.append(py::tuple(mode_chars));
+      inputs.append(py::tuple(mode_labels));
     }
 
     // Convert output modes
-    py::list output_chars;
+    py::list output_labels;
     for (size_t i = 0; i < network.output_modes.size(); i++) {
-      char c = mode_to_char_[network.output_modes[i]];
-      output_chars.append(py::str(std::string(1, c)));
+      output_labels.append(py::str(mode_to_label_[network.output_modes[i]]));
     }
-    py::tuple output = py::tuple(output_chars);
+    py::tuple output = py::tuple(output_labels);
 
-    // Convert size_dict: single-char string keys
+    // Convert size_dict: label string keys
     py::dict sizes;
     auto size_dict = network.build_size_dict();
     for (auto it = size_dict.begin(); it != size_dict.end(); ++it) {
-      char c = mode_to_char_[it->first];
-      sizes[py::str(std::string(1, c))] = it->second;
+      sizes[py::str(mode_to_label_[it->first])] = it->second;
     }
 
     uint64_t target_elements = memory_limit_bytes / element_size_bytes_;
@@ -373,19 +378,27 @@ private:
       plan.steps.push_back(step);
     }
 
-    // sliced_inds: keys are single-char strings — map back to int32_t
+    // sliced_inds: keys are label strings — map back to int32_t
     py::dict sliced_inds = tree.attr("sliced_inds");
     plan.num_slices = 1;
     for (auto &item : sliced_inds) {
       SliceInfo si;
       std::string mode_str = item.first.cast<std::string>();
-      // Reverse map: single char → original int32_t mode
-      if (mode_str.size() == 1 &&
-          char_to_mode_.find(mode_str[0]) != char_to_mode_.end()) {
-        si.mode = char_to_mode_[mode_str[0]];
+      // Primary: reverse-lookup in the label_to_mode_ map we built when
+      // sending the network to cotengra.
+      auto it = label_to_mode_.find(mode_str);
+      if (it != label_to_mode_.end()) {
+        si.mode = it->second;
       } else {
-        // Fallback: try parsing as integer
-        si.mode = static_cast<int32_t>(std::stoi(mode_str));
+        // Fallback: an integer-valued string. Kept for safety even though
+        // cotengra preserves label identity in practice.
+        try {
+          si.mode = static_cast<int32_t>(std::stoi(mode_str));
+        } catch (const std::exception &) {
+          throw std::runtime_error(
+              "CotengPathOptimizer: cannot resolve sliced mode label "
+              "returned by cotengra");
+        }
       }
       auto slice_info_obj = item.second;
       si.extent = slice_info_obj.attr("size").cast<int64_t>();
