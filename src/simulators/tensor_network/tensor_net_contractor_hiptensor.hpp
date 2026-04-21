@@ -763,6 +763,40 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
   // contract_single_slice can look up the exact descriptor shape for each
   // hiptensorContraction call. Input tensors may appear in multiple steps
   // with different padding, so we can't pad them in sliced_input_specs_.
+  //
+  // Dummy stripping: a padding dummy from step N is just a rank-filler for
+  // that one contraction's M or N requirement. Once the step completes it
+  // carries no information — it's an extent-1 axis with no correspondence
+  // in the natural tensor network. But without intervention, dummies ride
+  // along as "free" modes through the whole contraction chain, causing
+  // the output rank of late steps to balloon. hipTensor 1.5.0 on gfx90a
+  // has observed shape-specific correctness bugs (e.g. rank-12 C with 3+
+  // consecutive extent-1 modes silently writes only half the output
+  // tensor — n=10 QAOA ring triggers this, n=9 doesn't). We eliminate
+  // the accumulation by stripping extent-1 modes from A and B's
+  // descriptors at the START of each step, letting that step's
+  // pad_contraction_mnk re-add only the dummies IT needs. Downstream
+  // steps then see the minimum-rank spec for C.
+  //
+  // Memory layout is unaffected: extent-1 axes contribute nothing to
+  // stride or element count, so stripping them is purely a descriptor
+  // change. No data movement.
+  auto strip_extent_one = [](std::vector<int32_t> &modes,
+                             std::vector<int64_t> &extents) {
+    std::vector<int32_t> m;
+    std::vector<int64_t> e;
+    m.reserve(modes.size());
+    e.reserve(extents.size());
+    for (size_t i = 0; i < modes.size(); i++) {
+      if (extents[i] > 1) {
+        m.push_back(modes[i]);
+        e.push_back(extents[i]);
+      }
+    }
+    modes = std::move(m);
+    extents = std::move(e);
+  };
+
   step_plan_specs_.assign(num_steps, PlanSpec{});
 
   for (size_t step = 0; step < num_steps; step++) {
@@ -778,6 +812,14 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     std::vector<int64_t> extents_a = all_specs_[left].extents;
     std::vector<int32_t> modes_b = all_specs_[right].modes;
     std::vector<int64_t> extents_b = all_specs_[right].extents;
+
+    // Strip extent-1 dummies from A and B before this step's planning.
+    // Any dummies THIS step genuinely needs will be re-added by
+    // pad_contraction_mnk below. Keeping descriptors at their minimum
+    // natural rank sidesteps the hipTensor/CK rank-12-plus-consecutive-
+    // dummies bug documented above.
+    strip_extent_one(modes_a, extents_a);
+    strip_extent_one(modes_b, extents_b);
 
     std::vector<int32_t> modes_c;
     std::vector<int64_t> extents_c;
