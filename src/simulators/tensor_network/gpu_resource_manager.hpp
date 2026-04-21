@@ -66,6 +66,33 @@ namespace TensorNetwork {
 static constexpr uint32_t TENSOR_POINTER_ALIGN = 16;
 
 //=============================================================================
+// Split-complex tensor layout
+//=============================================================================
+// hipTensor 1.5.0 on gfx90a has broken complex contractions: kernels either
+// silently no-op or run a real kernel that leaves the imaginary plane
+// uninitialized. Real contractions work correctly. To support complex
+// semantics we store each tensor's real and imaginary values in separate
+// contiguous planes and issue four real contractions per complex
+// contraction:
+//
+//   Dr = Ar*Br - Ai*Bi
+//   Di = Ar*Bi + Ai*Br
+//
+// Each tensor occupies 2 * plane_bytes(N) bytes in the pool. The real plane
+// starts at offset 0; the imaginary plane at offset plane_bytes(N). Planes
+// are padded up to a 16-byte boundary so the imag plane is properly aligned
+// for hipTensor regardless of N's parity.
+inline size_t plane_bytes(int64_t num_elements, size_t element_size) {
+  size_t raw = static_cast<size_t>(num_elements) * element_size;
+  return (raw + 15u) & ~size_t{15u};
+}
+
+// Total bytes a single split-complex tensor occupies in the pool.
+inline size_t tensor_slot_bytes(int64_t num_elements, size_t element_size) {
+  return 2 * plane_bytes(num_elements, element_size);
+}
+
+//=============================================================================
 // Diagnostic logging
 //=============================================================================
 
@@ -270,14 +297,18 @@ public:
 
     hipSetDevice(device_id_);
 
+    // Split-complex contractions: descriptors see REAL tensors. hipTensor
+    // 1.5.0's complex path is broken on gfx90a; we decompose each complex
+    // contraction into four real contractions in execute_contraction. One
+    // plan (one shape, one compute type) serves all four calls.
     hipDataType hip_dtype;
     hiptensorComputeType_t compute_type;
     if (sizeof(data_t) == 8) {
-      hip_dtype = HIP_C_64F;
-      compute_type = HIPTENSOR_COMPUTE_C64F;
+      hip_dtype = HIP_R_64F;
+      compute_type = HIPTENSOR_COMPUTE_64F;
     } else {
-      hip_dtype = HIP_C_32F;
-      compute_type = HIPTENSOR_COMPUTE_C32F;
+      hip_dtype = HIP_R_32F;
+      compute_type = HIPTENSOR_COMPUTE_32F;
     }
 
     uint32_t align = TENSOR_POINTER_ALIGN;
@@ -487,6 +518,25 @@ private:
 };
 
 //=============================================================================
+// AccumulatePlanarFunctor
+//=============================================================================
+// Adds a split-complex tensor into an interleaved thrust::complex output
+// buffer. Used by GPUDevice::accumulate_planar_to_output. We use an
+// explicit functor rather than a device lambda to match the Aer build's
+// existing pattern and avoid extended-lambda compile flag dependencies.
+template <typename data_t> struct AccumulatePlanarFunctor {
+  thrust::complex<data_t> *out;
+  const data_t *re;
+  const data_t *im;
+  AccumulatePlanarFunctor(thrust::complex<data_t> *o, const data_t *r,
+                          const data_t *i)
+      : out(o), re(r), im(i) {}
+  __host__ __device__ void operator()(const size_t &i) const {
+    out[i] += thrust::complex<data_t>(re[i], im[i]);
+  }
+};
+
+//=============================================================================
 // GPUDevice
 //=============================================================================
 
@@ -558,12 +608,17 @@ public:
       const std::vector<std::shared_ptr<Tensor<data_t>>> &tensors,
       bool add_sp_tensors) {
     hipSetDevice(device_id_);
-    size_t total_elements = 0;
+
+    // Split-complex tensor layout. For each tensor we reserve
+    // 2 * plane_bytes(N, sizeof(data_t)) bytes — enough for a real plane
+    // and an imag plane, with the imag plane 16-byte-aligned relative to
+    // the tensor slot start. Total device bytes is the sum of slot sizes.
+    size_t total_bytes = 0;
     for (size_t i = 0; i < tensors.size(); i++)
       if (add_sp_tensors || !tensors[i]->sp_tensor())
-        total_elements += tensors[i]->tensor().size();
+        total_bytes += tensor_slot_bytes(
+            static_cast<int64_t>(tensors[i]->tensor().size()), sizeof(data_t));
 
-    size_t total_bytes = total_elements * sizeof(std::complex<data_t>);
     if (tensor_data_size_ < total_bytes) {
       if (tensor_data_ptr_) hipFree(tensor_data_ptr_);
       check_hip(hipMalloc(&tensor_data_ptr_, total_bytes),
@@ -572,17 +627,42 @@ public:
     }
 
     std::vector<void *> ptrs;
-    size_t offset = 0;
+    size_t byte_offset = 0;
     for (size_t i = 0; i < tensors.size(); i++) {
       if (add_sp_tensors || !tensors[i]->sp_tensor()) {
-        void *dst = static_cast<char *>(tensor_data_ptr_) +
-                    offset * sizeof(std::complex<data_t>);
+        size_t n = tensors[i]->tensor().size();
+        size_t pb = plane_bytes(static_cast<int64_t>(n), sizeof(data_t));
+        void *dst = static_cast<char *>(tensor_data_ptr_) + byte_offset;
         ptrs.push_back(dst);
-        check_hip(hipMemcpyAsync(dst, tensors[i]->tensor().data(),
-                     tensors[i]->tensor().size() * sizeof(std::complex<data_t>),
-                     hipMemcpyHostToDevice, stream_),
-            "hipMemcpyAsync(tensor_data)", device_id_);
-        offset += tensors[i]->tensor().size();
+
+        // Host tensor data is interleaved std::complex<data_t>. Split into
+        // real and imag planes via two strided H2D copies. hipMemcpy2DAsync
+        // semantics: (dst, dpitch, src, spitch, width, height, kind).
+        // width = sizeof(data_t) (one scalar per row), height = n.
+        const char *src_host =
+            reinterpret_cast<const char *>(tensors[i]->tensor().data());
+
+        // Real plane: dst at offset 0, src starts at byte 0, src stride
+        // sizeof(std::complex<data_t>) skips the imag word each row.
+        check_hip(hipMemcpy2DAsync(
+            dst, sizeof(data_t),
+            src_host, sizeof(std::complex<data_t>),
+            sizeof(data_t), n,
+            hipMemcpyHostToDevice, stream_),
+            "hipMemcpy2DAsync(tensor_data_re)", device_id_);
+
+        // Imag plane: dst at offset plane_bytes, src starts at the imag
+        // half of the first complex word (sizeof(data_t) bytes in), stride
+        // sizeof(std::complex<data_t>).
+        check_hip(hipMemcpy2DAsync(
+            static_cast<char *>(dst) + pb, sizeof(data_t),
+            src_host + sizeof(data_t), sizeof(std::complex<data_t>),
+            sizeof(data_t), n,
+            hipMemcpyHostToDevice, stream_),
+            "hipMemcpy2DAsync(tensor_data_im)", device_id_);
+
+        byte_offset += tensor_slot_bytes(
+            static_cast<int64_t>(n), sizeof(data_t));
       }
     }
     hipStreamSynchronize(stream_);
@@ -636,19 +716,103 @@ public:
   }
 
   // Execute pairwise contraction. accumulate=true uses beta=1 (D += A*B).
-  void execute_contraction(const CachedPlan<data_t> &plan, void *ptr_a,
-                           void *ptr_b, void *ptr_c, void *workspace,
-                           uint64_t workspace_size,
+  //
+  // Split-complex decomposition: A, B, C are stored with real and imaginary
+  // planes in separate contiguous regions of the pool slot. Given pointers
+  // ptr_{a,b,c} to slot starts and the element counts, we derive plane
+  // pointers and issue four real contractions (one hipTensor plan, four
+  // different pointer combinations and alpha/beta values):
+  //
+  //   Cr = Ar*Br - Ai*Bi
+  //   Ci = Ar*Bi + Ai*Br
+  //
+  // When accumulate=true the initial beta is 1 instead of 0 so we add into
+  // the pre-existing Cr / Ci values. The two subsequent calls always use
+  // beta=1 since they accumulate onto the partial result from the first
+  // call of each pair.
+  void execute_contraction(const CachedPlan<data_t> &plan,
+                           void *ptr_a, size_t num_elements_a,
+                           void *ptr_b, size_t num_elements_b,
+                           void *ptr_c, size_t num_elements_c,
+                           void *workspace, uint64_t workspace_size,
                            bool accumulate = false) {
     hipSetDevice(device_id_);
-    std::complex<data_t> alpha(1.0, 0.0);
-    std::complex<data_t> beta = accumulate ?
-        std::complex<data_t>(1.0, 0.0) : std::complex<data_t>(0.0, 0.0);
+
+    const size_t plane_a = plane_bytes(
+        static_cast<int64_t>(num_elements_a), sizeof(data_t));
+    const size_t plane_b = plane_bytes(
+        static_cast<int64_t>(num_elements_b), sizeof(data_t));
+    const size_t plane_c = plane_bytes(
+        static_cast<int64_t>(num_elements_c), sizeof(data_t));
+
+    data_t *Ar = reinterpret_cast<data_t *>(ptr_a);
+    data_t *Ai = reinterpret_cast<data_t *>(
+        reinterpret_cast<char *>(ptr_a) + plane_a);
+    data_t *Br = reinterpret_cast<data_t *>(ptr_b);
+    data_t *Bi = reinterpret_cast<data_t *>(
+        reinterpret_cast<char *>(ptr_b) + plane_b);
+    data_t *Cr = reinterpret_cast<data_t *>(ptr_c);
+    data_t *Ci = reinterpret_cast<data_t *>(
+        reinterpret_cast<char *>(ptr_c) + plane_c);
+
+    const data_t pos_one = static_cast<data_t>(1.0);
+    const data_t neg_one = static_cast<data_t>(-1.0);
+    const data_t zero    = static_cast<data_t>(0.0);
+    const data_t initial_beta = accumulate ? pos_one : zero;
+
+    // Cr = Ar * Br  (beta = initial)
     check_hiptensor(
-        hiptensorContraction(ht_handle_, &plan.plan, &alpha, ptr_a, ptr_b,
-                             &beta, ptr_c, ptr_c, workspace, workspace_size,
-                             stream_),
-        "hiptensorContraction", device_id_);
+        hiptensorContraction(ht_handle_, &plan.plan,
+                             &pos_one, Ar, Br,
+                             &initial_beta, Cr, Cr,
+                             workspace, workspace_size, stream_),
+        "hiptensorContraction(Cr=Ar*Br)", device_id_);
+    // Cr -= Ai * Bi  (beta = 1, alpha = -1)
+    check_hiptensor(
+        hiptensorContraction(ht_handle_, &plan.plan,
+                             &neg_one, Ai, Bi,
+                             &pos_one, Cr, Cr,
+                             workspace, workspace_size, stream_),
+        "hiptensorContraction(Cr-=Ai*Bi)", device_id_);
+    // Ci = Ar * Bi  (beta = initial)
+    check_hiptensor(
+        hiptensorContraction(ht_handle_, &plan.plan,
+                             &pos_one, Ar, Bi,
+                             &initial_beta, Ci, Ci,
+                             workspace, workspace_size, stream_),
+        "hiptensorContraction(Ci=Ar*Bi)", device_id_);
+    // Ci += Ai * Br  (beta = 1, alpha = 1)
+    check_hiptensor(
+        hiptensorContraction(ht_handle_, &plan.plan,
+                             &pos_one, Ai, Br,
+                             &pos_one, Ci, Ci,
+                             workspace, workspace_size, stream_),
+        "hiptensorContraction(Ci+=Ai*Br)", device_id_);
+  }
+
+  // Accumulate a split-complex tensor (stored with real plane followed by
+  // imag plane, each of num_elements data_t values) into the interleaved
+  // thrust complex output buffer dev_out_. Used at the end of each slice
+  // contraction to add the final slice's contribution to the running
+  // total.
+  void accumulate_planar_to_output(void *planar_tensor_ptr,
+                                   size_t num_elements) {
+    hipSetDevice(device_id_);
+    const size_t pb = plane_bytes(
+        static_cast<int64_t>(num_elements), sizeof(data_t));
+    const data_t *re = reinterpret_cast<const data_t *>(planar_tensor_ptr);
+    const data_t *im = reinterpret_cast<const data_t *>(
+        reinterpret_cast<const char *>(planar_tensor_ptr) + pb);
+
+    thrust::complex<data_t> *out =
+        thrust::raw_pointer_cast(dev_out_.data());
+
+    AccumulatePlanarFunctor<data_t> fn(out, re, im);
+    thrust::for_each_n(
+        thrust_gpu::par.on(stream_),
+        thrust::counting_iterator<size_t>(0),
+        num_elements,
+        fn);
   }
 
   void get_output(std::vector<std::complex<data_t>> &out) {
@@ -779,9 +943,9 @@ public:
     std::vector<int32_t> modes_b = {1, 2};
     std::vector<int32_t> modes_c = {0, 2};
 
-    hipDataType hip_dtype = (sizeof(data_t) == 8) ? HIP_C_64F : HIP_C_32F;
+    hipDataType hip_dtype = (sizeof(data_t) == 8) ? HIP_R_64F : HIP_R_32F;
     hiptensorComputeType_t compute_type =
-        (sizeof(data_t) == 8) ? HIPTENSOR_COMPUTE_C64F : HIPTENSOR_COMPUTE_C32F;
+        (sizeof(data_t) == 8) ? HIPTENSOR_COMPUTE_64F : HIPTENSOR_COMPUTE_32F;
 
     hiptensorTensorDescriptor_t da, db, dc;
     hiptensorContractionDescriptor_t desc;

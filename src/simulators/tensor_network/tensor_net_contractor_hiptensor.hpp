@@ -124,14 +124,22 @@ template <typename data_t>
 void dump_device_tensor(const char *label, void *dev_ptr, int64_t num_elements,
                         int max_print = 8) {
   if (!tn_debug()) return;
-  std::vector<std::complex<data_t>> host(num_elements);
-  hipMemcpy(host.data(), dev_ptr,
-            num_elements * sizeof(std::complex<data_t>),
-            hipMemcpyDeviceToHost);
+  // Split-complex tensor slot layout: real plane, then (16B-aligned) imag
+  // plane. Copy both planes back to host and assemble complex values.
+  std::vector<data_t> host_re(num_elements);
+  std::vector<data_t> host_im(num_elements);
+  const size_t pb = plane_bytes(num_elements, sizeof(data_t));
+  hipMemcpy(host_re.data(), dev_ptr,
+            num_elements * sizeof(data_t), hipMemcpyDeviceToHost);
+  hipMemcpy(host_im.data(),
+            static_cast<char *>(dev_ptr) + pb,
+            num_elements * sizeof(data_t), hipMemcpyDeviceToHost);
   fprintf(stderr, "[AER_TN_DEBUG] %s [%ld elements]:", label, (long)num_elements);
   int n_print = (int)std::min<int64_t>(num_elements, max_print);
   for (int i = 0; i < n_print; i++) {
-    fprintf(stderr, " (%.3f,%.3fi)", host[i].real(), host[i].imag());
+    fprintf(stderr, " (%.3f,%.3fi)",
+            static_cast<double>(host_re[i]),
+            static_cast<double>(host_im[i]));
   }
   if (num_elements > max_print) fprintf(stderr, " ...");
   fprintf(stderr, "\n");
@@ -583,15 +591,31 @@ template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::update_additional_tensors(
     const std::vector<std::shared_ptr<Tensor<data_t>>> &tensors) {
   hipSetDevice(gpu_mgr_.primary().device_id());
+  hipStream_t stream = gpu_mgr_.primary().stream();
+  int dev_id = gpu_mgr_.primary().device_id();
   size_t base = num_base_tensors_;
+  // Split-complex H2D: two strided copies (real plane then imag plane).
+  // Must match the layout established in GPUDevice::copy_tensor_data.
   for (size_t i = 0; i < tensors.size() && (base + i) < tensor_device_ptrs_.size(); i++) {
-    check_hip(hipMemcpyAsync(
-        tensor_device_ptrs_[base + i], tensors[i]->tensor().data(),
-        tensors[i]->tensor().size() * sizeof(std::complex<data_t>),
-        hipMemcpyHostToDevice, gpu_mgr_.primary().stream()),
-        "hipMemcpyAsync(update)", gpu_mgr_.primary().device_id());
+    size_t n = tensors[i]->tensor().size();
+    size_t pb = plane_bytes(static_cast<int64_t>(n), sizeof(data_t));
+    void *dst = tensor_device_ptrs_[base + i];
+    const char *src_host =
+        reinterpret_cast<const char *>(tensors[i]->tensor().data());
+    check_hip(hipMemcpy2DAsync(
+        dst, sizeof(data_t),
+        src_host, sizeof(std::complex<data_t>),
+        sizeof(data_t), n,
+        hipMemcpyHostToDevice, stream),
+        "hipMemcpy2DAsync(update_re)", dev_id);
+    check_hip(hipMemcpy2DAsync(
+        static_cast<char *>(dst) + pb, sizeof(data_t),
+        src_host + sizeof(data_t), sizeof(std::complex<data_t>),
+        sizeof(data_t), n,
+        hipMemcpyHostToDevice, stream),
+        "hipMemcpy2DAsync(update_im)", dev_id);
   }
-  hipStreamSynchronize(gpu_mgr_.primary().stream());
+  hipStreamSynchronize(stream);
 }
 
 template <typename data_t>
@@ -871,13 +895,14 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
         modes_c_safe, ps.extents_c);
   }
 
-  size_t element_bytes = 2 * sizeof(data_t);
+  // Each intermediate occupies a split-complex tensor slot: two planes
+  // (real, imag), each padded to a 16-byte boundary.
   std::vector<std::tuple<size_t, int, int, int>> intermediates;
 
   for (size_t step = 0; step < num_steps; step++) {
     size_t result_idx = num_inputs + step;
     int64_t num_elements = all_specs_[result_idx].num_elements();
-    size_t bytes = static_cast<size_t>(num_elements) * element_bytes;
+    size_t bytes = tensor_slot_bytes(num_elements, sizeof(data_t));
     int birth = static_cast<int>(step);
     int death = last_used[result_idx];
     if (death < 0) death = static_cast<int>(num_steps - 1);
@@ -1114,11 +1139,11 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     //      RMW on the D tile regardless, and under -ffast-math (which the
     //      Aer build uses) reading uninitialized memory can produce NaNs
     //      that propagate via 0*NaN=NaN and get flushed to junk.
-    // Zeroing D before the call kills both hazards at microsecond cost.
+    // Zeroing the full slot (both real and imag planes) before the call
+    // kills both hazards at microsecond cost.
     {
-      size_t c_bytes =
-          static_cast<size_t>(all_specs_[result_idx].num_elements()) *
-          2 * sizeof(data_t);
+      size_t c_bytes = tensor_slot_bytes(
+          all_specs_[result_idx].num_elements(), sizeof(data_t));
       check_hip(hipMemsetAsync(all_ptrs[result_idx], 0, c_bytes, dev.stream()),
                 "hipMemsetAsync(C pre-zero)", dev.device_id());
     }
@@ -1132,8 +1157,15 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
               modes_to_str(ps.modes_c).c_str());
     }
 
+    // Split-complex decomposition requires per-tensor element counts so
+    // execute_contraction can derive the real/imag plane pointers.
     dev.execute_contraction(plan,
-        all_ptrs[left], all_ptrs[right], all_ptrs[result_idx],
+        all_ptrs[left],
+        static_cast<size_t>(all_specs_[left].num_elements()),
+        all_ptrs[right],
+        static_cast<size_t>(all_specs_[right].num_elements()),
+        all_ptrs[result_idx],
+        static_cast<size_t>(all_specs_[result_idx].num_elements()),
         workspace, ws_size, false);
 
     if (tn_debug()) {
@@ -1161,13 +1193,11 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     return;
   }
 
-  thrust::transform(
-      thrust_gpu::par.on(dev.stream()),
-      dev.output_buffer().begin(),
-      dev.output_buffer().begin() + out_size_,
-      static_cast<thrust::complex<data_t> *>(final_ptr),
-      dev.output_buffer().begin(),
-      thrust::plus<thrust::complex<data_t>>());
+  // The final slice tensor is stored split-complex (real plane followed by
+  // imag plane). Accumulate it into the interleaved dev_out_ buffer via a
+  // small thrust kernel that reads both planes and forms complex values
+  // on the fly.
+  dev.accumulate_planar_to_output(final_ptr, out_size_);
 
   if (tn_debug()) {
     hipStreamSynchronize(dev.stream());
@@ -1189,6 +1219,24 @@ void TensorNetContractor_HipTensor<data_t>::project_slice(
   projected_ptrs = tensor_device_ptrs_;
 
   if (plan_.sliced.empty()) return;
+
+  // Slicing is incompatible with the current split-complex tensor layout:
+  // each tensor slot stores [real plane][imag plane] with the imag plane
+  // offset at plane_bytes(full_N) from the slot start. A sliced
+  // sub-tensor's imag plane does not start at plane_bytes(N_sub) from
+  // the shifted real-plane pointer, so execute_contraction's implicit
+  // im = re + plane_bytes(N) offset would address the wrong memory.
+  //
+  // None of the current demo or benchmark workloads trigger slicing.
+  // Fail loudly rather than silently produce wrong results. A proper
+  // fix would track real and imaginary plane pointers separately
+  // throughout the contractor.
+  throw std::runtime_error(
+      "TensorNetContractor_HipTensor: contraction plan requires slicing "
+      "(plan_.sliced non-empty); slicing is not yet supported under the "
+      "split-complex tensor layout used to work around hipTensor 1.5.0's "
+      "broken complex contraction kernels on gfx90a. Reduce problem size "
+      "or disable slicing in the path optimizer.");
 
   std::vector<int64_t> slice_values(plan_.sliced.size());
   uint_t remaining = slice_index;
