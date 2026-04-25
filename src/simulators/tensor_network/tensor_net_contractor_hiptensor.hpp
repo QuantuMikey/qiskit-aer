@@ -94,6 +94,36 @@ static bool tn_mnk_padding_enabled() {
   return enabled;
 }
 
+// hipTensor 1.5.0 ships kernel instances only at NumDimM=NumDimN=NumDimK=6
+// (see contraction_solution_instances.cpp in the upstream library). When a
+// per-step contraction descriptor exceeds those bounds — M>6, N>6, or K>6 —
+// hipTensor's brute-force dispatcher (HIPTENSOR_ALGO_DEFAULT) silently
+// invokes an m6n6k6 kernel against the oversized input. The kernel
+// classifies any excess M-axes as K-axes (see contraction_solution_impl.hpp
+// where Base::mM and Base::mK are computed from the first MaxNumDimsM=6
+// entries vs the rest). The output is silently wrong: extra M-axes are
+// summed over instead of preserved as free output dimensions.
+//
+// This guard refuses to dispatch any step that would hit the m6n6k6
+// ceiling. It throws with a clear error message before any kernel runs.
+// Without it, users get silent wrong results. Documented as OI11 in the
+// design doc.
+//
+// Kill switch: AER_TN_DISABLE_RANK_GUARD=1 disables the check (for
+// bisection or to confirm the silent-wrong-result mode for upstream bug
+// reports). Default is enabled — a fast, loud failure beats a slow,
+// silent one.
+static bool tn_rank_guard_enabled() {
+  static bool checked = false;
+  static bool enabled = true;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_DISABLE_RANK_GUARD");
+    enabled = !(val != nullptr && std::string(val) == "1");
+    checked = true;
+  }
+  return enabled;
+}
+
 //=============================================================================
 // Diagnostic helpers
 //=============================================================================
@@ -831,6 +861,48 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
       dummies_on_c = pad_contraction_mnk(modes_a, extents_a,
                                          modes_b, extents_b,
                                          modes_c, extents_c);
+    }
+
+    // OI11 rank guard: refuse to dispatch any step whose padded descriptor
+    // exceeds hipTensor 1.5.0's m6n6k6 kernel coverage. Without this guard,
+    // contractions where M, N, or K exceed 6 produce silent wrong results
+    // because the brute-force dispatcher invokes an m6n6k6 kernel and the
+    // kernel sums excess M-axes into the contracted-K dimension. See
+    // tn_rank_guard_enabled() above for full rationale and kill switch.
+    if (tn_rank_guard_enabled()) {
+      // Recompute M/N/K from the (possibly padded) descriptors. M = modes
+      // free on A only, N = modes free on B only, K = modes shared.
+      std::set<int32_t> sa_post(modes_a.begin(), modes_a.end());
+      std::set<int32_t> sb_post(modes_b.begin(), modes_b.end());
+      int num_m = 0, num_n = 0, num_k = 0;
+      for (int32_t m : modes_a) {
+        if (sb_post.count(m)) num_k++; else num_m++;
+      }
+      for (int32_t m : modes_b) {
+        if (!sa_post.count(m)) num_n++;
+      }
+
+      if (num_m > 6 || num_n > 6 || num_k > 6) {
+        std::stringstream err;
+        err << "hipTensor m6n6k6 ceiling exceeded at contraction step "
+            << step << " of " << num_steps
+            << " (T" << left << " x T" << right << " -> T" << result_idx << "): "
+            << "M=" << num_m << " N=" << num_n << " K=" << num_k
+            << " (hipTensor 1.5.0 ships kernels only at M=N=K=6). "
+            << "modes_a=" << modes_to_str(modes_a)
+            << " modes_b=" << modes_to_str(modes_b)
+            << " modes_c=" << modes_to_str(modes_c) << ". "
+            << "This circuit's contraction path requires kernel shapes "
+            << "that hipTensor 1.5.0 does not provide. Options: "
+            << "(1) use method='statevector' (validated on LUMI to 44 "
+            << "qubits at depth 30 on 1024 nodes, CSC April 2025), "
+            << "(2) reduce circuit depth or qubit count, "
+            << "(3) try a different contraction-path optimizer setting "
+            << "via cotengra to see if a lower-rank path exists. "
+            << "Set AER_TN_DISABLE_RANK_GUARD=1 to bypass this check "
+            << "(produces SILENT WRONG RESULTS — for bug-reporting only).";
+        throw std::runtime_error(err.str());
+      }
     }
 
     if (step == num_steps - 1) {
