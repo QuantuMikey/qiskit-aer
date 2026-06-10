@@ -465,6 +465,34 @@ def available_devices(controller):
     return tuple(dev)
 
 
+def gpu_device_count():
+    """Number of usable GPUs visible to Aer on this node (0 on CPU-only nodes).
+
+    Never raises and never touches hipTensor/cuTensor initialization: it is a
+    bare device-count probe, safe to call on a CPU-only node (e.g. a LUMI
+    ``standard`` node). Use it to choose CPU vs GPU execution deliberately
+    based on problem size, instead of discovering GPU absence via an
+    exception."""
+    from .controller_wrappers import gpu_device_count as _gpu_device_count
+
+    return _gpu_device_count()
+
+
+def tensor_network_gpu_available():
+    """Whether ``method='tensor_network'`` can run on this node.
+
+    The tensor-network contractor is GPU-only by design; on a node without a
+    ROCm/CUDA-capable GPU this returns False and a ``tensor_network`` run
+    would raise a clean ``AerError``/``RuntimeError`` naming the missing GPU.
+    Small circuits are typically faster with CPU methods anyway — GPU pays
+    off only once compute dominates transfer and launch overhead."""
+    from .controller_wrappers import (
+        tensor_network_gpu_available as _tn_gpu_available,
+    )
+
+    return _tn_gpu_available()
+
+
 def add_final_save_op(aer_circuits, state):
     """Add final save state op to all experiments in a qobj."""
 

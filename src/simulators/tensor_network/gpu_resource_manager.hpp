@@ -142,6 +142,25 @@ inline void check_hiptensor(hiptensorStatus_t err, const char *func,
 }
 
 //=============================================================================
+// No-throw GPU capability probe (Piece 0 — CPU-node operability)
+//=============================================================================
+// On a CPU-only node hipGetDeviceCount returns hipErrorNoDevice. That is a
+// normal condition, not an error: callers use this probe to choose CPU vs
+// GPU execution deliberately instead of discovering GPU absence via a crash.
+// Never throws; never aborts; clears the sticky HIP error so later HIP calls
+// are unaffected.
+inline int tn_gpu_device_count() noexcept {
+  int count = 0;
+  if (hipGetDeviceCount(&count) != hipSuccess) {
+    (void)hipGetLastError();
+    return 0;
+  }
+  return count;
+}
+
+inline bool tn_gpu_available() noexcept { return tn_gpu_device_count() > 0; }
+
+//=============================================================================
 // ContractionSignature and HipTensorPlanCache
 //=============================================================================
 
@@ -169,7 +188,9 @@ build_signature(const std::vector<int32_t> &modes_a,
                 const std::vector<int32_t> &modes_b,
                 const std::vector<int64_t> &extents_b,
                 const std::vector<int32_t> &modes_c,
-                const std::vector<int64_t> &extents_c) {
+                const std::vector<int64_t> &extents_c,
+                const std::vector<int64_t> &strides_a = {},
+                const std::vector<int64_t> &strides_b = {}) {
   ContractionSignature sig;
   sig.data.push_back(static_cast<int32_t>(modes_a.size()));
   for (size_t i = 0; i < modes_a.size(); i++) sig.data.push_back(modes_a[i]);
@@ -180,6 +201,14 @@ build_signature(const std::vector<int32_t> &modes_a,
   sig.data.push_back(static_cast<int32_t>(modes_c.size()));
   for (size_t i = 0; i < modes_c.size(); i++) sig.data.push_back(modes_c[i]);
   for (size_t i = 0; i < extents_c.size(); i++) sig.data.push_back(static_cast<int32_t>(extents_c[i]));
+  // Strides distinguish a strided sliced-input view from a packed tensor of
+  // identical shape. Empty means packed (descriptor built with nullptr
+  // strides — hipTensor's column-major default); a sentinel separates the
+  // empty case from an explicit stride list so the two can never alias.
+  sig.data.push_back(static_cast<int32_t>(strides_a.size()));
+  for (size_t i = 0; i < strides_a.size(); i++) sig.data.push_back(static_cast<int32_t>(strides_a[i]));
+  sig.data.push_back(static_cast<int32_t>(strides_b.size()));
+  for (size_t i = 0; i < strides_b.size(); i++) sig.data.push_back(static_cast<int32_t>(strides_b[i]));
   return sig;
 }
 
@@ -206,6 +235,11 @@ template <typename data_t> struct CachedPlan {
   std::vector<int64_t> extents_a_storage;
   std::vector<int64_t> extents_b_storage;
   std::vector<int64_t> extents_c_storage;
+  // Explicit strides for sliced-input views (empty = packed, descriptor
+  // built with nullptr strides). Same lifetime rule as the mode/extent
+  // arrays: hipTensor retains the pointer, so the plan must own the data.
+  std::vector<int64_t> strides_a_storage;
+  std::vector<int64_t> strides_b_storage;
 };
 
 template <typename data_t> class HipTensorPlanCache {
@@ -233,7 +267,9 @@ public:
                 const std::vector<int32_t> &modes_b,
                 const std::vector<int64_t> &extents_b,
                 const std::vector<int32_t> &modes_c,
-                const std::vector<int64_t> &extents_c) {
+                const std::vector<int64_t> &extents_c,
+                const std::vector<int64_t> &strides_a = {},
+                const std::vector<int64_t> &strides_b = {}) {
     // Diagnostic kill switch: forces a fresh plan build on every call via
     // an always-rebuilt slot outside the cache map. Useful when suspecting
     // cache-relocation hazards; AER_TN_DISABLE_PLAN_CACHE=1 activates it.
@@ -294,6 +330,8 @@ public:
     cp.extents_a_storage = extents_a;
     cp.extents_b_storage = extents_b;
     cp.extents_c_storage = extents_c;
+    cp.strides_a_storage = strides_a;
+    cp.strides_b_storage = strides_b;
 
     hipSetDevice(device_id_);
 
@@ -312,14 +350,23 @@ public:
     }
 
     uint32_t align = TENSOR_POINTER_ALIGN;
+    // A and B may be strided views into a larger parent tensor (slice
+    // projection keeps device data in place and presents the unsliced
+    // remainder through parent strides). nullptr = hipTensor's packed
+    // column-major default, identical to an explicit packed stride list.
+    // C is always a packed pool slot, so it never carries strides.
+    const int64_t *sa = cp.strides_a_storage.empty()
+                            ? nullptr : cp.strides_a_storage.data();
+    const int64_t *sb = cp.strides_b_storage.empty()
+                            ? nullptr : cp.strides_b_storage.data();
     check_hiptensor(hiptensorInitTensorDescriptor(
         handle_, &cp.desc_a, static_cast<uint32_t>(cp.modes_a_storage.size()),
-        cp.extents_a_storage.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
+        cp.extents_a_storage.data(), sa, hip_dtype, HIPTENSOR_OP_IDENTITY),
         "hiptensorInitTensorDescriptor(A)", device_id_);
 
     check_hiptensor(hiptensorInitTensorDescriptor(
         handle_, &cp.desc_b, static_cast<uint32_t>(cp.modes_b_storage.size()),
-        cp.extents_b_storage.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
+        cp.extents_b_storage.data(), sb, hip_dtype, HIPTENSOR_OP_IDENTITY),
         "hiptensorInitTensorDescriptor(B)", device_id_);
 
     check_hiptensor(hiptensorInitTensorDescriptor(
@@ -736,8 +783,13 @@ public:
                            void *ptr_c, size_t num_elements_c,
                            void *workspace, uint64_t workspace_size,
                            bool accumulate = false) {
-    hipSetDevice(device_id_);
-
+    // Packed-slot convenience form: derive each tensor's imaginary plane
+    // from its slot layout ([real plane][imag plane], imag at
+    // plane_bytes(N_full)). Valid only for tensors that occupy a whole
+    // slot — pool intermediates and unprojected inputs. Slice-projected
+    // inputs must use the explicit-plane overload below, because their
+    // imag-plane offset depends on the FULL parent tensor size, not the
+    // projected element count (resolves OI9).
     const size_t plane_a = plane_bytes(
         static_cast<int64_t>(num_elements_a), sizeof(data_t));
     const size_t plane_b = plane_bytes(
@@ -745,16 +797,29 @@ public:
     const size_t plane_c = plane_bytes(
         static_cast<int64_t>(num_elements_c), sizeof(data_t));
 
-    data_t *Ar = reinterpret_cast<data_t *>(ptr_a);
-    data_t *Ai = reinterpret_cast<data_t *>(
-        reinterpret_cast<char *>(ptr_a) + plane_a);
-    data_t *Br = reinterpret_cast<data_t *>(ptr_b);
-    data_t *Bi = reinterpret_cast<data_t *>(
-        reinterpret_cast<char *>(ptr_b) + plane_b);
-    data_t *Cr = reinterpret_cast<data_t *>(ptr_c);
-    data_t *Ci = reinterpret_cast<data_t *>(
-        reinterpret_cast<char *>(ptr_c) + plane_c);
+    execute_contraction_planes(
+        plan,
+        reinterpret_cast<data_t *>(ptr_a),
+        reinterpret_cast<data_t *>(reinterpret_cast<char *>(ptr_a) + plane_a),
+        reinterpret_cast<data_t *>(ptr_b),
+        reinterpret_cast<data_t *>(reinterpret_cast<char *>(ptr_b) + plane_b),
+        reinterpret_cast<data_t *>(ptr_c),
+        reinterpret_cast<data_t *>(reinterpret_cast<char *>(ptr_c) + plane_c),
+        workspace, workspace_size, accumulate);
+  }
 
+  // Explicit-plane form. The caller provides the real and imaginary plane
+  // pointers for every operand. Slice projection advances both planes by
+  // the same element offset within the parent tensor's slot, so a sliced
+  // sub-tensor's planes are no longer related by plane_bytes(N_sub) — this
+  // overload is what makes slicing and split-complex compose.
+  void execute_contraction_planes(const CachedPlan<data_t> &plan,
+                                  data_t *Ar, data_t *Ai,
+                                  data_t *Br, data_t *Bi,
+                                  data_t *Cr, data_t *Ci,
+                                  void *workspace, uint64_t workspace_size,
+                                  bool accumulate = false) {
+    hipSetDevice(device_id_);
     const data_t pos_one = static_cast<data_t>(1.0);
     const data_t neg_one = static_cast<data_t>(-1.0);
     const data_t zero    = static_cast<data_t>(0.0);
@@ -887,10 +952,18 @@ public:
 
   void discover(const std::vector<uint64_t> &target_gpus = {},
                 size_t min_memory = 256 * 1024 * 1024) {
-    int device_count = 0;
-    check_hip(hipGetDeviceCount(&device_count), "hipGetDeviceCount");
+    // Piece 0 (CPU-node operability): use the no-throw probe rather than
+    // check_hip so that "no GPU on this node" surfaces as a single clean,
+    // catchable exception naming the cause — not as a HIP error string and
+    // never as a process abort. GPU absence is a normal condition on LUMI
+    // `standard` nodes; only an explicit request for the GPU-only contractor
+    // makes it an error, which is exactly the path that reaches discover().
+    int device_count = tn_gpu_device_count();
     if (device_count == 0)
-      throw std::runtime_error("No HIP-capable GPUs found.");
+      throw std::runtime_error(
+          "tensor_network method requires a ROCm-capable GPU; none detected "
+          "on this node — for circuits of this size consider a CPU-supported "
+          "method (e.g. method='statevector' with device='CPU').");
 
     std::vector<int> candidates;
     if (!target_gpus.empty()) {

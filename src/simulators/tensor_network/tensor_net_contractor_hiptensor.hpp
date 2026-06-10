@@ -175,6 +175,31 @@ void dump_device_tensor(const char *label, void *dev_ptr, int64_t num_elements,
   fprintf(stderr, "\n");
 }
 
+// Plane-pair variant for slice-projected tensors, whose imaginary plane is
+// not derivable from the projected element count. Prints leading elements of
+// each plane; for strided views these are the parent's leading elements — a
+// debug aid for pointer placement, not a strided gather.
+template <typename data_t>
+void dump_device_planes(const char *label, const data_t *re, const data_t *im,
+                        int64_t num_elements, int max_print = 8) {
+  if (!tn_debug()) return;
+  int n_print = (int)std::min<int64_t>(num_elements, max_print);
+  std::vector<data_t> host_re(n_print);
+  std::vector<data_t> host_im(n_print);
+  hipMemcpy(host_re.data(), re, n_print * sizeof(data_t),
+            hipMemcpyDeviceToHost);
+  hipMemcpy(host_im.data(), im, n_print * sizeof(data_t),
+            hipMemcpyDeviceToHost);
+  fprintf(stderr, "[AER_TN_DEBUG] %s [%ld elements]:", label, (long)num_elements);
+  for (int i = 0; i < n_print; i++) {
+    fprintf(stderr, " (%.3f,%.3fi)",
+            static_cast<double>(host_re[i]),
+            static_cast<double>(host_im[i]));
+  }
+  if (num_elements > max_print) fprintf(stderr, " ...");
+  fprintf(stderr, "\n");
+}
+
 //=============================================================================
 // Helper: compute result modes/extents of a pairwise contraction
 //=============================================================================
@@ -386,13 +411,35 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   std::set<int32_t> sliced_mode_set_;
   bool pool_ready_;
 
+  // Split-complex plane pointers for one tensor: re/im are independent
+  // because slice projection advances both planes by the slice's element
+  // offset within the FULL parent tensor — after projection the imaginary
+  // plane is no longer derivable from the projected element count. This
+  // pair is the unit project_slice produces and execute_contraction_planes
+  // consumes (design doc §18.4; resolves OI9).
+  struct PlanePtrs {
+    data_t *re;
+    data_t *im;
+  };
+
+  // Column-major strides of each input tensor's REMAINING (unsliced) modes
+  // within the full parent tensor, aligned index-for-index with
+  // sliced_input_specs_[t]. Empty when the tensor carries no sliced mode
+  // (packed layout, descriptor strides = nullptr). Built once per plan in
+  // build_sliced_specs(); identical for every slice — only pointer offsets
+  // differ slice to slice.
+  std::vector<std::vector<int64_t>> sliced_input_strides_;
+
   // Per-step descriptor shape used when submitting contractions to hipTensor.
-  // Each PlanSpec holds the (possibly MNK-padded) modes/extents for A, B, C.
+  // Each PlanSpec holds the (possibly MNK-padded) modes/extents for A, B, C,
+  // plus explicit strides for A/B when they are slice-projected views into a
+  // larger parent tensor (empty = packed). C is always a packed pool slot.
   // Input tensors may appear in multiple steps with different padding, which
   // is why this is per-step, not per-tensor. Rebuilt on every setup_pool_and_cache.
   struct PlanSpec {
     std::vector<int32_t> modes_a, modes_b, modes_c;
     std::vector<int64_t> extents_a, extents_b, extents_c;
+    std::vector<int64_t> strides_a, strides_b;
   };
   std::vector<PlanSpec> step_plan_specs_;
 
@@ -431,7 +478,8 @@ private:
   bool topology_matches_previous() const;
   void cache_topology();
   void contract_single_slice(uint_t slice_index, int device_idx);
-  void project_slice(uint_t slice_index, std::vector<void *> &projected_ptrs);
+  void project_slice(uint_t slice_index, int device_idx,
+                     std::vector<PlanePtrs> &projected);
   void accumulate_across_gpus();
   void accumulate_across_mpi();
   void contract_all();
@@ -741,16 +789,33 @@ void TensorNetContractor_HipTensor<data_t>::build_sliced_specs() {
 
   size_t num_inputs = network_desc_.tensors.size();
   sliced_input_specs_.resize(num_inputs);
+  sliced_input_strides_.assign(num_inputs, {});
 
   for (size_t t = 0; t < num_inputs; t++) {
+    const TensorSpec &full = network_desc_.tensors[t];
     sliced_input_specs_[t].modes.clear();
     sliced_input_specs_[t].extents.clear();
-    for (size_t m = 0; m < network_desc_.tensors[t].modes.size(); m++) {
-      if (sliced_mode_set_.find(network_desc_.tensors[t].modes[m]) == sliced_mode_set_.end()) {
-        sliced_input_specs_[t].modes.push_back(network_desc_.tensors[t].modes[m]);
-        sliced_input_specs_[t].extents.push_back(network_desc_.tensors[t].extents[m]);
+
+    bool has_sliced_mode = false;
+    int64_t stride = 1; // column-major: mode 0 fastest, parent extents
+    std::vector<int64_t> remaining_strides;
+    for (size_t m = 0; m < full.modes.size(); m++) {
+      if (sliced_mode_set_.find(full.modes[m]) == sliced_mode_set_.end()) {
+        sliced_input_specs_[t].modes.push_back(full.modes[m]);
+        sliced_input_specs_[t].extents.push_back(full.extents[m]);
+        remaining_strides.push_back(stride);
+      } else {
+        has_sliced_mode = true;
       }
+      stride *= full.extents[m];
     }
+
+    // A projected tensor is a strided view inside its parent: the remaining
+    // modes keep their PARENT strides (which is what makes projection pure
+    // pointer arithmetic). Tensors without sliced modes stay packed, marked
+    // by an empty stride vector → descriptor built with nullptr strides.
+    if (has_sliced_mode)
+      sliced_input_strides_[t] = std::move(remaining_strides);
   }
 }
 
@@ -810,21 +875,30 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
   //
   // Memory layout is unaffected: extent-1 axes contribute nothing to
   // stride or element count, so stripping them is purely a descriptor
-  // change. No data movement.
+  // change. No data movement. Strides (present only for slice-projected
+  // input views) drop entries in lockstep so they stay index-aligned
+  // with modes/extents.
   auto strip_extent_one = [](std::vector<int32_t> &modes,
-                             std::vector<int64_t> &extents) {
+                             std::vector<int64_t> &extents,
+                             std::vector<int64_t> &strides) {
     std::vector<int32_t> m;
     std::vector<int64_t> e;
+    std::vector<int64_t> s;
     m.reserve(modes.size());
     e.reserve(extents.size());
+    s.reserve(strides.size());
+    const bool has_strides = !strides.empty();
     for (size_t i = 0; i < modes.size(); i++) {
       if (extents[i] > 1) {
         m.push_back(modes[i]);
         e.push_back(extents[i]);
+        if (has_strides)
+          s.push_back(strides[i]);
       }
     }
     modes = std::move(m);
     extents = std::move(e);
+    strides = std::move(s);
   };
 
   step_plan_specs_.assign(num_steps, PlanSpec{});
@@ -843,13 +917,22 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     std::vector<int32_t> modes_b = all_specs_[right].modes;
     std::vector<int64_t> extents_b = all_specs_[right].extents;
 
+    // Slice-projected input views carry their parent strides; intermediates
+    // and unsliced inputs are packed (empty → descriptor strides nullptr).
+    std::vector<int64_t> strides_a =
+        (left < num_inputs) ? sliced_input_strides_[left]
+                            : std::vector<int64_t>{};
+    std::vector<int64_t> strides_b =
+        (right < num_inputs) ? sliced_input_strides_[right]
+                             : std::vector<int64_t>{};
+
     // Strip extent-1 dummies from A and B before this step's planning.
     // Any dummies THIS step genuinely needs will be re-added by
     // pad_contraction_mnk below. Keeping descriptors at their minimum
     // natural rank sidesteps the hipTensor/CK rank-12-plus-consecutive-
     // dummies bug documented above.
-    strip_extent_one(modes_a, extents_a);
-    strip_extent_one(modes_b, extents_b);
+    strip_extent_one(modes_a, extents_a, strides_a);
+    strip_extent_one(modes_b, extents_b, strides_b);
 
     std::vector<int32_t> modes_c;
     std::vector<int64_t> extents_c;
@@ -861,6 +944,16 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
       dummies_on_c = pad_contraction_mnk(modes_a, extents_a,
                                          modes_b, extents_b,
                                          modes_c, extents_c);
+      // Extend stride lists for appended extent-1 dummies: their stride is
+      // never dereferenced (extent 1), so any value works — 1 is the value
+      // hipTensor's own packed formula yields for an extent-1 mode at the
+      // front, keeping the descriptor maximally unsurprising for CK.
+      // Packed tensors (empty stride list) stay packed: hipTensor's nullptr
+      // default extends correctly to appended extent-1 dummies.
+      if (!strides_a.empty())
+        strides_a.resize(modes_a.size(), 1);
+      if (!strides_b.empty())
+        strides_b.resize(modes_b.size(), 1);
     }
 
     // OI11 rank guard: refuse to dispatch any step whose padded descriptor
@@ -894,10 +987,13 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
             << " modes_c=" << modes_to_str(modes_c) << ". "
             << "This circuit's contraction path requires kernel shapes "
             << "that hipTensor 1.5.0 does not provide. Options: "
-            << "(1) use method='statevector' (validated on LUMI to 44 "
+            << "(1) tighten the per-slice budget so the slicer cuts this "
+            << "step inside the envelope (lower AER_TN_SLICE_TARGET_BYTES, "
+            << "current default 65536), "
+            << "(2) use method='statevector' (validated on LUMI to 44 "
             << "qubits at depth 30 on 1024 nodes, CSC April 2025), "
-            << "(2) reduce circuit depth or qubit count, "
-            << "(3) try a different contraction-path optimizer setting "
+            << "(3) reduce circuit depth or qubit count, "
+            << "(4) try a different contraction-path optimizer setting "
             << "via cotengra to see if a lower-rank path exists. "
             << "Set AER_TN_DISABLE_RANK_GUARD=1 to bypass this check "
             << "(produces SILENT WRONG RESULTS — for bug-reporting only).";
@@ -961,6 +1057,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     step_plan_specs_[step].extents_b = extents_b;
     step_plan_specs_[step].modes_c = modes_c;
     step_plan_specs_[step].extents_c = extents_c;
+    step_plan_specs_[step].strides_a = strides_a;
+    step_plan_specs_[step].strides_b = strides_b;
 
     if (tn_debug()) {
       fprintf(stderr,
@@ -1000,13 +1098,15 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     auto sig = build_signature(
         modes_a_safe, ps.extents_a,
         modes_b_safe, ps.extents_b,
-        modes_c_safe, ps.extents_c);
+        modes_c_safe, ps.extents_c,
+        ps.strides_a, ps.strides_b);
 
     dev.plan_cache().get_or_create(
         sig,
         modes_a_safe, ps.extents_a,
         modes_b_safe, ps.extents_b,
-        modes_c_safe, ps.extents_c);
+        modes_c_safe, ps.extents_c,
+        ps.strides_a, ps.strides_b);
   }
 
   // Each intermediate occupies a split-complex tensor slot: two planes
@@ -1038,7 +1138,16 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract(
     std::vector<std::complex<data_t>> &out) {
+  // Each device holds the partial sum of its assigned slice range after
+  // contract_all(); each rank holds its slice range after MPI partitioning.
+  // Reduce both layers before reading the result off the primary device —
+  // skipping either reduction drops every slice not assigned to (rank 0,
+  // device 0). Reduction order is fixed by index (P4).
   contract_all();
+  accumulate_across_gpus();
+#ifdef AER_MPI
+  accumulate_across_mpi();
+#endif
   gpu_mgr_.primary().get_output(out);
 }
 
@@ -1176,12 +1285,13 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     fprintf(stderr, "[AER_TN_DEBUG] contract_single_slice(slice=%lu, dev=%d)\n",
             (unsigned long)slice_index, device_idx);
 
-  std::vector<void *> projected_ptrs;
-  project_slice(slice_index, projected_ptrs);
-
-  std::vector<void *> all_ptrs(num_inputs + num_steps, nullptr);
-  for (size_t i = 0; i < num_inputs; i++)
-    all_ptrs[i] = projected_ptrs[i];
+  // Every operand is a (real plane, imag plane) pointer pair. Inputs come
+  // from slice projection (parent slot + slice offset, both planes);
+  // intermediates are packed pool slots whose imag plane is at
+  // plane_bytes(N) from the slot base.
+  std::vector<PlanePtrs> all_planes(num_inputs + num_steps,
+                                    PlanePtrs{nullptr, nullptr});
+  project_slice(slice_index, device_idx, all_planes);
 
   void *workspace = dev.pool().get_workspace_ptr();
   uint64_t ws_size = dev.pool().get_workspace_size();
@@ -1191,10 +1301,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       char label[64];
       snprintf(label, sizeof(label), "  input[%zu]", i);
       // Print up to 32 elements so 4-leg gates (e.g. CNOT's 16 values) are
-      // fully visible — crucial for distinguishing identity from CNOT since
-      // they share first 4 values [1, 0, 0, 0].
-      dump_device_tensor<data_t>(label, all_ptrs[i],
-                                  sliced_input_specs_[i].num_elements(), 32);
+      // fully visible. For slice-projected strided views this prints the
+      // parent's leading elements (debug aid, not a strided gather).
+      dump_device_planes<data_t>(label, all_planes[i].re, all_planes[i].im,
+                                 sliced_input_specs_[i].num_elements(), 32);
     }
   }
 
@@ -1205,7 +1315,9 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
 
     // Use the per-step padded descriptor shape we recorded in
     // setup_pool_and_cache. The plan cache is keyed on these same
-    // shapes, so the lookup is O(1) after the first slice.
+    // shapes (including slice-view strides), so the lookup is O(1) after
+    // the first slice — all slices of a step share one plan by
+    // construction (§8.3).
     const PlanSpec &ps = step_plan_specs_[step];
 
     // ---- Mode ID remap ----
@@ -1226,23 +1338,27 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
                               modes_a_safe, modes_b_safe, modes_c_safe);
 
     // Cache signature uses the remapped IDs so identical remapped
-    // descriptors hit the cache. Two different original signatures that
-    // remap to the same sequence of small-positive IDs with identical
-    // extents would cache-collide, but since mode identity within a
-    // descriptor is determined only by position + extent, this is the
-    // correct semantics for hipTensor anyway.
+    // descriptors hit the cache; strides distinguish projected views from
+    // packed tensors of the same shape.
     auto sig = build_signature(
         modes_a_safe, ps.extents_a,
         modes_b_safe, ps.extents_b,
-        modes_c_safe, ps.extents_c);
+        modes_c_safe, ps.extents_c,
+        ps.strides_a, ps.strides_b);
 
     const CachedPlan<data_t> &plan = dev.plan_cache().get_or_create(
         sig,
         modes_a_safe, ps.extents_a,
         modes_b_safe, ps.extents_b,
-        modes_c_safe, ps.extents_c);
+        modes_c_safe, ps.extents_c,
+        ps.strides_a, ps.strides_b);
 
-    all_ptrs[result_idx] = dev.pool().get_tensor_ptr(static_cast<int>(result_idx));
+    void *c_slot = dev.pool().get_tensor_ptr(static_cast<int>(result_idx));
+    const size_t c_plane = plane_bytes(
+        all_specs_[result_idx].num_elements(), sizeof(data_t));
+    all_planes[result_idx].re = reinterpret_cast<data_t *>(c_slot);
+    all_planes[result_idx].im =
+        reinterpret_cast<data_t *>(static_cast<char *>(c_slot) + c_plane);
 
     // Defense in depth against two orthogonal failure modes:
     //   1. The pool memory for this intermediate is freshly allocated or
@@ -1258,60 +1374,69 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     {
       size_t c_bytes = tensor_slot_bytes(
           all_specs_[result_idx].num_elements(), sizeof(data_t));
-      check_hip(hipMemsetAsync(all_ptrs[result_idx], 0, c_bytes, dev.stream()),
+      check_hip(hipMemsetAsync(c_slot, 0, c_bytes, dev.stream()),
                 "hipMemsetAsync(C pre-zero)", dev.device_id());
     }
 
     if (tn_debug()) {
       fprintf(stderr,
               "[AER_TN_DEBUG]   step %zu exec: "
-              "A_ptr=%p B_ptr=%p C_ptr=%p ws=%p ws_sz=%lu modes_c=%s\n",
-              step, all_ptrs[left], all_ptrs[right], all_ptrs[result_idx],
+              "A_re=%p B_re=%p C_re=%p ws=%p ws_sz=%lu modes_c=%s "
+              "strided=%c%c\n",
+              step, (void *)all_planes[left].re, (void *)all_planes[right].re,
+              (void *)all_planes[result_idx].re,
               workspace, (unsigned long)ws_size,
-              modes_to_str(ps.modes_c).c_str());
+              modes_to_str(ps.modes_c).c_str(),
+              ps.strides_a.empty() ? '-' : 'A',
+              ps.strides_b.empty() ? '-' : 'B');
     }
 
-    // Split-complex decomposition requires per-tensor element counts so
-    // execute_contraction can derive the real/imag plane pointers.
-    dev.execute_contraction(plan,
-        all_ptrs[left],
-        static_cast<size_t>(all_specs_[left].num_elements()),
-        all_ptrs[right],
-        static_cast<size_t>(all_specs_[right].num_elements()),
-        all_ptrs[result_idx],
-        static_cast<size_t>(all_specs_[result_idx].num_elements()),
+    // Split-complex decomposition with explicit plane pointers (OI9
+    // resolution): each operand's planes were resolved above — by slice
+    // projection for inputs and by slot layout for intermediates.
+    dev.execute_contraction_planes(plan,
+        all_planes[left].re, all_planes[left].im,
+        all_planes[right].re, all_planes[right].im,
+        all_planes[result_idx].re, all_planes[result_idx].im,
         workspace, ws_size, false);
 
     if (tn_debug()) {
       hipStreamSynchronize(dev.stream());
       char label[64];
       snprintf(label, sizeof(label), "  after step %zu (T%zu)", step, result_idx);
-      dump_device_tensor<data_t>(label, all_ptrs[result_idx],
-                                  all_specs_[result_idx].num_elements(), 32);
+      dump_device_planes<data_t>(label, all_planes[result_idx].re,
+                                 all_planes[result_idx].im,
+                                 all_specs_[result_idx].num_elements(), 32);
     }
   }
 
   size_t final_idx = num_inputs + num_steps - 1;
-  void *final_ptr = all_ptrs[final_idx];
   int64_t final_elements = all_specs_[final_idx].num_elements();
 
   if (tn_debug())
     fprintf(stderr,
-            "[AER_TN_DEBUG]   accumulate final_ptr=%p (%ld el) into out_buf (%lu el)\n",
-            final_ptr, (long)final_elements, (unsigned long)out_size_);
+            "[AER_TN_DEBUG]   accumulate final T%zu (%ld el) into out_buf (%lu el)\n",
+            final_idx, (long)final_elements, (unsigned long)out_size_);
 
   if (final_elements != (int64_t)out_size_) {
-    fprintf(stderr,
-            "[AER_TN] ERROR: final tensor size %ld != out_size_ %lu\n",
-            (long)final_elements, (unsigned long)out_size_);
-    return;
+    // The final slice tensor must always cover the full unsliced output:
+    // cotengra slices only summed (inner) bonds, and the planner rejects
+    // plans that slice an output mode. A mismatch is a planner/slicer
+    // bookkeeping bug — refuse loudly rather than corrupt the result (P3).
+    std::stringstream err;
+    err << "TensorNetContractor_HipTensor: final slice tensor has "
+        << final_elements << " elements but output expects " << out_size_
+        << " (slice " << slice_index << "). A sliced mode leaked into the "
+        << "output tensor; this is a slicing bookkeeping bug.";
+    throw std::runtime_error(err.str());
   }
 
   // The final slice tensor is stored split-complex (real plane followed by
   // imag plane). Accumulate it into the interleaved dev_out_ buffer via a
   // small thrust kernel that reads both planes and forms complex values
-  // on the fly.
-  dev.accumulate_planar_to_output(final_ptr, out_size_);
+  // on the fly. Slices on one device run sequentially in increasing index
+  // order, so the per-device accumulation order is fixed (P4).
+  dev.accumulate_planar_to_output(all_planes[final_idx].re, out_size_);
 
   if (tn_debug()) {
     hipStreamSynchronize(dev.stream());
@@ -1329,29 +1454,37 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
 
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::project_slice(
-    uint_t slice_index, std::vector<void *> &projected_ptrs) {
-  projected_ptrs = tensor_device_ptrs_;
-
-  if (plan_.sliced.empty()) return;
-
-  // Slicing is incompatible with the current split-complex tensor layout:
-  // each tensor slot stores [real plane][imag plane] with the imag plane
-  // offset at plane_bytes(full_N) from the slot start. A sliced
-  // sub-tensor's imag plane does not start at plane_bytes(N_sub) from
-  // the shifted real-plane pointer, so execute_contraction's implicit
-  // im = re + plane_bytes(N) offset would address the wrong memory.
+    uint_t slice_index, int device_idx, std::vector<PlanePtrs> &projected) {
+  // Project every input tensor onto one slice (fixed value of every sliced
+  // mode) for execution on device_idx. Pure pointer arithmetic — no copies,
+  // no data movement (design doc §18.3): for each tensor carrying a sliced
+  // mode, both split-complex planes advance by the slice's element offset
+  // within the FULL parent tensor. The element offset uses COLUMN-major
+  // strides (mode 0 fastest), matching hipTensor's packed-stride default for
+  // the unsliced descriptors. The remaining (unsliced) modes are presented to
+  // hipTensor as a strided view via PlanSpec::strides_a/b, so the data is
+  // read in place inside the parent layout.
   //
-  // None of the current demo or benchmark workloads trigger slicing.
-  // Fail loudly rather than silently produce wrong results. A proper
-  // fix would track real and imaginary plane pointers separately
-  // throughout the contractor.
-  throw std::runtime_error(
-      "TensorNetContractor_HipTensor: contraction plan requires slicing "
-      "(plan_.sliced non-empty); slicing is not yet supported under the "
-      "split-complex tensor layout used to work around hipTensor 1.5.0's "
-      "broken complex contraction kernels on gfx90a. Reduce problem size "
-      "or disable slicing in the path optimizer.");
+  // Plane bookkeeping (resolves OI9): the imaginary plane is always
+  // plane_bytes(N_full) from the slot base — N_full, not the sliced count —
+  // which is why the projection produces explicit re/im pairs instead of a
+  // single slot pointer.
+  const size_t num_inputs = network_desc_.tensors.size();
+  // Fill the input prefix; intermediates (slots after num_inputs) belong to
+  // the caller. Grow if needed, never shrink.
+  if (projected.size() < num_inputs)
+    projected.resize(num_inputs, PlanePtrs{nullptr, nullptr});
 
+  // Inputs are replicated per device as a slab copy: rebase each primary
+  // pointer onto this device's slab before applying slice offsets.
+  GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
+  const char *primary_base =
+      static_cast<const char *>(gpu_mgr_.primary().tensor_data_ptr());
+  char *device_base = static_cast<char *>(dev.tensor_data_ptr());
+
+  // slice_index → per-mode values, mixed radix, last sliced mode fastest.
+  // The decomposition order is fixed by plan_.sliced and identical on every
+  // rank and device, preserving deterministic accumulation (P4).
   std::vector<int64_t> slice_values(plan_.sliced.size());
   uint_t remaining = slice_index;
   for (int i = static_cast<int>(plan_.sliced.size()) - 1; i >= 0; i--) {
@@ -1363,25 +1496,28 @@ void TensorNetContractor_HipTensor<data_t>::project_slice(
   for (size_t i = 0; i < plan_.sliced.size(); i++)
     slice_map[plan_.sliced[i].mode] = slice_values[i];
 
-  size_t element_bytes = 2 * sizeof(data_t);
+  for (size_t t = 0; t < num_inputs; t++) {
+    const TensorSpec &full = network_desc_.tensors[t];
 
-  for (size_t t = 0; t < network_desc_.tensors.size(); t++) {
-    const TensorSpec &spec = network_desc_.tensors[t];
+    char *slot = device_base +
+                 (static_cast<const char *>(tensor_device_ptrs_[t]) -
+                  primary_base);
+
     int64_t offset_elements = 0;
-
-    std::vector<int64_t> strides(spec.modes.size(), 1);
-    for (int i = static_cast<int>(spec.modes.size()) - 2; i >= 0; i--)
-      strides[i] = strides[i + 1] * spec.extents[i + 1];
-
-    for (size_t m = 0; m < spec.modes.size(); m++) {
-      auto it = slice_map.find(spec.modes[m]);
-      if (it != slice_map.end())
-        offset_elements += it->second * strides[m];
+    if (!plan_.sliced.empty()) {
+      int64_t stride = 1; // column-major: mode 0 fastest
+      for (size_t m = 0; m < full.modes.size(); m++) {
+        auto it = slice_map.find(full.modes[m]);
+        if (it != slice_map.end())
+          offset_elements += it->second * stride;
+        stride *= full.extents[m];
+      }
     }
 
-    if (offset_elements > 0)
-      projected_ptrs[t] = static_cast<char *>(projected_ptrs[t]) +
-                          offset_elements * element_bytes;
+    const size_t plane = plane_bytes(full.num_elements(), sizeof(data_t));
+    const size_t shift = static_cast<size_t>(offset_elements) * sizeof(data_t);
+    projected[t].re = reinterpret_cast<data_t *>(slot + shift);
+    projected[t].im = reinterpret_cast<data_t *>(slot + plane + shift);
   }
 }
 
@@ -1428,17 +1564,43 @@ template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::accumulate_across_mpi() {
 #ifdef AER_MPI
   if (nprocs_ <= 1) return;
-  std::vector<std::complex<data_t>> out(out_size_);
-  gpu_mgr_.primary().get_output(out);
-  std::vector<std::complex<data_t>> tmp(out_size_);
-  MPI_Datatype mpi_type =
-      (sizeof(data_t) == 8) ? MPI_DOUBLE_PRECISION : MPI_FLOAT;
-  MPI_Allreduce(out.data(), tmp.data(), out_size_ * 2, mpi_type, MPI_SUM,
-                MPI_COMM_WORLD);
+
+  std::vector<std::complex<data_t>> acc(out_size_);
+  gpu_mgr_.primary().get_output(acc);
+
+  // Deterministic binary-tree reduction by rank index (P4): at stride s,
+  // rank r receives from rank r+s and adds in fixed element order. The
+  // pairing depends only on rank indices and rank count, never on timing,
+  // so the floating-point sum is bit-identical run to run. (MPI_Allreduce
+  // makes no such ordering guarantee.) Slice→rank assignment is contiguous
+  // by index, so the combined order across all slices is the global index
+  // order regardless of which ranks executed which slices.
+  std::vector<std::complex<data_t>> incoming(out_size_);
+  MPI_Datatype mpi_type = (sizeof(data_t) == 8) ? MPI_DOUBLE : MPI_FLOAT;
+  for (int stride = 1; stride < nprocs_; stride *= 2) {
+    if (myrank_ % (2 * stride) == 0) {
+      int src = myrank_ + stride;
+      if (src < nprocs_) {
+        MPI_Recv(incoming.data(), static_cast<int>(out_size_) * 2, mpi_type,
+                 src, stride, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        for (size_t i = 0; i < out_size_; i++)
+          acc[i] += incoming[i];
+      }
+    } else if (myrank_ % (2 * stride) == stride) {
+      MPI_Send(acc.data(), static_cast<int>(out_size_) * 2, mpi_type,
+               myrank_ - stride, stride, MPI_COMM_WORLD);
+      break; // this rank's partial has been handed off
+    }
+  }
+
+  // Aer expects the full result on every rank.
+  MPI_Bcast(acc.data(), static_cast<int>(out_size_) * 2, mpi_type, 0,
+            MPI_COMM_WORLD);
+
   hipSetDevice(gpu_mgr_.primary().device_id());
   hipMemcpyAsync(
       thrust::raw_pointer_cast(gpu_mgr_.primary().output_buffer().data()),
-      tmp.data(), out_size_ * sizeof(std::complex<data_t>),
+      acc.data(), out_size_ * sizeof(std::complex<data_t>),
       hipMemcpyHostToDevice, gpu_mgr_.primary().stream());
   hipStreamSynchronize(gpu_mgr_.primary().stream());
 #endif

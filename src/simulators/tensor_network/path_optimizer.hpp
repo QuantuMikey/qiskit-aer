@@ -76,6 +76,53 @@ static std::string path_optlib() {
   return cached;
 }
 
+// Per-slice peak-intermediate budget in BYTES, from AER_TN_SLICE_TARGET_BYTES.
+// Default derives from the hipTensor m6n6k6 envelope: a kernel-fitting step
+// has intermediate rank <= 12, so peak per-slice intermediate is at most
+// 2^12 = 4096 elements; one logical complex element occupies 16 bytes
+// (double, split-complex: two 8-byte real planes), giving 65536 bytes. The
+// budget converts to a cotengra `target_size` in ELEMENTS using each
+// optimizer's element size, so a single value covers float and double.
+// Lower it to slice harder (e.g. when interior steps still trip the K<=6
+// limit); raise it only if a future hipTensor ships higher kernels.
+static uint64_t slice_target_bytes() {
+  static bool checked = false;
+  static uint64_t cached = 65536;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_SLICE_TARGET_BYTES");
+    if (val != nullptr) {
+      char *end = nullptr;
+      unsigned long long parsed = std::strtoull(val, &end, 10);
+      if (end != val && parsed > 0) {
+        cached = static_cast<uint64_t>(parsed);
+      } else {
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: AER_TN_SLICE_TARGET_BYTES='%s' is "
+                "not a positive integer; using default %llu bytes.\n",
+                val, (unsigned long long)cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+// AER_TN_FORCE_SLICING=1 forces at least 2 slices even when the natural
+// path already fits the per-slice budget. Slicer correctness testing on
+// small circuits depends on this: it exercises the full project/execute/
+// accumulate machinery on circuits cheap enough to validate element-wise
+// against a statevector or NumPy einsum reference.
+static bool force_slicing() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_FORCE_SLICING");
+    enabled = (val != nullptr && std::string(val) == "1");
+    checked = true;
+  }
+  return enabled;
+}
+
 //=============================================================================
 // Data structures
 //=============================================================================
@@ -279,10 +326,23 @@ public:
       sizes[py::str(mode_to_label_[it->first])] = it->second;
     }
 
+    // Per-slice peak-intermediate budget for cotengra's target_size, in
+    // elements. Two ceilings apply: the device-memory budget (we must fit
+    // at all) and the m6n6k6 kernel-envelope budget (every per-step
+    // descriptor must stay inside hipTensor's only kernel shape). The
+    // envelope is by far the tighter bound on LUMI (4 Ki elements vs ~7 Gi);
+    // taking the min keeps the memory bound authoritative for tiny GPUs and
+    // makes the planner's behavior identical on every node class otherwise.
     uint64_t target_elements = memory_limit_bytes / element_size_bytes_;
+    uint64_t envelope_elements =
+        std::max<uint64_t>(1, slice_target_bytes() / element_size_bytes_);
+    target_elements = std::min(target_elements, envelope_elements);
 
     py::dict slicing_opts;
     slicing_opts["target_size"] = target_elements;
+    // Outer (output) modes must never be sliced: the engine's accumulator
+    // sums slices, which matches summed-bond slicing only (see extract_plan).
+    slicing_opts["allow_outer"] = false;
     py::dict reconf_opts;
 
     py::object tree;
@@ -295,6 +355,13 @@ public:
           py::arg("seed") = seed,
           py::arg("progbar") = false);
       tree = opt.attr("search")(inputs, output, sizes);
+      // RandomGreedyOptimizer has no slicing_opts; slice the finished tree
+      // to the same per-slice budget the HyperOptimizer path uses, so both
+      // presets honor the m6n6k6 envelope. No-op when the tree already fits.
+      tree.attr("slice")(py::arg("target_size") = target_elements,
+                         py::arg("allow_outer") = false,
+                         py::arg("seed") = seed,
+                         py::arg("inplace") = true);
     } else {
       // HyperOptimizer path: backend chosen by AER_TN_OPTLIB env var.
       //
@@ -362,11 +429,33 @@ public:
       tree = opt.attr("search")(inputs, output, sizes);
     }
 
-    return extract_plan(tree);
+    // AER_TN_FORCE_SLICING=1: if the natural path needed no slicing, slice
+    // anyway (at least 2 slices). This is the validation hook that lets the
+    // slicer's projection/accumulation machinery run on small circuits whose
+    // results can be checked element-wise against an independent reference.
+    if (force_slicing()) {
+      py::dict sliced_inds = tree.attr("sliced_inds");
+      if (py::len(sliced_inds) == 0) {
+        tree.attr("slice")(py::arg("target_slices") = 2,
+                           py::arg("allow_outer") = false,
+                           py::arg("seed") = seed,
+                           py::arg("inplace") = true);
+        if (path_verbose()) {
+          fprintf(stderr,
+                  "[AER_TN_PATH] AER_TN_FORCE_SLICING=1: sliced an "
+                  "already-fitting path over %zu mode(s)\n",
+                  (size_t)py::len(tree.attr("sliced_inds")));
+        }
+      }
+    }
+
+    return extract_plan(tree, std::set<int32_t>(network.output_modes.begin(),
+                                                network.output_modes.end()));
   }
 
 private:
-  ContractionPlan extract_plan(py::object &tree) {
+  ContractionPlan extract_plan(py::object &tree,
+                               const std::set<int32_t> &output_modes) {
     ContractionPlan plan;
 
     py::object ssa_path = tree.attr("get_ssa_path")();
@@ -402,6 +491,22 @@ private:
       }
       auto slice_info_obj = item.second;
       si.extent = slice_info_obj.attr("size").cast<int64_t>();
+
+      // The execution engine's accumulation rule is a plain element-wise
+      // sum, which is only correct for sliced bonds that are summed over
+      // (inner indices). A sliced OUTPUT mode would mean each slice owns a
+      // disjoint block of the output instead — different semantics the
+      // engine does not implement. cotengra doesn't slice outer indices
+      // under the options used here; this guard turns a future change of
+      // that default into a loud planning error rather than a silent
+      // wrong result.
+      if (output_modes.count(si.mode)) {
+        throw std::runtime_error(
+            "CotengPathOptimizer: cotengra sliced an output (outer) mode; "
+            "the sliced execution engine only supports slicing summed "
+            "bonds. This is a planner configuration bug.");
+      }
+
       plan.sliced.push_back(si);
       plan.num_slices *= static_cast<uint64_t>(si.extent);
     }
@@ -452,8 +557,13 @@ public:
     }
 
     best.num_slices = 1;
+    // Same two-ceiling budget as the cotengra path: device memory and the
+    // m6n6k6 envelope, in elements (16 bytes per logical complex element).
     int64_t element_budget =
         static_cast<int64_t>(memory_limit_bytes / 16);
+    int64_t envelope_budget =
+        std::max<int64_t>(1, static_cast<int64_t>(slice_target_bytes() / 16));
+    element_budget = std::min(element_budget, envelope_budget);
     while (best.peak_intermediate_elements > element_budget &&
            !size_dict.empty()) {
       int32_t best_mode = -1;

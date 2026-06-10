@@ -81,6 +81,36 @@ template <typename MODULE>
 void bind_aer_controller(MODULE m) {
   m.def("aer_initialize_libraries", &initialize_libraries);
 
+  // Piece 0 (CPU-node operability): a queryable capability flag so user code
+  // and test harnesses can choose CPU vs GPU execution deliberately based on
+  // problem size, instead of discovering GPU absence via an exception (or,
+  // pre-patch, a process abort). Never throws; on a node with no GPU the
+  // query reports zero devices and clears the sticky runtime error.
+  m.def("gpu_device_count", []() {
+#ifdef AER_THRUST_GPU
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) {
+      cudaGetLastError();
+      return 0;
+    }
+    return count;
+#else
+    return 0;
+#endif
+  });
+  m.def("tensor_network_gpu_available", []() {
+#ifdef AER_THRUST_GPU
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) {
+      cudaGetLastError();
+      return false;
+    }
+    return count > 0;
+#else
+    return false;
+#endif
+  });
+
   py::class_<ControllerExecutor<Controller>> aer_ctrl(m,
                                                       "aer_controller_execute");
   aer_ctrl.def(py::init<>());

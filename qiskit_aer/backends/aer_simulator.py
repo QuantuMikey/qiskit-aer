@@ -26,6 +26,8 @@ from .backend_utils import (
     cpp_execute_circuits,
     available_methods,
     available_devices,
+    gpu_device_count,
+    tensor_network_gpu_available,
     MAX_QUBITS_STATEVECTOR,
     BASIS_GATES,
 )
@@ -883,6 +885,22 @@ class AerSimulator(AerBackend):
         if "_gpu" in self.name:
             return ["GPU"]
         return copy.copy(self._AVAILABLE_DEVICES)
+
+    @staticmethod
+    def gpu_device_count():
+        """Number of usable GPUs on this node (0 on CPU-only nodes).
+
+        Safe to call anywhere, including CPU-only nodes; never raises."""
+        return gpu_device_count()
+
+    @staticmethod
+    def tensor_network_gpu_available():
+        """Whether ``method='tensor_network'`` (GPU-only) can run here.
+
+        On a CPU-only node this returns False; a tensor_network run would
+        raise a clean error naming the missing GPU. Small circuits are
+        typically faster on CPU methods regardless."""
+        return tensor_network_gpu_available()
 
     def configuration(self):
         """Return the simulator backend configuration.
