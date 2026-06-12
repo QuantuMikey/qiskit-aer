@@ -654,9 +654,23 @@ void TensorNetContractor_HipTensor<data_t>::set_additional_tensors(
   for (size_t i = 0; i < tensors.size(); i++)
     input_tensors_.push_back(tensors[i]);
 
-  auto additional_ptrs = gpu_mgr_.primary().copy_tensor_data(tensors, true);
-  tensor_device_ptrs_.insert(tensor_device_ptrs_.end(),
-                             additional_ptrs.begin(), additional_ptrs.end());
+  // CSC fix (Bell <ZZ> = 0.0 — the REAL root cause):
+  // GPUDevice::copy_tensor_data() packs whatever list it is given starting at
+  // byte offset 0 of the per-device tensor arena, and only re-allocates when
+  // the requested total exceeds the current arena size. Calling it with ONLY
+  // the additional (Pauli) tensors therefore wrote them over the FIRST slots
+  // of the arena — on top of the network's input tensors. Observed on the
+  // n=2 Bell repro: T10/T11 device pointers equaled the T0/T2 slots, the Z
+  // matrices' real planes turned T0/T2 into (1,-i) and their imag planes
+  // zeroed T1/T3, so every contraction branch through T1/T3 collapsed to 0
+  // and the expectation value came out exactly 0.0.
+  // Fix: re-upload the FULL input list (network + additional). The additional
+  // tensors land in their own slots after the network slots, every entry of
+  // tensor_device_ptrs_ stays inside the (possibly re-grown) primary arena —
+  // which keeps the per-device slab rebase in the contraction path valid —
+  // and update_additional_tensors()' indexing via num_base_tensors_ now
+  // points at real, dedicated slots.
+  tensor_device_ptrs_ = gpu_mgr_.primary().copy_tensor_data(input_tensors_, true);
   build_network_description();
   pool_ready_ = false;
 
