@@ -190,7 +190,8 @@ build_signature(const std::vector<int32_t> &modes_a,
                 const std::vector<int32_t> &modes_c,
                 const std::vector<int64_t> &extents_c,
                 const std::vector<int64_t> &strides_a = {},
-                const std::vector<int64_t> &strides_b = {}) {
+                const std::vector<int64_t> &strides_b = {},
+                const std::vector<int64_t> &strides_c = {}) {
   ContractionSignature sig;
   sig.data.push_back(static_cast<int32_t>(modes_a.size()));
   for (size_t i = 0; i < modes_a.size(); i++) sig.data.push_back(modes_a[i]);
@@ -209,6 +210,11 @@ build_signature(const std::vector<int32_t> &modes_a,
   for (size_t i = 0; i < strides_a.size(); i++) sig.data.push_back(static_cast<int32_t>(strides_a[i]));
   sig.data.push_back(static_cast<int32_t>(strides_b.size()));
   for (size_t i = 0; i < strides_b.size(); i++) sig.data.push_back(static_cast<int32_t>(strides_b[i]));
+  // C strides: empty for packed pool-slot C (the common case), non-empty for
+  // WS-3 tiled strided-C blocks. Same sentinel discipline as A/B so a packed
+  // C can never collide with a strided C of identical mode/extent shape.
+  sig.data.push_back(static_cast<int32_t>(strides_c.size()));
+  for (size_t i = 0; i < strides_c.size(); i++) sig.data.push_back(static_cast<int32_t>(strides_c[i]));
   return sig;
 }
 
@@ -240,6 +246,12 @@ template <typename data_t> struct CachedPlan {
   // arrays: hipTensor retains the pointer, so the plan must own the data.
   std::vector<int64_t> strides_a_storage;
   std::vector<int64_t> strides_b_storage;
+  // Explicit C strides. Packed pool-slot C steps leave this empty (nullptr
+  // descriptor, as before). WS-3 tiled sub-blocks set it: a block is a
+  // strided VIEW into the packed parent C, so when a non-trailing C axis is
+  // tiled away the surviving axes are no longer contiguous and C must carry
+  // explicit strides — same mechanism as the A/B sliced-view strides above.
+  std::vector<int64_t> strides_c_storage;
 };
 
 template <typename data_t> class HipTensorPlanCache {
@@ -269,7 +281,8 @@ public:
                 const std::vector<int32_t> &modes_c,
                 const std::vector<int64_t> &extents_c,
                 const std::vector<int64_t> &strides_a = {},
-                const std::vector<int64_t> &strides_b = {}) {
+                const std::vector<int64_t> &strides_b = {},
+                const std::vector<int64_t> &strides_c = {}) {
     // Diagnostic kill switch: forces a fresh plan build on every call via
     // an always-rebuilt slot outside the cache map. Useful when suspecting
     // cache-relocation hazards; AER_TN_DISABLE_PLAN_CACHE=1 activates it.
@@ -332,6 +345,7 @@ public:
     cp.extents_c_storage = extents_c;
     cp.strides_a_storage = strides_a;
     cp.strides_b_storage = strides_b;
+    cp.strides_c_storage = strides_c;
 
     hipSetDevice(device_id_);
 
@@ -354,11 +368,15 @@ public:
     // projection keeps device data in place and presents the unsliced
     // remainder through parent strides). nullptr = hipTensor's packed
     // column-major default, identical to an explicit packed stride list.
-    // C is always a packed pool slot, so it never carries strides.
+    // C is packed for ordinary pool-slot steps (strides_c empty → nullptr),
+    // but a WS-3 tiled sub-block is a strided VIEW into the packed parent C
+    // and supplies explicit C strides (see strides_c_storage).
     const int64_t *sa = cp.strides_a_storage.empty()
                             ? nullptr : cp.strides_a_storage.data();
     const int64_t *sb = cp.strides_b_storage.empty()
                             ? nullptr : cp.strides_b_storage.data();
+    const int64_t *sc = cp.strides_c_storage.empty()
+                            ? nullptr : cp.strides_c_storage.data();
     check_hiptensor(hiptensorInitTensorDescriptor(
         handle_, &cp.desc_a, static_cast<uint32_t>(cp.modes_a_storage.size()),
         cp.extents_a_storage.data(), sa, hip_dtype, HIPTENSOR_OP_IDENTITY),
@@ -371,7 +389,7 @@ public:
 
     check_hiptensor(hiptensorInitTensorDescriptor(
         handle_, &cp.desc_c, static_cast<uint32_t>(cp.modes_c_storage.size()),
-        cp.extents_c_storage.data(), nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY),
+        cp.extents_c_storage.data(), sc, hip_dtype, HIPTENSOR_OP_IDENTITY),
         "hiptensorInitTensorDescriptor(C)", device_id_);
 
     check_hiptensor(hiptensorInitContractionDescriptor(

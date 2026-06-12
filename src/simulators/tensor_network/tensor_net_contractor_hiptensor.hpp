@@ -983,6 +983,12 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     uint64_t right = plan_.steps[step].right;
     size_t result_idx = num_inputs + step;
 
+    // WS-3: set in the rank guard when this oversized step is to be tiled.
+    // The actual build_tiles_for_step runs after the final-step C-reorder
+    // below so tiles encode modes_c in its FINAL physical order.
+    bool tile_this_step = false;
+    int tile_num_m = 0, tile_num_n = 0, tile_num_k = 0;
+
     // Natural (unpadded) A and B modes come from all_specs_ (which for inputs
     // reflects sliced_input_specs_, and for earlier intermediates reflects
     // their padded forms — that's fine, the padded form is just the valid
@@ -1060,20 +1066,19 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
           // increment. Every observed failure (full statevector >12, large
           // reduced DM) is output-mode-heavy and runs at 1 slice because
           // output modes cannot be sliced (allow_outer=false), so this covers
-          // them all. The tiles are executed by contract_single_slice; the
-          // recorded modes_c/extents_c below still describe the FULL (untiled)
-          // output so downstream steps and the pool layout are unchanged.
-          step_plan_specs_[step].tiles = build_tiles_for_step(
-              modes_a, extents_a, strides_a,
-              modes_b, extents_b, strides_b,
-              modes_c, extents_c);
-          if (tn_verbose()) {
-            fprintf(stderr,
-                    "[AER_TN] tiling step %zu (M=%d N=%d K=%d) into %zu "
-                    "m6n6k6 sub-contractions\n",
-                    step, num_m, num_n, num_k,
-                    step_plan_specs_[step].tiles.size());
-          }
+          // them all.
+          //
+          // Defer the actual build_tiles_for_step call until AFTER the
+          // final-step C-reorder block below. Tiles encode column-major
+          // offsets and strides over modes_c; the final step rewrites modes_c
+          // into modes_out_ order, so building here (pre-reorder) would make
+          // the final step write C in a different order than downstream steps
+          // and output extraction read it. Just flag the step now and record
+          // the M/N/K for the verbose line emitted after the build.
+          tile_this_step = true;
+          tile_num_m = num_m;
+          tile_num_n = num_n;
+          tile_num_k = num_k;
           // fall through: record the full descriptor as usual below.
         } else {
           std::stringstream err;
@@ -1162,6 +1167,26 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
       all_specs_[result_idx].extents = extents_c;
     }
 
+    // WS-3: now that modes_c/extents_c are in their FINAL physical order
+    // (after any final-step reorder above), build the sub-block tiles. They
+    // encode column-major offsets and strides over this exact C order, which
+    // is the order downstream steps and output extraction read C in, so the
+    // tiled writes and the reads agree. The recorded full modes_c/extents_c
+    // below still describe the untiled output for pool layout; the untiled
+    // whole-step plan is never executed for a tiled step.
+    if (tile_this_step) {
+      step_plan_specs_[step].tiles = build_tiles_for_step(
+          modes_a, extents_a, strides_a,
+          modes_b, extents_b, strides_b,
+          modes_c, extents_c);
+      if (tn_verbose())
+        fprintf(stderr,
+                "[AER_TN] tiling step %zu (M=%d N=%d K=%d) into %zu "
+                "m6n6k6 sub-contractions\n",
+                step, tile_num_m, tile_num_n, tile_num_k,
+                step_plan_specs_[step].tiles.size());
+    }
+
     // Record the exact per-plan descriptor shape for contract_single_slice.
     step_plan_specs_[step].modes_a = modes_a;
     step_plan_specs_[step].extents_a = extents_a;
@@ -1209,10 +1234,11 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
         remap_modes_to_safe_range(t.modes_a, t.modes_b, t.modes_c,
                                   ma_safe, mb_safe, mc_safe);
         auto tsig = build_signature(ma_safe, t.extents_a, mb_safe, t.extents_b,
-                                    mc_safe, t.extents_c, t.strides_a, t.strides_b);
+                                    mc_safe, t.extents_c, t.strides_a, t.strides_b,
+                                    t.strides_c);
         dev.plan_cache().get_or_create(
             tsig, ma_safe, t.extents_a, mb_safe, t.extents_b,
-            mc_safe, t.extents_c, t.strides_a, t.strides_b);
+            mc_safe, t.extents_c, t.strides_a, t.strides_b, t.strides_c);
       }
       continue;
     }
@@ -1480,10 +1506,11 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         remap_modes_to_safe_range(t.modes_a, t.modes_b, t.modes_c,
                                   ma_safe, mb_safe, mc_safe);
         auto tsig = build_signature(ma_safe, t.extents_a, mb_safe, t.extents_b,
-                                    mc_safe, t.extents_c, t.strides_a, t.strides_b);
+                                    mc_safe, t.extents_c, t.strides_a, t.strides_b,
+                                    t.strides_c);
         const CachedPlan<data_t> &tplan = dev.plan_cache().get_or_create(
             tsig, ma_safe, t.extents_a, mb_safe, t.extents_b,
-            mc_safe, t.extents_c, t.strides_a, t.strides_b);
+            mc_safe, t.extents_c, t.strides_a, t.strides_b, t.strides_c);
 
         // Apply this block's column-major element offsets as base-pointer
         // shifts to BOTH split-complex planes (mirrors project_slice). Use the
@@ -1670,6 +1697,15 @@ TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
     const std::vector<int32_t> &modes_c, const std::vector<int64_t> &extents_c) {
   using Tile = typename PlanSpec::Tile;
 
+  // strides_a/strides_b are the parent input strides. In this first increment
+  // tiling runs only at num_slices==1, where inputs are packed and these are
+  // empty; the block strides are derived from the packed parent layout (sa/sb
+  // below). They are retained in the signature for the future sliced-tiling
+  // increment, where a block's parent strides come from the slice projection
+  // rather than the packed layout. Mark unused for now to keep the build clean.
+  (void)strides_a;
+  (void)strides_b;
+
   std::set<int32_t> set_a(modes_a.begin(), modes_a.end());
   std::set<int32_t> set_b(modes_b.begin(), modes_b.end());
   std::set<int32_t> set_c(modes_c.begin(), modes_c.end());
@@ -1730,31 +1766,33 @@ TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
 
   bool any_k_tiled = !tK.empty();
 
-  // The per-block (free) descriptor: drop tile modes from A/B/C mode lists and
-  // their extents/strides. Identical for every block; offsets differ.
+  // The per-block (free) descriptor: drop tile modes from A/B/C mode lists.
+  // The surviving free modes keep their PARENT column-major strides (sa/sb/sc
+  // computed above), NOT re-packed strides. This is what makes a block a
+  // correct strided VIEW into its packed parent: when a non-trailing axis is
+  // tiled away, the kept axes are no longer contiguous in the parent buffer,
+  // so a packed descriptor would mis-address every element past the gap (the
+  // bug this fixes — packed-contiguous writes were only correct for N-only and
+  // K-only tiling). Tiling runs at num_slices==1, so the parent is packed and
+  // sa/sb/sc are its true strides. Identical for every block; offsets differ.
   auto drop_tiles = [&tile_set](const std::vector<int32_t> &modes,
                                 const std::vector<int64_t> &extents,
-                                const std::vector<int64_t> &strides,
+                                const std::map<int32_t, int64_t> &pstride,
                                 std::vector<int32_t> &om,
                                 std::vector<int64_t> &oe,
                                 std::vector<int64_t> &os) {
-    const bool has_str = !strides.empty();
     for (size_t i = 0; i < modes.size(); i++) {
       if (tile_set.count(modes[i])) continue;
       om.push_back(modes[i]);
       oe.push_back(extents[i]);
-      if (has_str) os.push_back(strides[i]);
+      os.push_back(pstride.at(modes[i]));
     }
   };
   std::vector<int32_t> bma, bmb, bmc;
-  std::vector<int64_t> bea, beb, bec, bsa, bsb;
-  drop_tiles(modes_a, extents_a, strides_a, bma, bea, bsa);
-  drop_tiles(modes_b, extents_b, strides_b, bmb, beb, bsb);
-  // C is always a packed pool slot: strip tile modes from its mode/extent only.
-  {
-    std::vector<int64_t> dummy_sc;
-    drop_tiles(modes_c, extents_c, std::vector<int64_t>{}, bmc, bec, dummy_sc);
-  }
+  std::vector<int64_t> bea, beb, bec, bsa, bsb, bsc;
+  drop_tiles(modes_a, extents_a, sa, bma, bea, bsa);
+  drop_tiles(modes_b, extents_b, sb, bmb, beb, bsb);
+  drop_tiles(modes_c, extents_c, sc, bmc, bec, bsc);
 
   // Total block count.
   uint64_t nblocks = 1;
@@ -1779,7 +1817,7 @@ TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
     Tile t;
     t.modes_a = bma; t.extents_a = bea; t.strides_a = bsa;
     t.modes_b = bmb; t.extents_b = beb; t.strides_b = bsb;
-    t.modes_c = bmc; t.extents_c = bec;
+    t.modes_c = bmc; t.extents_c = bec; t.strides_c = bsc;
     t.off_a = off_a; t.off_b = off_b; t.off_c = off_c;
 
     // Pad each block to satisfy the m6n6k6 grammar exactly as a normal step
@@ -1788,8 +1826,14 @@ TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
     if (tn_mnk_padding_enabled()) {
       pad_contraction_mnk(t.modes_a, t.extents_a, t.modes_b, t.extents_b,
                           t.modes_c, t.extents_c);
-      if (!t.strides_a.empty()) t.strides_a.resize(t.modes_a.size(), 1);
-      if (!t.strides_b.empty()) t.strides_b.resize(t.modes_b.size(), 1);
+      // Dummies are appended at the end of each mode list and are extent-1, so
+      // their stride is never dereferenced; pad all three stride lists to the
+      // new rank with value 1 (hipTensor's packed default for an extent-1
+      // axis). All three are now non-empty (real strided views), so unlike the
+      // old packed path these resizes always run.
+      t.strides_a.resize(t.modes_a.size(), 1);
+      t.strides_b.resize(t.modes_b.size(), 1);
+      t.strides_c.resize(t.modes_c.size(), 1);
     }
 
     // K-tiled blocks accumulate into the shared C region. When K is tiled,
