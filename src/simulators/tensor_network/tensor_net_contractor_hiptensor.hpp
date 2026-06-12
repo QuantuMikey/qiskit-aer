@@ -1057,16 +1057,20 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
       }
 
       if (num_m > 6 || num_n > 6 || num_k > 6) {
-        if (tn_tiling_enabled() && plan_.num_slices == 1) {
-          // WS-3 (first increment): decompose this oversized step into a grid
-          // of m6n6k6 sub-contractions instead of refusing. Restricted to the
-          // unsliced (num_slices==1) case: tile offsets are computed on the
-          // unsliced column-major layout, so combining tiling with slice
-          // projection (strided parent views) is deferred to a later
-          // increment. Every observed failure (full statevector >12, large
-          // reduced DM) is output-mode-heavy and runs at 1 slice because
-          // output modes cannot be sliced (allow_outer=false), so this covers
-          // them all.
+        if (tn_tiling_enabled()) {
+          // WS-3: decompose this oversized step into a grid of m6n6k6
+          // sub-contractions instead of refusing. Works for both unsliced and
+          // sliced plans: for a sliced step the input leaves are slice-
+          // projected strided views, and build_tiles_for_step derives each
+          // block's offsets and free-mode strides from the projected parent
+          // strides (passed in strides_a/strides_b). Those strides are slice-
+          // independent, so the tiles built once here are reused for every
+          // slice; project_slice applies the per-slice base offset, and the
+          // tile offset adds on top in the same column-major stride space
+          // (slice-offset + tile-offset compose; verified bit-equal to einsum).
+          // Slice-sum (across slices, into out_buf) and tile-sum (within a
+          // slice: disjoint M/N regions plus K-accumulation into the C slot)
+          // are sums at two levels and compose.
           //
           // Defer the actual build_tiles_for_step call until AFTER the
           // final-step C-reorder block below. Tiles encode column-major
@@ -1092,17 +1096,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
               << " modes_c=" << modes_to_str(modes_c) << ". "
               << "This circuit's contraction path requires kernel shapes "
               << "that hipTensor 1.5.0 does not provide. Options: ";
-          if (tn_tiling_enabled() && plan_.num_slices != 1) {
-            err << "(1) mode tiling is enabled but this plan is sliced ("
-                << plan_.num_slices << " slices); the first tiling increment "
-                << "supports only unsliced plans, so this step still refuses — "
-                << "lower the circuit/output size so the oversized step occurs "
-                << "at num_slices==1, ";
-          } else {
-            err << "(1) enable mode tiling with AER_TN_ENABLE_TILING=1 "
-                << "(decomposes oversized steps into m6n6k6 sub-contractions; "
-                << "first increment requires an unsliced plan), ";
-          }
+          err << "(1) enable mode tiling with AER_TN_ENABLE_TILING=1 "
+              << "(decomposes oversized steps into m6n6k6 sub-contractions; "
+              << "supports both unsliced and sliced plans), ";
           err << "(2) tighten the per-slice budget so the slicer cuts this "
               << "step inside the envelope (lower AER_TN_SLICE_TARGET_BYTES, "
               << "current default 65536), "
@@ -1697,14 +1693,11 @@ TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
     const std::vector<int32_t> &modes_c, const std::vector<int64_t> &extents_c) {
   using Tile = typename PlanSpec::Tile;
 
-  // strides_a/strides_b are the parent input strides. In this first increment
-  // tiling runs only at num_slices==1, where inputs are packed and these are
-  // empty; the block strides are derived from the packed parent layout (sa/sb
-  // below). They are retained in the signature for the future sliced-tiling
-  // increment, where a block's parent strides come from the slice projection
-  // rather than the packed layout. Mark unused for now to keep the build clean.
-  (void)strides_a;
-  (void)strides_b;
+  // strides_a/strides_b are the parent input strides: non-empty (and
+  // slice-independent) for a slice-projected leaf input, empty for a packed
+  // input (intermediate, or unsliced leaf). They feed sa/sb below so a block is
+  // a correct strided view into either a projected or a packed parent. This is
+  // what lets tiling compose with slicing.
 
   std::set<int32_t> set_a(modes_a.begin(), modes_a.end());
   std::set<int32_t> set_b(modes_b.begin(), modes_b.end());
@@ -1729,8 +1722,27 @@ TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
     for (size_t i = 0; i < modes.size(); i++) { s[modes[i]] = st; st *= extents[i]; }
     return s;
   };
-  std::map<int32_t, int64_t> sa = stride_map(modes_a, extents_a);
-  std::map<int32_t, int64_t> sb = stride_map(modes_b, extents_b);
+  // sa/sb are the parent column-major element strides used both for a block's
+  // base-pointer offsets and for its surviving free-mode descriptor strides.
+  // When an input is a SLICE-PROJECTED view, its parent strides arrive in
+  // strides_a/strides_b (non-empty) and are slice-INDEPENDENT — project_slice
+  // fixes only the per-slice base offset, never the strides — so the tiles
+  // built here from them are a correct strided view into the projected parent
+  // for every slice. When the input is packed (an intermediate, or an unsliced
+  // leaf) the stride list is empty and we derive packed column-major strides
+  // from extents, exactly as the unsliced increment did. C is always a packed
+  // intermediate slot (never projected), so sc stays packed.
+  auto strides_to_map = [](const std::vector<int32_t> &modes,
+                           const std::vector<int64_t> &strides) {
+    std::map<int32_t, int64_t> s;
+    for (size_t i = 0; i < modes.size() && i < strides.size(); i++)
+      s[modes[i]] = strides[i];
+    return s;
+  };
+  std::map<int32_t, int64_t> sa = strides_a.empty()
+      ? stride_map(modes_a, extents_a) : strides_to_map(modes_a, strides_a);
+  std::map<int32_t, int64_t> sb = strides_b.empty()
+      ? stride_map(modes_b, extents_b) : strides_to_map(modes_b, strides_b);
   std::map<int32_t, int64_t> sc = stride_map(modes_c, extents_c);
   std::map<int32_t, int64_t> ext;
   for (size_t i = 0; i < modes_a.size(); i++) ext[modes_a[i]] = extents_a[i];
@@ -1769,12 +1781,13 @@ TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
   // The per-block (free) descriptor: drop tile modes from A/B/C mode lists.
   // The surviving free modes keep their PARENT column-major strides (sa/sb/sc
   // computed above), NOT re-packed strides. This is what makes a block a
-  // correct strided VIEW into its packed parent: when a non-trailing axis is
-  // tiled away, the kept axes are no longer contiguous in the parent buffer,
-  // so a packed descriptor would mis-address every element past the gap (the
-  // bug this fixes — packed-contiguous writes were only correct for N-only and
-  // K-only tiling). Tiling runs at num_slices==1, so the parent is packed and
-  // sa/sb/sc are its true strides. Identical for every block; offsets differ.
+  // correct strided VIEW into its parent: when a non-trailing axis is tiled
+  // away, the kept axes are no longer contiguous in the parent buffer, so a
+  // packed descriptor would mis-address every element past the gap (the bug
+  // this fixes — packed-contiguous writes were only correct for N-only and
+  // K-only tiling). sa/sb are the parent's true strides whether the parent is
+  // packed (unsliced/intermediate) or slice-projected; sc is always packed (C
+  // is an intermediate slot). Identical for every block; offsets differ.
   auto drop_tiles = [&tile_set](const std::vector<int32_t> &modes,
                                 const std::vector<int64_t> &extents,
                                 const std::map<int32_t, int64_t> &pstride,
