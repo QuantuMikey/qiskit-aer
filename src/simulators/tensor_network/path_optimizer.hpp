@@ -49,6 +49,22 @@ static bool path_verbose() {
   return enabled;
 }
 
+// WS-3: when AER_TN_ENABLE_TILING=1, the contractor decomposes oversized
+// per-step contractions into m6n6k6 sub-contractions, so an output carrying
+// more than 12 free modes is no longer infeasible. The >12-free-mode
+// feasibility refusal below must therefore defer to tiling when it is on.
+// Mirrors tn_tiling_enabled() in the contractor (same env var).
+static bool path_tiling_enabled() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_ENABLE_TILING");
+    enabled = (val != nullptr && std::string(val) == "1");
+    checked = true;
+  }
+  return enabled;
+}
+
 // Read cotengra backend selection from AER_TN_OPTLIB env var.
 // Valid values: "optuna" (default), "cmaes", "sbplx", "sses".
 // Anything else falls through to "optuna".
@@ -349,7 +365,7 @@ public:
     //    hyperopt trials ("Ran out of valid indices to slice") and die in a
     //    bare KeyError('tree').
     constexpr size_t kMaxFreeModes = 12; // 6 M-modes + 6 N-modes (m6n6k6)
-    if (network.output_modes.size() > kMaxFreeModes) {
+    if (network.output_modes.size() > kMaxFreeModes && !path_tiling_enabled()) {
       std::ostringstream msg;
       msg << "CotengPathOptimizer: requested output has "
           << network.output_modes.size()
@@ -359,7 +375,9 @@ public:
           << " free modes per step. Full-statevector extraction above 12 "
              "qubits is infeasible on this backend; request expectation "
              "values, amplitudes, or other low-rank outputs instead "
-             "(slicing is fully effective for those).";
+             "(slicing is fully effective for those), or enable mode tiling "
+             "with AER_TN_ENABLE_TILING=1 to decompose oversized output "
+             "steps into m6n6k6 sub-contractions.";
       throw std::runtime_error(msg.str());
     }
 

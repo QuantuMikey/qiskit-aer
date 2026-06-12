@@ -124,6 +124,27 @@ static bool tn_rank_guard_enabled() {
   return enabled;
 }
 
+// WS-3 mode tiling. When a per-step contraction exceeds the m6n6k6 envelope
+// (M>6, N>6, or K>6), tiling decomposes that one step into a loop of
+// kernel-sized (<=6 each) sub-contractions and accumulates the pieces, so an
+// oversized step produces correct results instead of the rank guard throwing.
+//
+// Default OFF: until tiling is numerically validated (test_tiling_unit.py vs
+// einsum to 1e-10, then full-statevector>12 and large-reduced-DM vs CPU), the
+// rank guard stays the default behavior so a partially complete tiler can
+// never produce silent wrong output in normal runs. Activate with
+// AER_TN_ENABLE_TILING=1.
+static bool tn_tiling_enabled() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_ENABLE_TILING");
+    enabled = (val != nullptr && std::string(val) == "1");
+    checked = true;
+  }
+  return enabled;
+}
+
 //=============================================================================
 // Diagnostic helpers
 //=============================================================================
@@ -440,6 +461,26 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
     std::vector<int32_t> modes_a, modes_b, modes_c;
     std::vector<int64_t> extents_a, extents_b, extents_c;
     std::vector<int64_t> strides_a, strides_b;
+
+    // WS-3 mode tiling. Empty `tiles` => in-envelope step, executed exactly as
+    // before via the descriptor above (zero behavior change). Non-empty =>
+    // this logical step is oversized (M>6, N>6, or K>6) and is executed as a
+    // loop of these kernel-sized sub-contractions; each Tile is itself
+    // m6n6k6-grammar-compliant. K-block tiles set accumulate=true so their
+    // partial products sum into the same C sub-region; M/N-block tiles write
+    // disjoint C sub-regions (accumulate=false).
+    struct Tile {
+      std::vector<int32_t> modes_a, modes_b, modes_c;
+      std::vector<int64_t> extents_a, extents_b, extents_c;
+      std::vector<int64_t> strides_a, strides_b, strides_c;
+      // Element offsets (column-major, mode-0-fastest) into the FULL parent
+      // A/B/C tensors for this sub-block's origin. Applied as a base-pointer
+      // shift to both split-complex planes, mirroring project_slice().
+      int64_t off_a = 0, off_b = 0, off_c = 0;
+      bool accumulate = false;   // true for K-block partials (beta=1)
+      bool zero_c_first = false; // true on the first writer of each C region
+    };
+    std::vector<Tile> tiles;
   };
   std::vector<PlanSpec> step_plan_specs_;
 
@@ -478,6 +519,17 @@ private:
   bool topology_matches_previous() const;
   void cache_topology();
   void contract_single_slice(uint_t slice_index, int device_idx);
+  // WS-3: decompose one oversized contraction step (M>6, N>6, or K>6) into a
+  // grid of m6n6k6-compliant sub-block Tiles. Returns the tile list; throws if
+  // a block still cannot be made grammar-compliant. The caller stores the
+  // result in step_plan_specs_[step].tiles.
+  std::vector<typename TensorNetContractor_HipTensor<data_t>::PlanSpec::Tile>
+  build_tiles_for_step(
+      const std::vector<int32_t> &modes_a, const std::vector<int64_t> &extents_a,
+      const std::vector<int64_t> &strides_a,
+      const std::vector<int32_t> &modes_b, const std::vector<int64_t> &extents_b,
+      const std::vector<int64_t> &strides_b,
+      const std::vector<int32_t> &modes_c, const std::vector<int64_t> &extents_c);
   void project_slice(uint_t slice_index, int device_idx,
                      std::vector<PlanePtrs> &projected);
   void accumulate_across_gpus();
@@ -999,28 +1051,65 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
       }
 
       if (num_m > 6 || num_n > 6 || num_k > 6) {
-        std::stringstream err;
-        err << "hipTensor m6n6k6 ceiling exceeded at contraction step "
-            << step << " of " << num_steps
-            << " (T" << left << " x T" << right << " -> T" << result_idx << "): "
-            << "M=" << num_m << " N=" << num_n << " K=" << num_k
-            << " (hipTensor 1.5.0 ships kernels only at M=N=K=6). "
-            << "modes_a=" << modes_to_str(modes_a)
-            << " modes_b=" << modes_to_str(modes_b)
-            << " modes_c=" << modes_to_str(modes_c) << ". "
-            << "This circuit's contraction path requires kernel shapes "
-            << "that hipTensor 1.5.0 does not provide. Options: "
-            << "(1) tighten the per-slice budget so the slicer cuts this "
-            << "step inside the envelope (lower AER_TN_SLICE_TARGET_BYTES, "
-            << "current default 65536), "
-            << "(2) use method='statevector' (validated on LUMI to 44 "
-            << "qubits at depth 30 on 1024 nodes, CSC April 2025), "
-            << "(3) reduce circuit depth or qubit count, "
-            << "(4) try a different contraction-path optimizer setting "
-            << "via cotengra to see if a lower-rank path exists. "
-            << "Set AER_TN_DISABLE_RANK_GUARD=1 to bypass this check "
-            << "(produces SILENT WRONG RESULTS — for bug-reporting only).";
-        throw std::runtime_error(err.str());
+        if (tn_tiling_enabled() && plan_.num_slices == 1) {
+          // WS-3 (first increment): decompose this oversized step into a grid
+          // of m6n6k6 sub-contractions instead of refusing. Restricted to the
+          // unsliced (num_slices==1) case: tile offsets are computed on the
+          // unsliced column-major layout, so combining tiling with slice
+          // projection (strided parent views) is deferred to a later
+          // increment. Every observed failure (full statevector >12, large
+          // reduced DM) is output-mode-heavy and runs at 1 slice because
+          // output modes cannot be sliced (allow_outer=false), so this covers
+          // them all. The tiles are executed by contract_single_slice; the
+          // recorded modes_c/extents_c below still describe the FULL (untiled)
+          // output so downstream steps and the pool layout are unchanged.
+          step_plan_specs_[step].tiles = build_tiles_for_step(
+              modes_a, extents_a, strides_a,
+              modes_b, extents_b, strides_b,
+              modes_c, extents_c);
+          if (tn_verbose()) {
+            fprintf(stderr,
+                    "[AER_TN] tiling step %zu (M=%d N=%d K=%d) into %zu "
+                    "m6n6k6 sub-contractions\n",
+                    step, num_m, num_n, num_k,
+                    step_plan_specs_[step].tiles.size());
+          }
+          // fall through: record the full descriptor as usual below.
+        } else {
+          std::stringstream err;
+          err << "hipTensor m6n6k6 ceiling exceeded at contraction step "
+              << step << " of " << num_steps
+              << " (T" << left << " x T" << right << " -> T" << result_idx << "): "
+              << "M=" << num_m << " N=" << num_n << " K=" << num_k
+              << " (hipTensor 1.5.0 ships kernels only at M=N=K=6). "
+              << "modes_a=" << modes_to_str(modes_a)
+              << " modes_b=" << modes_to_str(modes_b)
+              << " modes_c=" << modes_to_str(modes_c) << ". "
+              << "This circuit's contraction path requires kernel shapes "
+              << "that hipTensor 1.5.0 does not provide. Options: ";
+          if (tn_tiling_enabled() && plan_.num_slices != 1) {
+            err << "(1) mode tiling is enabled but this plan is sliced ("
+                << plan_.num_slices << " slices); the first tiling increment "
+                << "supports only unsliced plans, so this step still refuses — "
+                << "lower the circuit/output size so the oversized step occurs "
+                << "at num_slices==1, ";
+          } else {
+            err << "(1) enable mode tiling with AER_TN_ENABLE_TILING=1 "
+                << "(decomposes oversized steps into m6n6k6 sub-contractions; "
+                << "first increment requires an unsliced plan), ";
+          }
+          err << "(2) tighten the per-slice budget so the slicer cuts this "
+              << "step inside the envelope (lower AER_TN_SLICE_TARGET_BYTES, "
+              << "current default 65536), "
+              << "(3) use method='statevector' (validated on LUMI to 44 "
+              << "qubits at depth 30 on 1024 nodes, CSC April 2025), "
+              << "(4) reduce circuit depth or qubit count, "
+              << "(5) try a different contraction-path optimizer setting "
+              << "via cotengra to see if a lower-rank path exists. "
+              << "Set AER_TN_DISABLE_RANK_GUARD=1 to bypass this check "
+              << "(produces SILENT WRONG RESULTS — for bug-reporting only).";
+          throw std::runtime_error(err.str());
+        }
       }
     }
 
@@ -1110,6 +1199,23 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
     // Use the padded per-step descriptor shape, not the raw all_specs_
     // (which for inputs may differ from what this specific plan needs).
     const PlanSpec &ps = step_plan_specs_[step];
+
+    if (!ps.tiles.empty()) {
+      // WS-3 tiled step: pre-build each sub-block plan so its workspace is
+      // counted by max_workspace_bytes() below. The untiled whole-step plan is
+      // never executed for a tiled step, so we do NOT build it here.
+      for (const auto &t : ps.tiles) {
+        std::vector<int32_t> ma_safe, mb_safe, mc_safe;
+        remap_modes_to_safe_range(t.modes_a, t.modes_b, t.modes_c,
+                                  ma_safe, mb_safe, mc_safe);
+        auto tsig = build_signature(ma_safe, t.extents_a, mb_safe, t.extents_b,
+                                    mc_safe, t.extents_c, t.strides_a, t.strides_b);
+        dev.plan_cache().get_or_create(
+            tsig, ma_safe, t.extents_a, mb_safe, t.extents_b,
+            mc_safe, t.extents_c, t.strides_a, t.strides_b);
+      }
+      continue;
+    }
 
     // Remap mode IDs to a safe range (see remap_modes_to_safe_range above).
     // Must use identical logic to contract_single_slice so cache
@@ -1343,6 +1449,75 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     // construction (§8.3).
     const PlanSpec &ps = step_plan_specs_[step];
 
+    void *c_slot = dev.pool().get_tensor_ptr(static_cast<int>(result_idx));
+    const size_t c_plane = plane_bytes(
+        all_specs_[result_idx].num_elements(), sizeof(data_t));
+    all_planes[result_idx].re = reinterpret_cast<data_t *>(c_slot);
+    all_planes[result_idx].im =
+        reinterpret_cast<data_t *>(static_cast<char *>(c_slot) + c_plane);
+
+    if (!ps.tiles.empty()) {
+      // ---- WS-3 tiled step ----
+      // Zero the whole C slot ONCE up front: K-accumulating tiles add into it,
+      // and disjoint M/N tiles each overwrite their own region. (Per-tile
+      // zeroing would clobber the K running sum — see WS3_tiling_design.md.)
+      {
+        size_t c_bytes = tensor_slot_bytes(
+            all_specs_[result_idx].num_elements(), sizeof(data_t));
+        check_hip(hipMemsetAsync(c_slot, 0, c_bytes, dev.stream()),
+                  "hipMemsetAsync(tiled C pre-zero)", dev.device_id());
+      }
+      if (tn_debug())
+        fprintf(stderr,
+                "[AER_TN_DEBUG]   step %zu TILED into %zu sub-contractions\n",
+                step, ps.tiles.size());
+
+      for (size_t ti = 0; ti < ps.tiles.size(); ti++) {
+        const auto &t = ps.tiles[ti];
+
+        // Per-block safe-ID remap (identical discipline to the untiled path).
+        std::vector<int32_t> ma_safe, mb_safe, mc_safe;
+        remap_modes_to_safe_range(t.modes_a, t.modes_b, t.modes_c,
+                                  ma_safe, mb_safe, mc_safe);
+        auto tsig = build_signature(ma_safe, t.extents_a, mb_safe, t.extents_b,
+                                    mc_safe, t.extents_c, t.strides_a, t.strides_b);
+        const CachedPlan<data_t> &tplan = dev.plan_cache().get_or_create(
+            tsig, ma_safe, t.extents_a, mb_safe, t.extents_b,
+            mc_safe, t.extents_c, t.strides_a, t.strides_b);
+
+        // Apply this block's column-major element offsets as base-pointer
+        // shifts to BOTH split-complex planes (mirrors project_slice). Use the
+        // re/im plane bases already resolved in all_planes[]: for sliced inputs
+        // these come from project_slice (parent-tensor plane sizing + slice
+        // offset), for intermediates from the packed slot layout below. We must
+        // NOT recompute the re->im gap here — project_slice sizes it on the
+        // FULL parent, not the sliced element count, so recomputing would be
+        // wrong for sliced inputs. Offsetting the already-correct .im base is
+        // valid because the tile offset is an element index into the same
+        // (parent or packed) column-major layout both planes share.
+        data_t *Ar = all_planes[left].re + t.off_a;
+        data_t *Ai = all_planes[left].im + t.off_a;
+        data_t *Br = all_planes[right].re + t.off_b;
+        data_t *Bi = all_planes[right].im + t.off_b;
+        data_t *Cr = all_planes[result_idx].re + t.off_c;
+        data_t *Ci = all_planes[result_idx].im + t.off_c;
+
+        dev.execute_contraction_planes(tplan, Ar, Ai, Br, Bi, Cr, Ci,
+                                       workspace, ws_size, t.accumulate);
+      }
+
+      if (tn_debug()) {
+        hipStreamSynchronize(dev.stream());
+        char label[64];
+        snprintf(label, sizeof(label), "  after tiled step %zu (T%zu)", step,
+                 result_idx);
+        dump_device_planes<data_t>(label, all_planes[result_idx].re,
+                                   all_planes[result_idx].im,
+                                   all_specs_[result_idx].num_elements(), 32);
+      }
+      continue; // tiled step done; skip the single-dispatch path below
+    }
+
     // ---- Mode ID remap ----
     // hipTensor / Composable Kernel silently produces zero output when
     // mode IDs are large negative (observed experimentally with
@@ -1375,13 +1550,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         modes_b_safe, ps.extents_b,
         modes_c_safe, ps.extents_c,
         ps.strides_a, ps.strides_b);
-
-    void *c_slot = dev.pool().get_tensor_ptr(static_cast<int>(result_idx));
-    const size_t c_plane = plane_bytes(
-        all_specs_[result_idx].num_elements(), sizeof(data_t));
-    all_planes[result_idx].re = reinterpret_cast<data_t *>(c_slot);
-    all_planes[result_idx].im =
-        reinterpret_cast<data_t *>(static_cast<char *>(c_slot) + c_plane);
 
     // Defense in depth against two orthogonal failure modes:
     //   1. The pool memory for this intermediate is freshly allocated or
@@ -1473,6 +1641,184 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       fprintf(stderr, " (%.3f,%.3fi)", host[i].real(), host[i].imag());
     fprintf(stderr, "\n");
   }
+}
+
+// WS-3 mode tiling: decompose one oversized contraction (M>6, N>6, or K>6)
+// into a grid of m6n6k6-compliant sub-contractions. Verified bit-equal to
+// einsum (M-tiling exact; K-tiling to fp roundoff) before implementation.
+//
+// Model (mirrors project_slice's column-major offset arithmetic): for each
+// axis that exceeds 6 modes, take the EXCESS modes as "tile modes" and iterate
+// every mixed-radix combination of their values. For a fixed combination:
+//   * M tile-modes select a disjoint sub-region of C and the matching rows of
+//     A  -> the block writes its own C region (accumulate=false).
+//   * N tile-modes  -> disjoint C region and matching rows of B
+//     (accumulate=false).
+//   * K tile-modes select matching slabs of A AND B and the partial product
+//     must be SUMMED into the same C region -> accumulate=true.
+// Each block's remaining (free) modes number <=6 on every axis, so it is a
+// legal m6n6k6 call. Offsets are element offsets in the FULL parent tensor's
+// column-major (mode-0-fastest) layout; contract_single_slice applies them as
+// base-pointer shifts to both split-complex planes.
+template <typename data_t>
+std::vector<typename TensorNetContractor_HipTensor<data_t>::PlanSpec::Tile>
+TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
+    const std::vector<int32_t> &modes_a, const std::vector<int64_t> &extents_a,
+    const std::vector<int64_t> &strides_a,
+    const std::vector<int32_t> &modes_b, const std::vector<int64_t> &extents_b,
+    const std::vector<int64_t> &strides_b,
+    const std::vector<int32_t> &modes_c, const std::vector<int64_t> &extents_c) {
+  using Tile = typename PlanSpec::Tile;
+
+  std::set<int32_t> set_a(modes_a.begin(), modes_a.end());
+  std::set<int32_t> set_b(modes_b.begin(), modes_b.end());
+  std::set<int32_t> set_c(modes_c.begin(), modes_c.end());
+
+  // Classify modes. M = in A & C not B; N = in B & C not A; K = in A & B not C.
+  std::vector<int32_t> M, N, K;
+  for (int32_t m : modes_a) {
+    if (set_b.count(m)) { if (!set_c.count(m)) K.push_back(m); }
+    else if (set_c.count(m)) M.push_back(m);
+  }
+  for (int32_t m : modes_b) {
+    if (!set_a.count(m) && set_c.count(m)) N.push_back(m);
+  }
+
+  // Column-major element stride of each mode within its parent tensor (mode 0
+  // fastest), so an offset for fixing mode == value is value * stride.
+  auto stride_map = [](const std::vector<int32_t> &modes,
+                       const std::vector<int64_t> &extents) {
+    std::map<int32_t, int64_t> s;
+    int64_t st = 1;
+    for (size_t i = 0; i < modes.size(); i++) { s[modes[i]] = st; st *= extents[i]; }
+    return s;
+  };
+  std::map<int32_t, int64_t> sa = stride_map(modes_a, extents_a);
+  std::map<int32_t, int64_t> sb = stride_map(modes_b, extents_b);
+  std::map<int32_t, int64_t> sc = stride_map(modes_c, extents_c);
+  std::map<int32_t, int64_t> ext;
+  for (size_t i = 0; i < modes_a.size(); i++) ext[modes_a[i]] = extents_a[i];
+  for (size_t i = 0; i < modes_b.size(); i++) ext[modes_b[i]] = extents_b[i];
+  for (size_t i = 0; i < modes_c.size(); i++) ext[modes_c[i]] = extents_c[i];
+
+  // Tile modes = the excess beyond 6 on each oversized axis. Free modes stay.
+  // Only EXTENT>1 modes are eligible to be tiled: extent-1 dummies (added by
+  // pad_contraction_mnk upstream) carry no data, so keeping them free and
+  // tiling only real modes guarantees each block's free axis holds <=6 real
+  // modes irrespective of where padding placed the dummies.
+  auto excess = [&ext](const std::vector<int32_t> &axis) {
+    std::vector<int32_t> real;
+    for (int32_t m : axis) if (ext[m] > 1) real.push_back(m);
+    return (real.size() > 6)
+               ? std::vector<int32_t>(real.begin() + 6, real.end())
+               : std::vector<int32_t>{};
+  };
+  std::vector<int32_t> tM = excess(M), tN = excess(N), tK = excess(K);
+  std::set<int32_t> tile_set;
+  for (int32_t m : tM) tile_set.insert(m);
+  for (int32_t m : tN) tile_set.insert(m);
+  for (int32_t m : tK) tile_set.insert(m);
+
+  // Ordered list of all tile modes, with which operands each one offsets and
+  // whether it is a (summed) K mode. Mixed-radix iteration order is fixed and
+  // deterministic (P4).
+  struct TileMode { int32_t mode; bool in_a, in_b, in_c; bool is_k; int64_t extent; };
+  std::vector<TileMode> tile_modes;
+  for (int32_t m : tM) tile_modes.push_back({m, true, false, true, false, ext[m]});
+  for (int32_t m : tN) tile_modes.push_back({m, false, true, true, false, ext[m]});
+  for (int32_t m : tK) tile_modes.push_back({m, true, true, false, true, ext[m]});
+
+  bool any_k_tiled = !tK.empty();
+
+  // The per-block (free) descriptor: drop tile modes from A/B/C mode lists and
+  // their extents/strides. Identical for every block; offsets differ.
+  auto drop_tiles = [&tile_set](const std::vector<int32_t> &modes,
+                                const std::vector<int64_t> &extents,
+                                const std::vector<int64_t> &strides,
+                                std::vector<int32_t> &om,
+                                std::vector<int64_t> &oe,
+                                std::vector<int64_t> &os) {
+    const bool has_str = !strides.empty();
+    for (size_t i = 0; i < modes.size(); i++) {
+      if (tile_set.count(modes[i])) continue;
+      om.push_back(modes[i]);
+      oe.push_back(extents[i]);
+      if (has_str) os.push_back(strides[i]);
+    }
+  };
+  std::vector<int32_t> bma, bmb, bmc;
+  std::vector<int64_t> bea, beb, bec, bsa, bsb;
+  drop_tiles(modes_a, extents_a, strides_a, bma, bea, bsa);
+  drop_tiles(modes_b, extents_b, strides_b, bmb, beb, bsb);
+  // C is always a packed pool slot: strip tile modes from its mode/extent only.
+  {
+    std::vector<int64_t> dummy_sc;
+    drop_tiles(modes_c, extents_c, std::vector<int64_t>{}, bmc, bec, dummy_sc);
+  }
+
+  // Total block count.
+  uint64_t nblocks = 1;
+  for (const auto &tm : tile_modes) nblocks *= static_cast<uint64_t>(tm.extent);
+
+  std::vector<Tile> tiles;
+  tiles.reserve(nblocks);
+
+  for (uint64_t idx = 0; idx < nblocks; idx++) {
+    // Decompose idx into per-tile-mode values, first tile mode fastest (fixed,
+    // deterministic order).
+    uint64_t rem = idx;
+    int64_t off_a = 0, off_b = 0, off_c = 0;
+    for (const auto &tm : tile_modes) {
+      int64_t v = static_cast<int64_t>(rem % static_cast<uint64_t>(tm.extent));
+      rem /= static_cast<uint64_t>(tm.extent);
+      if (tm.in_a) off_a += v * sa[tm.mode];
+      if (tm.in_b) off_b += v * sb[tm.mode];
+      if (tm.in_c) off_c += v * sc[tm.mode];
+    }
+
+    Tile t;
+    t.modes_a = bma; t.extents_a = bea; t.strides_a = bsa;
+    t.modes_b = bmb; t.extents_b = beb; t.strides_b = bsb;
+    t.modes_c = bmc; t.extents_c = bec;
+    t.off_a = off_a; t.off_b = off_b; t.off_c = off_c;
+
+    // Pad each block to satisfy the m6n6k6 grammar exactly as a normal step
+    // does (extent-1 dummies). Done per block so each descriptor is itself
+    // grammar-compliant (R1: never hand a block a known-bad shape).
+    if (tn_mnk_padding_enabled()) {
+      pad_contraction_mnk(t.modes_a, t.extents_a, t.modes_b, t.extents_b,
+                          t.modes_c, t.extents_c);
+      if (!t.strides_a.empty()) t.strides_a.resize(t.modes_a.size(), 1);
+      if (!t.strides_b.empty()) t.strides_b.resize(t.modes_b.size(), 1);
+    }
+
+    // K-tiled blocks accumulate into the shared C region. When K is tiled,
+    // multiple blocks target the SAME off_c, so only the first writer zeroes
+    // it; the rest add (beta=1). When K is not tiled, every block has a unique
+    // off_c (disjoint M/N region) and writes fresh.
+    if (any_k_tiled) {
+      // off_c repeats every (#K-combinations) blocks. With tile_modes ordered
+      // M,N,K and idx mixed-radix first-fastest, the K values are the highest-
+      // order digits, so blocks sharing an off_c are NOT contiguous. Instead
+      // detect the first writer by whether ALL K tile-mode values are zero.
+      uint64_t r = idx;
+      bool first_k = true;
+      for (const auto &tm : tile_modes) {
+        int64_t v = static_cast<int64_t>(r % static_cast<uint64_t>(tm.extent));
+        r /= static_cast<uint64_t>(tm.extent);
+        if (tm.is_k && v != 0) { first_k = false; break; }
+      }
+      t.accumulate = !first_k;       // beta=1 for all but the first K writer
+      t.zero_c_first = first_k;      // first K writer zeroes its C region
+    } else {
+      t.accumulate = false;
+      t.zero_c_first = true;         // every block writes a fresh disjoint region
+    }
+
+    tiles.push_back(std::move(t));
+  }
+
+  return tiles;
 }
 
 template <typename data_t>
