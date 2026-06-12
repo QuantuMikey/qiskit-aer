@@ -981,7 +981,6 @@ double TensorNet<data_t>::norm() const {
 
   TensorNetContractor<data_t> *contractor;
   create_contractor(contractor);
-  contractor->set_network(tensors_);
 
   std::vector<int32_t> modes_out(2);
   std::vector<int64_t> extents_out(2);
@@ -992,7 +991,12 @@ double TensorNet<data_t>::norm() const {
   extents_out[0] = 2;
   extents_out[1] = 2;
 
+  // CSC WS-4 fix (idle-qubit orphan-drop, sibling of the WS-1 DM-path bug):
+  // set_output() before set_network() so the orphan mask sees the output modes;
+  // otherwise an idle qubit 0 (connected only through the output) is dropped and
+  // the state norm is corrupted. Mirrors reduced_density_matrix() ordering.
   contractor->set_output(modes_out, extents_out);
+  contractor->set_network(tensors_);
   contractor->setup_contraction(use_cuTensorNet_autotuning_);
   double val = contractor->contract_and_trace(1);
 
@@ -1053,9 +1057,6 @@ double TensorNet<data_t>::norm(const reg_t &qubits,
 
   TensorNetContractor<data_t> *contractor;
   create_contractor(contractor);
-  contractor->set_network(tensors_);
-  contractor->allocate_additional_tensors(mat.size() * 2);
-  contractor->set_additional_tensors(mat_tensors);
 
   std::vector<int32_t> modes_out(2);
   std::vector<int64_t> extents_out(2);
@@ -1066,7 +1067,26 @@ double TensorNet<data_t>::norm(const reg_t &qubits,
   extents_out[0] = 2;
   extents_out[1] = 2;
 
+  // CSC WS-4 fix (idle-qubit orphan-drop, sibling of the WS-1 DM-path bug):
+  // set_output() MUST run before set_network() so the orphan mask sees the
+  // (post-matrix) output modes and does not drop qubits[0]'s base tensor when it
+  // is connected only through the output. The operative matrix attaches via
+  // set_additional_tensors AFTER set_network -- it relies on the 15887dd9 arena
+  // packing (base network uploaded first, additional tensors appended) -- so
+  // that call stays in place.
+  // NOTE (applies only to the stochastic-trajectory Kraus path that calls this
+  // norm; the DEFAULT noisy-DM path routes through apply_superop_matrix ->
+  // contract(), not here): for a genuinely idle qubit i not in `qubits`, the
+  // connect loop above rewires its ket qubits_sp_[i] to tmp_modes[i] ==
+  // modes_qubits_[i], which its bra qubits_[i] already carries -> the two share
+  // a mode (count >= 2) and neither is orphaned, so the reorder is sufficient.
+  // An idle-qubit-under-Kraus case is included in the WS-4 GPU test to confirm
+  // this on hardware before this path is relied upon.
   contractor->set_output(modes_out, extents_out);
+  contractor->set_network(tensors_);
+  contractor->allocate_additional_tensors(mat.size() * 2);
+  contractor->set_additional_tensors(mat_tensors);
+
   contractor->setup_contraction(use_cuTensorNet_autotuning_);
   double val = contractor->contract_and_trace(1);
 
@@ -1138,7 +1158,6 @@ TensorNet<data_t>::probabilities(const reg_t &qubits) const {
 
   TensorNetContractor<data_t> *contractor;
   create_contractor(contractor);
-  contractor->set_network(tensors_);
 
   // output tensor
   for (uint_t i = 0; i < nqubits; i++) {
@@ -1148,7 +1167,14 @@ TensorNet<data_t>::probabilities(const reg_t &qubits) const {
     extents_out[i + nqubits] = 2;
   }
 
+  // CSC WS-4 fix (idle-qubit orphan-drop, sibling of the WS-1 DM-path bug):
+  // set_output() MUST run before set_network(). A qubit that is in the measured
+  // set but untouched by any gate is connected to nothing but the output; if
+  // set_network() runs first, modes_out_ is still empty, the orphan mask sees
+  // that qubit's bra/ket modes at count==1 and drops the tensor -> its marginal
+  // probability is corrupted/zeroed. Mirror reduced_density_matrix() ordering.
   contractor->set_output(modes_out, extents_out);
+  contractor->set_network(tensors_);
   contractor->setup_contraction(use_cuTensorNet_autotuning_);
   contractor->contract(trace);
 
@@ -1243,9 +1269,6 @@ void TensorNet<data_t>::sample_measure_branch(
 
   TensorNetContractor<data_t> *contractor;
   create_contractor(contractor);
-  contractor->set_network(tensors_);
-  if (measured_qubits > 0)
-    contractor->allocate_additional_tensors(measured_qubits * 2 * 2);
 
   // output tensor
   std::vector<int32_t> modes_out(nqubits * 2);
@@ -1256,10 +1279,16 @@ void TensorNet<data_t>::sample_measure_branch(
     extents_out[i] = 2;
     extents_out[i + nqubits] = 2;
   }
-  contractor->set_output(modes_out, extents_out);
 
-  contractor->allocate_sampling_buffers();
-
+  // CSC WS-4 fix (two ordering bugs, both siblings of the WS-1 DM-path fix):
+  //  (1) The "connect qubits not to be measured" mode rewrites below mutate the
+  //      input tensors' modes. set_network() captures input-tensor modes (via
+  //      build_network_description()); if the rewrites run after set_network(),
+  //      the FIRST call traces out the wrong modes and non-measured qubits are
+  //      left dangling. The connect loop MUST run before set_network().
+  //  (2) set_output() MUST run before set_network() so the orphan mask sees the
+  //      output modes; otherwise an idle measured qubit (connected only to the
+  //      output) is dropped and its marginal is corrupted.
   // connect qubits not to be measured
   if (pos_measured - nqubits > 0) {
     for (uint_t i = 0; i < pos_measured - nqubits; i++) {
@@ -1271,6 +1300,13 @@ void TensorNet<data_t>::sample_measure_branch(
       }
     }
   }
+
+  contractor->set_output(modes_out, extents_out);
+  contractor->set_network(tensors_);
+  if (measured_qubits > 0)
+    contractor->allocate_additional_tensors(measured_qubits * 2 * 2);
+
+  contractor->allocate_sampling_buffers();
 
   uint_t num_branches;
   num_branches = 1ull << nqubits_branch;
