@@ -1380,7 +1380,27 @@ double TensorNet<data_t>::expval_pauli(const reg_t &qubits,
   uint_t size = qubits.size();
   std::vector<std::shared_ptr<Tensor<data_t>>> pauli_tensors;
   std::vector<int32_t> tmp_modes = modes_qubits_;
+
+  // CSC fix (expval zero-output bug, found by Bell <ZZ> repro on gfx90a):
+  // the appended Pauli tensors below take fresh mode IDs from tmp_index++.
+  // Starting that at mode_index_ is NOT safe here: expval_pauli contracts
+  // against the CONJUGATE ('sp') half of the network, whose tensors already
+  // carry mode IDs that can equal or exceed mode_index_ depending on build
+  // order. When a Pauli mode collides with a live sp-tensor mode (observed:
+  // mode 13 shared between the conjugate tensor [3,7,13,11] and a Pauli
+  // tensor [8,13]), hipTensor sees an ill-formed contraction and silently
+  // returns a zero tensor — the whole expectation value comes out exactly
+  // 0.0. Start above the true maximum mode ID present anywhere in the
+  // network (both bra and conjugate ket sides) so the new Pauli modes are
+  // provably disjoint from every existing mode.
   int32_t tmp_index = mode_index_;
+  for (const auto &tn : tensors_) {
+    if (!tn)
+      continue;
+    for (int32_t m : tn->modes())
+      if (m >= tmp_index)
+        tmp_index = m + 1;
+  }
 
   pauli_tensors.reserve(size * 2);
   cvector_t<data_t> mat_phase(4, 0.0);
