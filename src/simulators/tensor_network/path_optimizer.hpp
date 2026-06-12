@@ -338,6 +338,56 @@ public:
         std::max<uint64_t>(1, slice_target_bytes() / element_size_bytes_);
     target_elements = std::min(target_elements, envelope_elements);
 
+    // --- Output feasibility (OI15 made concrete by the first n=14 GPU run) -
+    //
+    // 1) Free-mode envelope. The m6n6k6 kernels admit at most 6 M-modes and
+    //    6 N-modes per contraction, so no pairwise step can PRODUCE a tensor
+    //    with more than 12 free modes. A request whose output carries more
+    //    than 12 open modes (e.g. a full statevector save at n > 12) is
+    //    infeasible for this backend at any slicing. Refuse up front with
+    //    the real reason instead of letting cotengra exhaust dozens of
+    //    hyperopt trials ("Ran out of valid indices to slice") and die in a
+    //    bare KeyError('tree').
+    constexpr size_t kMaxFreeModes = 12; // 6 M-modes + 6 N-modes (m6n6k6)
+    if (network.output_modes.size() > kMaxFreeModes) {
+      std::ostringstream msg;
+      msg << "CotengPathOptimizer: requested output has "
+          << network.output_modes.size()
+          << " free modes, but hipTensor's m6n6k6 contraction kernels can "
+             "produce at most "
+          << kMaxFreeModes
+          << " free modes per step. Full-statevector extraction above 12 "
+             "qubits is infeasible on this backend; request expectation "
+             "values, amplitudes, or other low-rank outputs instead "
+             "(slicing is fully effective for those).";
+      throw std::runtime_error(msg.str());
+    }
+
+    // 2) Output-size clamp. Outer (output) modes are never sliced by design
+    //    (allow_outer = false everywhere below), so slicing can shrink
+    //    intermediates but can NEVER shrink the output tensor itself. Any
+    //    target below the output's own element count therefore makes the
+    //    slicing problem infeasible by construction, and cotengra correctly
+    //    fails every trial. Clamp the target to at least the output size;
+    //    intermediates still get pushed toward the envelope wherever the
+    //    output permits. (Per-step descriptor feasibility for an
+    //    above-envelope output is guaranteed by check (1): <= 12 free modes
+    //    of extent 2 is <= 4096 elements <= one m6n6k6 result.)
+    uint64_t output_elements = 1;
+    for (auto e : network.output_extents)
+      output_elements *= static_cast<uint64_t>(e);
+    if (output_elements > target_elements) {
+      if (path_verbose()) {
+        fprintf(stderr,
+                "[AER_TN_PATH] target_size raised %llu -> %llu elements: "
+                "output tensor cannot be sliced (allow_outer=false) and "
+                "bounds the per-slice peak from below\n",
+                (unsigned long long)target_elements,
+                (unsigned long long)output_elements);
+      }
+      target_elements = output_elements;
+    }
+
     py::dict slicing_opts;
     slicing_opts["target_size"] = target_elements;
     // Outer (output) modes must never be sliced: the engine's accumulator
@@ -426,7 +476,19 @@ public:
       // sbplx, sses: no seed kwarg (backends don't accept it).
 
       auto opt = ctg.attr("HyperOptimizer")(**kwargs);
-      tree = opt.attr("search")(inputs, output, sizes);
+      try {
+        tree = opt.attr("search")(inputs, output, sizes);
+      } catch (py::error_already_set &e) {
+        // cotengra raises KeyError('tree') when every hyperopt trial failed
+        // (no contraction tree was ever produced). Surface a named,
+        // actionable error instead of the bare KeyError.
+        std::ostringstream msg;
+        msg << "CotengPathOptimizer: cotengra found no feasible contraction "
+               "path under the current slicing constraints (target_size="
+            << target_elements
+            << " elements, allow_outer=false). Underlying error: " << e.what();
+        throw std::runtime_error(msg.str());
+      }
     }
 
     // AER_TN_FORCE_SLICING=1: if the natural path needed no slicing, slice
