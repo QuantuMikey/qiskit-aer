@@ -418,7 +418,6 @@ void TensorNet<data_t>::buffer_statevector(void) const {
 
   TensorNetContractor<data_t> *contractor;
   create_contractor(contractor);
-  contractor->set_network(tensors_, false);
 
   std::vector<int32_t> modes_out(num_qubits_);
   std::vector<int64_t> extents_out(num_qubits_);
@@ -429,7 +428,15 @@ void TensorNet<data_t>::buffer_statevector(void) const {
     extents_out[i] = 2;
   }
 
+  // CSC WS-1 fix (idle-qubit orphan-drop bug on the contract() path):
+  // set_output() MUST run before set_network(). set_network()'s orphan-drop
+  // mask (compute_orphan_mask) reads modes_out_ to decide which tensors are
+  // connected only through the output. With set_network() first, modes_out_
+  // is still empty, so an idle qubit (connected solely to the output) has all
+  // modes count==1 and is wrongly dropped, zeroing that statevector element.
+  // add_sp_tensors=false makes the orphan filter most active here.
   contractor->set_output(modes_out, extents_out);
+  contractor->set_network(tensors_, false);
   contractor->setup_contraction(use_cuTensorNet_autotuning_);
   contractor->contract(statevector_);
 
@@ -491,7 +498,6 @@ TensorNet<data_t>::reduced_density_matrix(const reg_t &qubits) {
 
   TensorNetContractor<data_t> *contractor;
   create_contractor(contractor);
-  contractor->set_network(tensors_);
 
   std::vector<int32_t> modes_out(nqubits * 2);
   std::vector<int64_t> extents_out(nqubits * 2);
@@ -505,7 +511,15 @@ TensorNet<data_t>::reduced_density_matrix(const reg_t &qubits) {
     extents_out[i + nqubits] = 2;
   }
 
+  // CSC WS-1 fix (idle-qubit orphan-drop bug on the contract() path):
+  // set_output() MUST run before set_network(). For a qubit that is in the
+  // reduced set but untouched by any gate, its bra (modes_qubits_) and ket
+  // (modes_qubits_sp_) modes are BOTH output modes and connect to nothing but
+  // the output. If set_network() runs first, modes_out_ is empty, the orphan
+  // mask sees both tensors' modes at count==1, and drops them -> that qubit's
+  // DM block is corrupted/zeroed.
   contractor->set_output(modes_out, extents_out);
+  contractor->set_network(tensors_);
   contractor->setup_contraction(use_cuTensorNet_autotuning_);
   contractor->contract(trace);
 

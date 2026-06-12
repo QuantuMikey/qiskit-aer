@@ -718,6 +718,15 @@ void TensorNetContractor_HipTensor<data_t>::set_output(
   out_size_ = 1;
   for (size_t i = 0; i < extents_out_.size(); i++)
     out_size_ *= extents_out_[i];
+  // CSC WS-1: set_output() may now be invoked before set_network() (so the
+  // orphan-drop mask sees real output modes). Device discovery normally
+  // happens in set_network(); replicate the guard here so primary() is valid
+  // and allocate_output() does not dereference an empty devices_ vector when
+  // set_output() runs first.
+  if (gpu_mgr_.num_devices() == 0) {
+    std::vector<uint64_t> targets(target_gpus_.begin(), target_gpus_.end());
+    gpu_mgr_.discover(targets);
+  }
   gpu_mgr_.primary().allocate_output(out_size_);
 
   if (tn_verbose())
