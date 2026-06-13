@@ -186,6 +186,29 @@ static uint64_t slice_target_bytes() {
   return cached;
 }
 
+// Cotengra search objective, from AER_TN_MINIMIZE. "combo" (default) minimizes
+// FLOPs+write; it can select plans with very wide single steps (huge
+// intermediates) that then require deep m6n6k6 tiling -- the multi-GCD crash
+// (job 19229140). "size" minimizes the largest intermediate, favoring
+// low-treewidth plans whose per-step shapes stay narrow, so tiling stays
+// shallow. Because every ensemble rank then searches for narrow plans, the
+// MINLOC(total_flops) pick in MPIParallelPathOptimizer has no wide plan to
+// select. "limit", "flops", and "write" are also valid cotengra objective
+// names and pass straight through. This is the cause-level lever for the
+// deep-tiling problem; default "combo" preserves prior behavior.
+static std::string path_minimize() {
+  static bool checked = false;
+  static std::string cached = "combo";
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_MINIMIZE");
+    if (val != nullptr && *val != '\0') {
+      cached = std::string(val);
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // Cotengra path-search budget, overridable for tuning and benchmarking
 // without recompiling. The HyperOptimizer stops at whichever of these two
 // limits it reaches first: max_repeats hyperopt trials, or max_time seconds
@@ -600,7 +623,7 @@ public:
       // seed-routing kwarg is added conditionally per backend using py::dict
       // of extra kwargs merged in via py::kwargs.
       py::dict kwargs;
-      kwargs["minimize"] = minimize_;
+      kwargs["minimize"] = path_minimize();
       kwargs["max_repeats"] = max_repeats_;
       kwargs["max_time"] = max_time_;
       kwargs["optlib"] = optlib;

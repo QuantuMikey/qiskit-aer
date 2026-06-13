@@ -189,6 +189,37 @@ static uint64_t tn_path_seed() {
   return cached;
 }
 
+// Hard ceiling on a plan's slice count. Suppressing wide steps by tightening
+// the per-slice budget trades tiling depth for slice count; past some point
+// the contraction is an impractical slice-grind (AER_TN_SLICE_TARGET_BYTES=4096
+// produced tens of thousands of slices, job 19231523, which never completed).
+// This guard refuses such a plan with a clear error instead of grinding. It
+// fires identically on every MPI rank (the MINLOC-broadcast plan is the same
+// everywhere), so the failure is collective and clean. Default 8192 is
+// generous; recovery is to loosen AER_TN_SLICE_TARGET_BYTES, raise this if the
+// cost is acceptable, or use method='statevector'. 0 disables the check.
+static uint64_t tn_max_slices() {
+  static bool checked = false;
+  static uint64_t cached = 8192;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_MAX_SLICES");
+    if (val != nullptr) {
+      char *end = nullptr;
+      long long parsed = std::strtoll(val, &end, 10);
+      if (end != val && parsed >= 0) {
+        cached = static_cast<uint64_t>(parsed);
+      } else {
+        fprintf(stderr,
+                "[AER_TN] warning: AER_TN_MAX_SLICES='%s' is not a non-negative "
+                "integer; using default %llu.\n",
+                val, (unsigned long long)cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // WS-3 mode tiling decomposes an oversized per-step contraction (M>6, N>6, or
 // K>6) into a loop of kernel-sized (<=6 each) sub-contractions, so the step
 // produces correct results instead of the rank guard throwing. Whether tiling
@@ -908,6 +939,21 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
         auto optimizer = create_optimizer();
         plan_ = optimizer->find_path(network_desc_, memory_budget,
                                      tn_path_seed(), engaged);
+
+        // Slice-count ceiling: refuse an over-sliced plan rather than grind
+        // (see tn_max_slices). plan_.num_slices is the MINLOC-broadcast value,
+        // identical on every rank, so this throws collectively and cleanly.
+        if (tn_max_slices() > 0 && plan_.num_slices > tn_max_slices()) {
+          std::stringstream err;
+          err << "[AER_TN] plan has " << plan_.num_slices
+              << " slices, exceeding the AER_TN_MAX_SLICES ceiling of "
+              << tn_max_slices() << ". The per-slice budget is too tight for "
+                 "this circuit (a slice-grind). Raise AER_TN_SLICE_TARGET_BYTES, "
+                 "raise AER_TN_MAX_SLICES if the cost is acceptable, or use "
+                 "method='statevector'.";
+          throw std::runtime_error(err.str());
+        }
+
         plan_valid_ = true;
         pool_ready_ = false;
         cache_topology();
