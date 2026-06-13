@@ -124,6 +124,71 @@ static bool tn_rank_guard_enabled() {
   return enabled;
 }
 
+// Fail-fast cap on WS-3 tiling depth. build_tiles_for_step decomposes an
+// oversized step into a grid whose size is the product of the extents of the
+// modes beyond the first 6 on each oversized axis, so it grows as ~2^(excess
+// modes) for qubit (extent-2) modes (M=16 modes -> 2^10 = 1024). A
+// decomposition that deep is unusably slow and, empirically (8-GCD job
+// 19229140 on 2x12p2, default budget), faults the GPU in the deep
+// slice-offset x tile-offset path. This cap refuses any step that would tile
+// beyond it BEFORE execution, with a clear error, instead of attempting it.
+// Recovery is to tighten the per-slice budget (lower AER_TN_SLICE_TARGET_BYTES)
+// so the slicer cuts the step inside the m6n6k6 envelope in the planner,
+// keeping tiling shallow. Default 64 is the deepest decomposition VALIDATED to
+// execute correctly (M=8 N=8 K=8 -> 64, job 19229899); the cap is strictly
+// protective (depths <= it behave exactly as before), so it can only prevent
+// the known crash, never introduce a regression. Raise it only after
+// validating the sliced-and-tiled path at the higher depth.
+static int tn_max_tile_subcontractions() {
+  static bool checked = false;
+  static int cached = 64;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_MAX_TILE_SUBCONTRACTIONS");
+    if (val != nullptr) {
+      char *end = nullptr;
+      long parsed = std::strtol(val, &end, 10);
+      if (end != val && parsed > 0) {
+        cached = static_cast<int>(parsed);
+      } else {
+        fprintf(stderr,
+                "[AER_TN] warning: AER_TN_MAX_TILE_SUBCONTRACTIONS='%s' is not "
+                "a positive integer; using default %d.\n",
+                val, cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+// Cotengra path-search seed, overridable for A/B steering and regression
+// probing. NOTE: the loky search pool's trial completion order is
+// nondeterministic, so a fixed seed does NOT make a parallel search
+// bit-reproducible; this only steers the starting point. The MPI path
+// optimizer offsets it per rank (seed + rank) to diversify the ensemble.
+// Default 42 preserves the historical hardcoded value.
+static uint64_t tn_path_seed() {
+  static bool checked = false;
+  static uint64_t cached = 42;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_PATH_SEED");
+    if (val != nullptr) {
+      char *end = nullptr;
+      long long parsed = std::strtoll(val, &end, 10);
+      if (end != val && parsed >= 0) {
+        cached = static_cast<uint64_t>(parsed);
+      } else {
+        fprintf(stderr,
+                "[AER_TN] warning: AER_TN_PATH_SEED='%s' is not a non-negative "
+                "integer; using default %llu.\n",
+                val, (unsigned long long)cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // WS-3 mode tiling decomposes an oversized per-step contraction (M>6, N>6, or
 // K>6) into a loop of kernel-sized (<=6 each) sub-contractions, so the step
 // produces correct results instead of the rank guard throwing. Whether tiling
@@ -841,7 +906,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
                   memory_budget / (1024.0 * 1024.0));
 
         auto optimizer = create_optimizer();
-        plan_ = optimizer->find_path(network_desc_, memory_budget, 42, engaged);
+        plan_ = optimizer->find_path(network_desc_, memory_budget,
+                                     tn_path_seed(), engaged);
         plan_valid_ = true;
         pool_ready_ = false;
         cache_topology();
@@ -1240,6 +1306,33 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                 "m6n6k6 sub-contractions\n",
                 step, tile_num_m, tile_num_n, tile_num_k,
                 step_plan_specs_[step].tiles.size());
+
+      // Fail-fast cap on tiling depth (see tn_max_tile_subcontractions).
+      // build_tiles_for_step decomposes any width without bound; a
+      // pathologically wide step both crawls and, on the deep sliced path,
+      // faults the GPU (8-GCD job 19229140). Refuse beyond the validated
+      // envelope here, before any kernel for this step runs, rather than
+      // attempt it. This is a plain runtime_error (not NeedsTilingException),
+      // so it propagates out of setup_contraction's retry loop as a clean,
+      // actionable failure instead of a silent GPU memory fault.
+      const size_t n_tiles = step_plan_specs_[step].tiles.size();
+      const int max_tiles = tn_max_tile_subcontractions();
+      if (n_tiles > static_cast<size_t>(max_tiles)) {
+        std::stringstream err;
+        err << "[AER_TN] tiling step " << step << " of " << num_steps
+            << " would decompose into " << n_tiles
+            << " m6n6k6 sub-contractions (M=" << tile_num_m
+            << " N=" << tile_num_n << " K=" << tile_num_k
+            << " modes), exceeding the AER_TN_MAX_TILE_SUBCONTRACTIONS cap of "
+            << max_tiles << ". A decomposition this deep is unusably slow and "
+               "has been observed to fault the GPU on the sliced path. Options: "
+               "(1) lower AER_TN_SLICE_TARGET_BYTES so the slicer cuts this "
+               "step inside the m6n6k6 envelope in the planner (keeps tiling "
+               "shallow; current default 65536), or (2) raise "
+               "AER_TN_MAX_TILE_SUBCONTRACTIONS only after validating that the "
+               "sliced-and-tiled path executes correctly at the higher depth.";
+        throw std::runtime_error(err.str());
+      }
     }
 
     // Record the exact per-plan descriptor shape for contract_single_slice.
