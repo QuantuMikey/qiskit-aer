@@ -1442,7 +1442,7 @@ TensorNetContractor_HipTensor<data_t>::create_optimizer() {
   try {
     size_t elem_bytes = 2 * sizeof(data_t);
     inner = std::unique_ptr<PathOptimizer>(new CotengPathOptimizer(
-        "combo", 128, 60.0, "hyper", elem_bytes));
+        "combo", -1, -1.0, "hyper", elem_bytes));
   } catch (...) {
     if (tn_verbose())
       fprintf(stderr, "[AER_TN] cotengra unavailable, using greedy\n");

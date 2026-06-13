@@ -186,6 +186,58 @@ static uint64_t slice_target_bytes() {
   return cached;
 }
 
+// Cotengra path-search budget, overridable for tuning and benchmarking
+// without recompiling. The HyperOptimizer stops at whichever of these two
+// limits it reaches first: max_repeats hyperopt trials, or max_time seconds
+// of wall clock. More trials (or more time) tends to find a cheaper
+// contraction at the cost of longer planning. Defaults match the historical
+// hardcoded values (128 trials / 60 s). Lower them for fast iteration; raise
+// them for a hard high-treewidth network where plan quality dominates
+// execution. Read once and cached, so a process uses one consistent budget.
+static int path_max_repeats() {
+  static bool checked = false;
+  static int cached = 128;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_PATH_MAX_REPEATS");
+    if (val != nullptr) {
+      char *end = nullptr;
+      long parsed = std::strtol(val, &end, 10);
+      if (end != val && parsed > 0) {
+        cached = static_cast<int>(parsed);
+      } else {
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: AER_TN_PATH_MAX_REPEATS='%s' is not a "
+                "positive integer; using default %d.\n",
+                val, cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+static double path_max_time() {
+  static bool checked = false;
+  static double cached = 60.0;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_PATH_MAX_TIME");
+    if (val != nullptr) {
+      char *end = nullptr;
+      double parsed = std::strtod(val, &end);
+      if (end != val && parsed > 0.0) {
+        cached = parsed;
+      } else {
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: AER_TN_PATH_MAX_TIME='%s' is not a "
+                "positive number; using default %.1f s.\n",
+                val, cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // AER_TN_FORCE_SLICING=1 forces at least 2 slices even when the natural
 // path already fits the per-slice budget. Slicer correctness testing on
 // small circuits depends on this: it exercises the full project/execute/
@@ -371,10 +423,12 @@ class CotengPathOptimizer : public PathOptimizer {
 
 public:
   CotengPathOptimizer(const std::string &minimize = "combo",
-                      int max_repeats = 128, double max_time = 60.0,
+                      int max_repeats = -1, double max_time = -1.0,
                       const std::string &preset = "hyper",
                       size_t element_size_bytes = 16)
-      : minimize_(minimize), max_repeats_(max_repeats), max_time_(max_time),
+      : minimize_(minimize),
+        max_repeats_(max_repeats > 0 ? max_repeats : path_max_repeats()),
+        max_time_(max_time > 0.0 ? max_time : path_max_time()),
         preset_(preset), element_size_bytes_(element_size_bytes) {}
 
   ContractionPlan find_path(const NetworkDescription &network,
