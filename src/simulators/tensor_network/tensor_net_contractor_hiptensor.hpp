@@ -124,26 +124,15 @@ static bool tn_rank_guard_enabled() {
   return enabled;
 }
 
-// WS-3 mode tiling. When a per-step contraction exceeds the m6n6k6 envelope
-// (M>6, N>6, or K>6), tiling decomposes that one step into a loop of
-// kernel-sized (<=6 each) sub-contractions and accumulates the pieces, so an
-// oversized step produces correct results instead of the rank guard throwing.
-//
-// Default OFF: until tiling is numerically validated (test_tiling_unit.py vs
-// einsum to 1e-10, then full-statevector>12 and large-reduced-DM vs CPU), the
-// rank guard stays the default behavior so a partially complete tiler can
-// never produce silent wrong output in normal runs. Activate with
-// AER_TN_ENABLE_TILING=1.
-static bool tn_tiling_enabled() {
-  static bool checked = false;
-  static bool enabled = false;
-  if (!checked) {
-    const char *val = std::getenv("AER_TN_ENABLE_TILING");
-    enabled = (val != nullptr && std::string(val) == "1");
-    checked = true;
-  }
-  return enabled;
-}
+// WS-3 mode tiling decomposes an oversized per-step contraction (M>6, N>6, or
+// K>6) into a loop of kernel-sized (<=6 each) sub-contractions, so the step
+// produces correct results instead of the rank guard throwing. Whether tiling
+// is engaged for a given setup_pool_and_cache pass is decided by the driver
+// (setup_contraction) and threaded in as the tiling_available parameter, not
+// read from the environment at the gate. The enable policy itself lives in
+// tn_tiling_mode() (path_optimizer.hpp): OFF refuses, ON always tiles, and AUTO
+// (default) lets the driver detect the first oversized step and re-plan once
+// with tiling engaged.
 
 //=============================================================================
 // Diagnostic helpers
@@ -515,7 +504,7 @@ public:
 private:
   void build_network_description();
   void build_sliced_specs();
-  void setup_pool_and_cache(int device_idx);
+  void setup_pool_and_cache(int device_idx, bool tiling_available);
   bool topology_matches_previous() const;
   void cache_topology();
   void contract_single_slice(uint_t slice_index, int device_idx);
@@ -798,55 +787,120 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
   network_desc_.output_modes = modes_out_;
   network_desc_.output_extents = extents_out_;
 
-  if (prev_valid_ && plan_valid_ && topology_matches_previous()) {
-    if (tn_verbose() && myrank_ == 0)
-      fprintf(stderr, "[AER_TN] reusing previous contraction path\n");
-  } else {
-    gpu_mgr_.primary().refresh_free_memory();
-    size_t free_bytes = gpu_mgr_.primary().free_memory();
+  // Tiling enable policy for THIS setup (AUTO lazy retry).
+  //
+  //   engaged == false  -> plan and set up as if tiling were unavailable: the
+  //                        planner refuses a >12-free-mode output and the
+  //                        contractor refuses a per-step M/N/K>6. In AUTO both
+  //                        gates throw NeedsTilingException instead of a hard
+  //                        error (OFF throws the hard error and never reaches
+  //                        the retry).
+  //   engaged == true   -> oversized outputs/steps tile instead of refusing.
+  //
+  // ON starts engaged (always tile, no probe). OFF and AUTO start not-engaged.
+  // The retry below runs ONCE: on the first NeedsTilingException in AUTO it
+  // re-plans and re-sets-up with engaged = true. A circuit that fits without
+  // tiling completes in pass 1 with no path change and no retry; only a circuit
+  // that would otherwise have errored pays the extra planning pass.
+  const TilingMode tiling_mode = tn_tiling_mode();
+  bool engaged = (tiling_mode == TilingMode::On);
 
-    int64_t max_possible_elements = 1;
-    for (size_t i = 0; i < extents_out_.size(); i++)
-      max_possible_elements *= extents_out_[i];
-    uint64_t workspace_estimate =
-        gpu_mgr_.query_workspace_for_size(max_possible_elements);
+  // AUTO short-circuit: if the requested output alone carries more than 12 free
+  // modes (full statevector > 12q, large reduced DM), the planner gate is
+  // certain to fire in pass 1, so skip the wasted cotengra search and engage
+  // tiling directly. An intermediate-only M/N/K>6 step (output <= 12 modes) is
+  // not visible here and still needs pass 1 to discover it.
+  if (tiling_mode == TilingMode::Auto && modes_out_.size() > 12)
+    engaged = true;
 
-    uint64_t memory_budget = free_bytes;
-    if (workspace_estimate < free_bytes)
-      memory_budget = free_bytes - workspace_estimate;
+  bool retried = false;
+  while (true) {
+    try {
+      if (prev_valid_ && plan_valid_ && topology_matches_previous()) {
+        if (tn_verbose() && myrank_ == 0)
+          fprintf(stderr, "[AER_TN] reusing previous contraction path\n");
+      } else {
+        gpu_mgr_.primary().refresh_free_memory();
+        size_t free_bytes = gpu_mgr_.primary().free_memory();
 
-    if (tn_verbose() && myrank_ == 0)
-      fprintf(stderr, "[AER_TN] memory: %.1f MB free, %.1f MB ws, %.1f MB budget\n",
-              free_bytes / (1024.0 * 1024.0),
-              workspace_estimate / (1024.0 * 1024.0),
-              memory_budget / (1024.0 * 1024.0));
+        int64_t max_possible_elements = 1;
+        for (size_t i = 0; i < extents_out_.size(); i++)
+          max_possible_elements *= extents_out_[i];
+        uint64_t workspace_estimate =
+            gpu_mgr_.query_workspace_for_size(max_possible_elements);
 
-    auto optimizer = create_optimizer();
-    plan_ = optimizer->find_path(network_desc_, memory_budget, 42);
-    plan_valid_ = true;
-    pool_ready_ = false;
-    cache_topology();
-  }
+        uint64_t memory_budget = free_bytes;
+        if (workspace_estimate < free_bytes)
+          memory_budget = free_bytes - workspace_estimate;
 
-  build_sliced_specs();
+        if (tn_verbose() && myrank_ == 0)
+          fprintf(stderr,
+                  "[AER_TN] memory: %.1f MB free, %.1f MB ws, %.1f MB budget\n",
+                  free_bytes / (1024.0 * 1024.0),
+                  workspace_estimate / (1024.0 * 1024.0),
+                  memory_budget / (1024.0 * 1024.0));
 
-  if (!pool_ready_) {
-    setup_pool_and_cache(0);
-    pool_ready_ = true;
-  }
+        auto optimizer = create_optimizer();
+        plan_ = optimizer->find_path(network_desc_, memory_budget, 42, engaged);
+        plan_valid_ = true;
+        pool_ready_ = false;
+        cache_topology();
+      }
 
-  slice_begin_ = myrank_ * plan_.num_slices / nprocs_;
-  slice_end_ = (myrank_ + 1) * plan_.num_slices / nprocs_;
+      build_sliced_specs();
 
-  num_devices_used_ = 1;
-  if (gpu_mgr_.num_devices() > 1 &&
-      (slice_end_ - slice_begin_) > gpu_mgr_.num_devices()) {
-    num_devices_used_ = gpu_mgr_.num_devices();
-    for (size_t i = 1; i < gpu_mgr_.num_devices(); i++) {
-      gpu_mgr_.device(i).copy_tensor_data_from(gpu_mgr_.primary());
-      gpu_mgr_.device(i).allocate_output(out_size_);
-      if (!gpu_mgr_.device(i).pool().is_allocated())
-        setup_pool_and_cache(i);
+      if (!pool_ready_) {
+        setup_pool_and_cache(0, engaged);
+        pool_ready_ = true;
+      }
+
+      slice_begin_ = myrank_ * plan_.num_slices / nprocs_;
+      slice_end_ = (myrank_ + 1) * plan_.num_slices / nprocs_;
+
+      num_devices_used_ = 1;
+      if (gpu_mgr_.num_devices() > 1 &&
+          (slice_end_ - slice_begin_) > gpu_mgr_.num_devices()) {
+        num_devices_used_ = gpu_mgr_.num_devices();
+        for (size_t i = 1; i < gpu_mgr_.num_devices(); i++) {
+          gpu_mgr_.device(i).copy_tensor_data_from(gpu_mgr_.primary());
+          gpu_mgr_.device(i).allocate_output(out_size_);
+          if (!gpu_mgr_.device(i).pool().is_allocated())
+            setup_pool_and_cache(i, engaged);
+        }
+      }
+
+      break;
+    } catch (const NeedsTilingException &e) {
+      // AUTO only: an oversized output/step was detected with tiling held back.
+      // Engage tiling and re-plan/re-setup exactly once. OFF never throws this
+      // type (its gates raise std::runtime_error), so the guard is defensive.
+      if (tiling_mode != TilingMode::Auto)
+        throw;
+      if (retried) {
+        // Pass 2 already had tiling engaged; tiling always decomposes a step to
+        // <= 6, so this should be unreachable. Surface it clearly rather than
+        // looping a third time.
+        std::stringstream err;
+        err << "[AER_TN] tiling was engaged after auto-detection but the "
+               "plan still exceeds the m6n6k6 envelope at the "
+            << e.where()
+            << " gate. This indicates a planning invariant violation, not a "
+               "tiling limitation. Underlying detail: "
+            << e.what();
+        throw std::runtime_error(err.str());
+      }
+      if (tn_verbose() && myrank_ == 0)
+        fprintf(stderr,
+                "[AER_TN] oversized step detected at %s; tiling auto-enabled "
+                "for this run (re-planning once)\n",
+                e.where());
+      engaged = true;
+      retried = true;
+      // Force a fresh path search on pass 2: the held-back plan must not be
+      // reused, and pool/topology caches from pass 1 are stale.
+      plan_valid_ = false;
+      prev_valid_ = false;
+      pool_ready_ = false;
     }
   }
 
@@ -895,7 +949,8 @@ void TensorNetContractor_HipTensor<data_t>::build_sliced_specs() {
 }
 
 template <typename data_t>
-void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx) {
+void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
+                                                                 bool tiling_available) {
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
   hipSetDevice(dev.device_id());
 
@@ -1057,7 +1112,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
       }
 
       if (num_m > 6 || num_n > 6 || num_k > 6) {
-        if (tn_tiling_enabled()) {
+        if (tiling_available) {
           // WS-3: decompose this oversized step into a grid of m6n6k6
           // sub-contractions instead of refusing. Works for both unsliced and
           // sliced plans: for a sliced step the input leaves are slice-
@@ -1096,9 +1151,10 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
               << " modes_c=" << modes_to_str(modes_c) << ". "
               << "This circuit's contraction path requires kernel shapes "
               << "that hipTensor 1.5.0 does not provide. Options: ";
-          err << "(1) enable mode tiling with AER_TN_ENABLE_TILING=1 "
-              << "(decomposes oversized steps into m6n6k6 sub-contractions; "
-              << "supports both unsliced and sliced plans), ";
+          err << "(1) enable mode tiling with AER_TN_TILING=on (or leave the "
+              << "default auto, which engages tiling on demand; decomposes "
+              << "oversized steps into m6n6k6 sub-contractions, supports both "
+              << "unsliced and sliced plans), ";
           err << "(2) tighten the per-slice budget so the slicer cuts this "
               << "step inside the envelope (lower AER_TN_SLICE_TARGET_BYTES, "
               << "current default 65536), "
@@ -1109,6 +1165,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx)
               << "via cotengra to see if a lower-rank path exists. "
               << "Set AER_TN_DISABLE_RANK_GUARD=1 to bypass this check "
               << "(produces SILENT WRONG RESULTS — for bug-reporting only).";
+          if (tn_tiling_mode() == TilingMode::Auto)
+            throw NeedsTilingException(NeedsTilingException::Gate::Contractor,
+                                       err.str());
           throw std::runtime_error(err.str());
         }
       }

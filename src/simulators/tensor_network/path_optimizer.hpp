@@ -13,6 +13,7 @@
 #define _path_optimizer_hpp_
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -49,21 +50,83 @@ static bool path_verbose() {
   return enabled;
 }
 
-// WS-3: when AER_TN_ENABLE_TILING=1, the contractor decomposes oversized
-// per-step contractions into m6n6k6 sub-contractions, so an output carrying
-// more than 12 free modes is no longer infeasible. The >12-free-mode
-// feasibility refusal below must therefore defer to tiling when it is on.
-// Mirrors tn_tiling_enabled() in the contractor (same env var).
-static bool path_tiling_enabled() {
+// Tiling enable policy. Tiling decomposes an oversized (M>6, N>6, or K>6)
+// per-step contraction — and a >12-free-mode output during path search — into a
+// grid of m6n6k6 sub-contractions, so a step that hipTensor's kernels cannot
+// dispatch produces correct results instead of a hard refusal. Both the planner
+// gate (>12-free-mode output, below) and the contractor gate (per-step M/N/K>6,
+// in setup_pool_and_cache) read this single policy.
+//
+// Tristate, default AUTO:
+//   AUTO  transparent — an oversized step is detected and tiling is engaged for
+//         that run via a one-shot re-plan (see setup_contraction). A circuit
+//         that fits without tiling pays nothing: pass 1 runs the exact no-tile
+//         planning and, on success, there is no retry and no path change.
+//   OFF   force no tiling; the gates refuse oversized steps. The escape hatch
+//         for NVIDIA A/B comparison, bug-report reproducers, and
+//         AER_TN_DISABLE_RANK_GUARD bisection.
+//   ON    tiling always available to the planner and contractor (no re-plan).
+//
+// Back-compat with the prior boolean knob (no breakage for existing scripts or
+// checkpoints): AER_TN_ENABLE_TILING=1 maps to ON, =0 maps to OFF. When
+// AER_TN_ENABLE_TILING is unset, AER_TN_TILING is consulted: "on"/"off"/"auto"
+// (case-insensitive); unset or unrecognised is AUTO.
+enum class TilingMode { Off, On, Auto };
+
+static TilingMode tn_tiling_mode() {
   static bool checked = false;
-  static bool enabled = false;
+  static TilingMode mode = TilingMode::Auto;
   if (!checked) {
-    const char *val = std::getenv("AER_TN_ENABLE_TILING");
-    enabled = (val != nullptr && std::string(val) == "1");
+    const char *legacy = std::getenv("AER_TN_ENABLE_TILING");
+    if (legacy != nullptr) {
+      std::string s(legacy);
+      mode = (s == "1") ? TilingMode::On : TilingMode::Off;
+    } else {
+      const char *val = std::getenv("AER_TN_TILING");
+      if (val != nullptr) {
+        std::string s(val);
+        for (char &c : s) c = static_cast<char>(std::tolower(c));
+        if (s == "on")
+          mode = TilingMode::On;
+        else if (s == "off")
+          mode = TilingMode::Off;
+        else if (s == "auto")
+          mode = TilingMode::Auto;
+        else {
+          fprintf(stderr,
+                  "[AER_TN_PATH] warning: AER_TN_TILING='%s' not recognised, "
+                  "using 'auto'. Valid values: auto, on, off.\n",
+                  val);
+          mode = TilingMode::Auto;
+        }
+      }
+    }
     checked = true;
   }
-  return enabled;
+  return mode;
 }
+
+// Typed signal that a gate hit the m6n6k6 envelope while tiling was held back.
+// In AUTO, setup_contraction catches THIS TYPE ONLY and re-plans once with
+// tiling engaged; OFF lets it convert to a hard refusal at the gate. It is
+// never thrown for a real failure (OOM, CK error), so the retry can never mask
+// one. Carries the gate that fired and the offending shape for the info line.
+class NeedsTilingException : public std::runtime_error {
+public:
+  enum class Gate { Planner, Contractor };
+
+  NeedsTilingException(Gate gate, const std::string &detail)
+      : std::runtime_error(detail), gate_(gate) {}
+
+  Gate gate() const { return gate_; }
+  const char *where() const {
+    return gate_ == Gate::Planner ? "planner (>12-free-mode output)"
+                                  : "contractor (per-step M/N/K>6)";
+  }
+
+private:
+  Gate gate_;
+};
 
 // Read cotengra backend selection from AER_TN_OPTLIB env var.
 // Valid values: "optuna" (default), "cmaes", "sbplx", "sses".
@@ -244,9 +307,15 @@ struct ContractionPlan {
 class PathOptimizer {
 public:
   virtual ~PathOptimizer() = default;
+  // tiling_available: when false, the planner's >12-free-mode gate throws
+  // NeedsTilingException (AUTO) or a hard refusal (OFF, decided by the caller);
+  // when true, oversized outputs are admitted because the contractor will tile
+  // them. The driver (setup_contraction) sets this per pass so pass 1 and pass 2
+  // are explicitly controlled rather than each gate re-reading the environment.
   virtual ContractionPlan find_path(const NetworkDescription &network,
                                     uint64_t memory_limit_bytes,
-                                    uint64_t seed) = 0;
+                                    uint64_t seed,
+                                    bool tiling_available) = 0;
 };
 
 //=============================================================================
@@ -310,7 +379,8 @@ public:
 
   ContractionPlan find_path(const NetworkDescription &network,
                             uint64_t memory_limit_bytes,
-                            uint64_t seed) override {
+                            uint64_t seed,
+                            bool tiling_available) override {
     py::gil_scoped_acquire gil;
     auto ctg = py::module_::import("cotengra");
 
@@ -365,7 +435,7 @@ public:
     //    hyperopt trials ("Ran out of valid indices to slice") and die in a
     //    bare KeyError('tree').
     constexpr size_t kMaxFreeModes = 12; // 6 M-modes + 6 N-modes (m6n6k6)
-    if (network.output_modes.size() > kMaxFreeModes && !path_tiling_enabled()) {
+    if (network.output_modes.size() > kMaxFreeModes && !tiling_available) {
       std::ostringstream msg;
       msg << "CotengPathOptimizer: requested output has "
           << network.output_modes.size()
@@ -376,8 +446,11 @@ public:
              "qubits is infeasible on this backend; request expectation "
              "values, amplitudes, or other low-rank outputs instead "
              "(slicing is fully effective for those), or enable mode tiling "
-             "with AER_TN_ENABLE_TILING=1 to decompose oversized output "
+             "with AER_TN_TILING=on (or auto) to decompose oversized output "
              "steps into m6n6k6 sub-contractions.";
+      if (tn_tiling_mode() == TilingMode::Auto)
+        throw NeedsTilingException(NeedsTilingException::Gate::Planner,
+                                   msg.str());
       throw std::runtime_error(msg.str());
     }
 
@@ -624,7 +697,8 @@ public:
 
   ContractionPlan find_path(const NetworkDescription &network,
                             uint64_t memory_limit_bytes,
-                            uint64_t seed) override {
+                            uint64_t seed,
+                            bool /*tiling_available*/) override {
     auto size_dict = network.build_size_dict();
     ContractionPlan best;
     best.total_flops = std::numeric_limits<double>::max();
@@ -810,13 +884,39 @@ public:
 
   ContractionPlan find_path(const NetworkDescription &network,
                             uint64_t memory_limit_bytes,
-                            uint64_t seed) override {
+                            uint64_t seed,
+                            bool tiling_available) override {
     int rank, size;
     MPI_Comm_rank(comm_, &rank);
     MPI_Comm_size(comm_, &size);
 
-    ContractionPlan local =
-        inner_->find_path(network, memory_limit_bytes, seed + rank);
+    // Per-rank cotengra search uses a rank-dependent seed, so one rank can hit
+    // the planner's free-mode gate while others succeed. NeedsTilingException
+    // must NOT propagate from a single rank here: the ranks that did not throw
+    // would march into the MPI_Allreduce below and desynchronize the collective
+    // (deadlock/abort). Instead, catch it locally, turn it into a flag, and make
+    // the decision collective: if ANY rank needs tiling, EVERY rank throws
+    // together, so the driver's one-shot retry re-plans all ranks with tiling
+    // engaged in lockstep. A non-tiling failure (OOM, CK error) is not this type
+    // and is left to propagate uniformly.
+    ContractionPlan local;
+    int local_needs_tiling = 0;
+    try {
+      local = inner_->find_path(network, memory_limit_bytes, seed + rank,
+                                tiling_available);
+    } catch (const NeedsTilingException &) {
+      local_needs_tiling = 1;
+    }
+
+    int any_needs_tiling = 0;
+    MPI_Allreduce(&local_needs_tiling, &any_needs_tiling, 1, MPI_INT, MPI_MAX,
+                  comm_);
+    if (any_needs_tiling) {
+      throw NeedsTilingException(
+          NeedsTilingException::Gate::Planner,
+          "MPI path search: at least one rank produced an above-envelope "
+          "output path; re-planning all ranks with tiling engaged.");
+    }
 
     struct { double cost; int rank; } local_result, global_result;
     local_result.cost = local.total_flops;
