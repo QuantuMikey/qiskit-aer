@@ -370,7 +370,7 @@ json_t TensorNet<data_t>::json() const {
 //------------------------------------------------------------------------------
 
 template <typename data_t>
-TensorNet<data_t>::TensorNet(size_t num_qubits) : num_qubits_(0) {
+TensorNet<data_t>::TensorNet(size_t num_qubits) : num_qubits_(0), mode_index_(0) {
   set_num_qubits(num_qubits);
 }
 
@@ -661,6 +661,16 @@ void TensorNet<data_t>::initialize() {
 
   if (statevector_.size() > 0)
     statevector_.clear(); // invalidate statevector buffer
+
+  // Mode IDs are handed out by an incrementing counter as tensors are added.
+  // Reset it to a fixed base here so the SAME circuit built independently on
+  // every MPI rank yields IDENTICAL mode IDs. Without this reset mode_index_
+  // keeps its construction value or a value left over from a prior build, so
+  // the int32 mode IDs differ per process; any broadcast plan that names modes
+  // by ID (the sliced-mode list on the MPI path) then fails to resolve on the
+  // non-winner ranks. Dummy/padding modes live in the INT32_MIN range and stay
+  // clear of these low positive IDs.
+  mode_index_ = 0;
 
   for (i = 0; i < tensors_.size(); i++) {
     tensors_[i].reset();
