@@ -1419,6 +1419,10 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     // (which for inputs may differ from what this specific plan needs).
     const PlanSpec &ps = step_plan_specs_[step];
 
+    if (tn_verbose())
+      fprintf(stderr, "[AER_TN] prebuild step %zu (%s, %zu tiles)\n",
+              step, ps.tiles.empty() ? "untiled" : "tiled", ps.tiles.size());
+
     if (!ps.tiles.empty()) {
       // WS-3 tiled step: pre-build each sub-block plan so its workspace is
       // counted by max_workspace_bytes() below. The untiled whole-step plan is
@@ -1474,9 +1478,20 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         std::make_tuple(bytes, birth, death, static_cast<int>(result_idx)));
   }
 
+  if (tn_verbose())
+    fprintf(stderr, "[AER_TN] prebuild loop done; computing workspace\n");
+
   uint64_t max_ws = dev.plan_cache().max_workspace_bytes();
 
+  if (tn_verbose())
+    fprintf(stderr, "[AER_TN] workspace computed (max_ws=%lu); laying out pool\n",
+            (unsigned long)max_ws);
+
   dev.pool().plan_layout(intermediates, max_ws, static_cast<int>(num_steps));
+
+  if (tn_verbose())
+    fprintf(stderr, "[AER_TN] pool layout done; allocating\n");
+
   dev.pool().allocate(dev.device_id());
 
   if (tn_verbose())
