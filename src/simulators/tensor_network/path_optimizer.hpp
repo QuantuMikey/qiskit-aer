@@ -186,6 +186,63 @@ static uint64_t slice_target_bytes() {
   return cached;
 }
 
+// Free-mode envelope of hipTensor's only kernel shape: m6n6k6 admits at most
+// 6 M-modes + 6 N-modes per contraction, so one kernel result holds at most
+// 2^12 = 4096 elements. This count grounds both the tiling ceiling below and
+// the planner's oversized-output gate.
+static constexpr size_t kMaxFreeModes = 12; // 6 M-modes + 6 N-modes (m6n6k6)
+
+// Hard ceiling, in ELEMENTS, on any tensor a TILED step may touch. Tiling
+// decomposes an oversized step into m6n6k6 sub-blocks whose descriptors are
+// strided VIEWS into the parent tensor; hipTensor/CK miscomputes and then
+// faults during plan creation once a tile descriptor's free-mode stride grows
+// too large, and that stride tracks the parent VOLUME (the top free mode sits
+// at stride ~= volume/2). Bounding every tiled operand's volume therefore
+// bounds its descriptor stride and keeps every block inside what CK can build.
+//
+// The DEFAULT is DERIVED from the kernel shape (2^kMaxFreeModes), the most
+// conservative bound -- at this size a tile descriptor's max stride is <= 2^11,
+// far below anything observed to fault. It is not a measured magic number.
+// Raise AER_TN_MAX_TILED_ELEMENTS only after empirically validating that
+// descriptors at the larger size both build and compute correctly on the
+// target hipTensor build (observed safe to 2^16 on ROCm 6.4.2 / gfx90a; a 2^18
+// descriptor faults). Raising it also admits larger non-sliceable outputs
+// (e.g. full-statevector extraction above 12 qubits).
+static uint64_t max_tiled_elements() {
+  static bool checked = false;
+  static uint64_t cached = (static_cast<uint64_t>(1) << kMaxFreeModes); // 4096
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_MAX_TILED_ELEMENTS");
+    if (val != nullptr) {
+      char *end = nullptr;
+      unsigned long long parsed = std::strtoull(val, &end, 10);
+      if (end != val && parsed > 0) {
+        cached = static_cast<uint64_t>(parsed);
+        // The ceiling can never sit below one kernel's own capacity: a single
+        // (untiled) m6n6k6 result already holds 2^kMaxFreeModes elements, and
+        // a tile descriptor never exceeds the parent it views. Floor it so a
+        // mistaken low value can't reject legitimately small tiled steps.
+        const uint64_t floor_elems = static_cast<uint64_t>(1) << kMaxFreeModes;
+        if (cached < floor_elems) {
+          fprintf(stderr,
+                  "[AER_TN_PATH] warning: AER_TN_MAX_TILED_ELEMENTS=%llu is "
+                  "below one m6n6k6 result (%llu); using %llu.\n",
+                  (unsigned long long)cached, (unsigned long long)floor_elems,
+                  (unsigned long long)floor_elems);
+          cached = floor_elems;
+        }
+      } else {
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: AER_TN_MAX_TILED_ELEMENTS='%s' is not a "
+                "positive integer; using kernel-derived default %llu.\n",
+                val, (unsigned long long)cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // Cotengra search objective, from AER_TN_MINIMIZE. "combo" (default) minimizes
 // FLOPs+write; it can select plans with very wide single steps (huge
 // intermediates) that then require deep m6n6k6 tiling -- the multi-GCD crash
@@ -501,55 +558,73 @@ public:
         std::max<uint64_t>(1, slice_target_bytes() / element_size_bytes_);
     target_elements = std::min(target_elements, envelope_elements);
 
-    // --- Output feasibility (OI15 made concrete by the first n=14 GPU run) -
-    //
-    // 1) Free-mode envelope. The m6n6k6 kernels admit at most 6 M-modes and
-    //    6 N-modes per contraction, so no pairwise step can PRODUCE a tensor
-    //    with more than 12 free modes. A request whose output carries more
-    //    than 12 open modes (e.g. a full statevector save at n > 12) is
-    //    infeasible for this backend at any slicing. Refuse up front with
-    //    the real reason instead of letting cotengra exhaust dozens of
-    //    hyperopt trials ("Ran out of valid indices to slice") and die in a
-    //    bare KeyError('tree').
-    constexpr size_t kMaxFreeModes = 12; // 6 M-modes + 6 N-modes (m6n6k6)
-    if (network.output_modes.size() > kMaxFreeModes && !tiling_available) {
-      std::ostringstream msg;
-      msg << "CotengPathOptimizer: requested output has "
-          << network.output_modes.size()
-          << " free modes, but hipTensor's m6n6k6 contraction kernels can "
-             "produce at most "
-          << kMaxFreeModes
-          << " free modes per step. Full-statevector extraction above 12 "
-             "qubits is infeasible on this backend; request expectation "
-             "values, amplitudes, or other low-rank outputs instead "
-             "(slicing is fully effective for those), or enable mode tiling "
-             "with AER_TN_TILING=on (or auto) to decompose oversized output "
-             "steps into m6n6k6 sub-contractions.";
-      if (tn_tiling_mode() == TilingMode::Auto)
-        throw NeedsTilingException(NeedsTilingException::Gate::Planner,
-                                   msg.str());
-      throw std::runtime_error(msg.str());
-    }
+    // Hard m6n6k6 tiling ceiling (see max_tiled_elements). Independent of the
+    // memory and slice budgets above: AER_TN_SLICE_TARGET_BYTES can only slice
+    // HARDER, never raise the per-slice peak past what CK can tile.
+    target_elements = std::min(target_elements, max_tiled_elements());
 
-    // 2) Output-size clamp. Outer (output) modes are never sliced by design
-    //    (allow_outer = false everywhere below), so slicing can shrink
-    //    intermediates but can NEVER shrink the output tensor itself. Any
-    //    target below the output's own element count therefore makes the
-    //    slicing problem infeasible by construction, and cotengra correctly
-    //    fails every trial. Clamp the target to at least the output size;
-    //    intermediates still get pushed toward the envelope wherever the
-    //    output permits. (Per-step descriptor feasibility for an
-    //    above-envelope output is guaranteed by check (1): <= 12 free modes
-    //    of extent 2 is <= 4096 elements <= one m6n6k6 result.)
+    // --- Output feasibility & the m6n6k6 tiling ceiling -------------------
+    //
+    // Output (open) modes can NEVER be sliced (allow_outer=false; the sliced
+    // engine sums slices, which is correct only for summed bonds), so the
+    // output tensor's own size is a hard lower bound on the per-slice peak. By
+    // output size, three regimes:
     uint64_t output_elements = 1;
     for (auto e : network.output_extents)
       output_elements *= static_cast<uint64_t>(e);
+
+    const uint64_t single_kernel_elements =
+        static_cast<uint64_t>(1) << kMaxFreeModes; // 4096: one m6n6k6 result
+
+    if (output_elements > single_kernel_elements) {
+      // The output cannot come from a single m6n6k6 result -- the final step
+      // must be TILED. Feasible only if the output fits the tiling ceiling,
+      // because its open modes cannot be sliced to shrink it.
+      if (output_elements > max_tiled_elements()) {
+        std::ostringstream msg;
+        msg << "CotengPathOptimizer: requested output has "
+            << network.output_modes.size() << " open modes ("
+            << output_elements
+            << " elements), exceeding the m6n6k6 tiling ceiling ("
+            << max_tiled_elements()
+            << " elements). Output (open) modes cannot be sliced, so this "
+               "output rank exceeds m6n6k6 tiling -- request a lower-rank "
+               "output (expectation value, amplitude, or a smaller reduced "
+               "density matrix). If larger outputs are known CK-safe on this "
+               "hipTensor build, raise AER_TN_MAX_TILED_ELEMENTS after "
+               "validation.";
+        throw std::runtime_error(msg.str());
+      }
+      if (!tiling_available) {
+        // Tileable, but tiling is not engaged this pass. AUTO: signal the
+        // driver to re-plan once with tiling on. OFF: refuse with the reason.
+        std::ostringstream msg;
+        msg << "CotengPathOptimizer: requested output has "
+            << network.output_modes.size() << " open modes, more than the "
+            << kMaxFreeModes
+            << " a single m6n6k6 step can produce. Enable mode tiling "
+               "(AER_TN_TILING=on or auto) to decompose the oversized output "
+               "step into m6n6k6 sub-contractions, or request a lower-rank "
+               "output.";
+        if (tn_tiling_mode() == TilingMode::Auto)
+          throw NeedsTilingException(NeedsTilingException::Gate::Planner,
+                                     msg.str());
+        throw std::runtime_error(msg.str());
+      }
+      // else: tileable AND tiling engaged -- fall through; the output step is
+      // tiled and the clamp below pins the per-slice peak to the (CK-safe)
+      // output size.
+    }
+
+    // Output-size clamp: slicing can't shrink the output, so the per-slice
+    // peak can't drop below it. Raise the target to at least the output size.
+    // The checks above guarantee output_elements <= max_tiled_elements, so the
+    // target stays inside the tiling ceiling.
     if (output_elements > target_elements) {
       if (path_verbose()) {
         fprintf(stderr,
                 "[AER_TN_PATH] target_size raised %llu -> %llu elements: "
-                "output tensor cannot be sliced (allow_outer=false) and "
-                "bounds the per-slice peak from below\n",
+                "output tensor cannot be sliced (allow_outer=false)\n",
                 (unsigned long long)target_elements,
                 (unsigned long long)output_elements);
       }
@@ -679,6 +754,50 @@ public:
       }
     }
 
+    // Enforce the m6n6k6 tiling envelope as ACHIEVED, not merely targeted.
+    // slicing_opts aim the HyperOptimizer at target_size during search, but the
+    // returned tree is not guaranteed to reach it -- the search is heuristic,
+    // and a low-FLOPs under-sliced tree can score best; across the MPI ensemble
+    // the MINLOC(FLOPs) pick then actively favors the laxest rank (the 8-GCD
+    // miscompute). Slice the tree explicitly to target so every plan leaving
+    // this function -- and thus every candidate the ensemble can select -- has
+    // a peak inside the envelope. allow_outer=false confines this to summed
+    // bonds, matching the engine's accumulator and extract_plan's guard.
+    {
+      for (int guard = 0; guard < 128; ++guard) {
+        int64_t cur = tree.attr("max_size")().cast<int64_t>();
+        if (static_cast<uint64_t>(cur) <= target_elements)
+          break;
+        const size_t before = py::len(tree.attr("sliced_inds"));
+        tree.attr("slice")(py::arg("target_size") = target_elements,
+                           py::arg("allow_outer") = false,
+                           py::arg("seed") = seed,
+                           py::arg("inplace") = true);
+        if (py::len(tree.attr("sliced_inds")) == before)
+          break; // no summed bond left to slice: residual peak is output-bound
+      }
+      const int64_t final_max = tree.attr("max_size")().cast<int64_t>();
+      if (static_cast<uint64_t>(final_max) > target_elements) {
+        std::ostringstream msg;
+        msg << "CotengPathOptimizer: peak intermediate (" << final_max
+            << " elements) exceeds the m6n6k6 tiling envelope ("
+            << target_elements
+            << ") and cannot be reduced further by slicing -- the residual peak "
+               "is bounded by output (open) modes the engine cannot split. This "
+               "output rank exceeds m6n6k6 tiling; request a lower-rank output "
+               "(expectation value, amplitude, or a smaller reduced density "
+               "matrix).";
+        throw std::runtime_error(msg.str());
+      }
+      if (path_verbose()) {
+        fprintf(stderr,
+                "[AER_TN_PATH] tiling envelope enforced: peak %lld <= target "
+                "%llu (%zu sliced modes)\n",
+                (long long)final_max, (unsigned long long)target_elements,
+                (size_t)py::len(tree.attr("sliced_inds")));
+      }
+    }
+
     return extract_plan(tree, std::set<int32_t>(network.output_modes.begin(),
                                                 network.output_modes.end()));
   }
@@ -789,18 +908,28 @@ public:
 
     best.num_slices = 1;
     // Same two-ceiling budget as the cotengra path: device memory and the
-    // m6n6k6 envelope, in elements (16 bytes per logical complex element).
+    // m6n6k6 envelope, in elements (16 bytes per logical complex element),
+    // plus the hard m6n6k6 tiling ceiling (see max_tiled_elements).
     int64_t element_budget =
         static_cast<int64_t>(memory_limit_bytes / 16);
     int64_t envelope_budget =
         std::max<int64_t>(1, static_cast<int64_t>(slice_target_bytes() / 16));
     element_budget = std::min(element_budget, envelope_budget);
+    element_budget =
+        std::min(element_budget, static_cast<int64_t>(max_tiled_elements()));
+    // Output (open) modes must never be sliced -- the sliced engine sums
+    // slices, correct only for summed bonds (mirrors the cotengra path's
+    // allow_outer=false and extract_plan's guard).
+    std::set<int32_t> output_set(network.output_modes.begin(),
+                                 network.output_modes.end());
     while (best.peak_intermediate_elements > element_budget &&
            !size_dict.empty()) {
       int32_t best_mode = -1;
       int64_t best_reduction = 0;
       for (auto it = size_dict.begin(); it != size_dict.end(); ++it) {
         if (it->second <= 1)
+          continue;
+        if (output_set.count(it->first))
           continue;
         int64_t reduction = best.peak_intermediate_elements -
                             best.peak_intermediate_elements / it->second;
@@ -818,6 +947,7 @@ public:
       best.sliced.push_back(si);
       best.num_slices *= static_cast<uint64_t>(si.extent);
       best.peak_intermediate_elements /= si.extent;
+      size_dict[best_mode] = 1; // sliced: do not pick this mode again
     }
 
     if (path_verbose()) {

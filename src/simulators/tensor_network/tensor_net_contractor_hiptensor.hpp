@@ -124,43 +124,6 @@ static bool tn_rank_guard_enabled() {
   return enabled;
 }
 
-// Fail-fast cap on WS-3 tiling depth. build_tiles_for_step decomposes an
-// oversized step into a grid whose size is the product of the extents of the
-// modes beyond the first 6 on each oversized axis, so it grows as ~2^(excess
-// modes) for qubit (extent-2) modes (M=16 modes -> 2^10 = 1024). A
-// decomposition that deep is unusably slow and, empirically (8-GCD job
-// 19229140 on 2x12p2, default budget), faults the GPU in the deep
-// slice-offset x tile-offset path. This cap refuses any step that would tile
-// beyond it BEFORE execution, with a clear error, instead of attempting it.
-// Recovery is to tighten the per-slice budget (lower AER_TN_SLICE_TARGET_BYTES)
-// so the slicer cuts the step inside the m6n6k6 envelope in the planner,
-// keeping tiling shallow. Default 64 is the deepest decomposition VALIDATED to
-// execute correctly (M=8 N=8 K=8 -> 64, job 19229899); the cap is strictly
-// protective (depths <= it behave exactly as before), so it can only prevent
-// the known crash, never introduce a regression. Raise it only after
-// validating the sliced-and-tiled path at the higher depth.
-static int tn_max_tile_subcontractions() {
-  static bool checked = false;
-  static int cached = 64;
-  if (!checked) {
-    const char *val = std::getenv("AER_TN_MAX_TILE_SUBCONTRACTIONS");
-    if (val != nullptr) {
-      char *end = nullptr;
-      long parsed = std::strtol(val, &end, 10);
-      if (end != val && parsed > 0) {
-        cached = static_cast<int>(parsed);
-      } else {
-        fprintf(stderr,
-                "[AER_TN] warning: AER_TN_MAX_TILE_SUBCONTRACTIONS='%s' is not "
-                "a positive integer; using default %d.\n",
-                val, cached);
-      }
-    }
-    checked = true;
-  }
-  return cached;
-}
-
 // Cotengra path-search seed, overridable for A/B steering and regression
 // probing. NOTE: the loky search pool's trial completion order is
 // nondeterministic, so a fixed seed does NOT make a parallel search
@@ -1353,30 +1316,47 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                 step, tile_num_m, tile_num_n, tile_num_k,
                 step_plan_specs_[step].tiles.size());
 
-      // Fail-fast cap on tiling depth (see tn_max_tile_subcontractions).
-      // build_tiles_for_step decomposes any width without bound; a
-      // pathologically wide step both crawls and, on the deep sliced path,
-      // faults the GPU (8-GCD job 19229140). Refuse beyond the validated
-      // envelope here, before any kernel for this step runs, rather than
-      // attempt it. This is a plain runtime_error (not NeedsTilingException),
-      // so it propagates out of setup_contraction's retry loop as a clean,
-      // actionable failure instead of a silent GPU memory fault.
-      const size_t n_tiles = step_plan_specs_[step].tiles.size();
-      const int max_tiles = tn_max_tile_subcontractions();
-      if (n_tiles > static_cast<size_t>(max_tiles)) {
+      // Verify the actual tile DESCRIPTOR against hipTensor's strided-view
+      // ceiling. The planner bounds intermediate VOLUME (its only lever is
+      // slicing summed bonds), which in turn bounds the descriptor's free-mode
+      // stride; here we check the EXACT strides the kernel will see -- the true
+      // CK constraint, which only the built descriptor exposes (mode order and
+      // extent-1 padding can make the volume->stride relation imperfect, and a
+      // future high-stride-first reorder would decouple them further). A
+      // descriptor whose max free-mode stride reaches the tiling ceiling is
+      // what miscomputes and then faults CK plan creation; refuse it here,
+      // before any kernel for this step runs, as a clean runtime_error (not a
+      // NeedsTilingException) instead of a silent GPU memory fault. This is the
+      // contractor-side half of the envelope invariant the planner enforces by
+      // slicing: planner volume <= max_tiled_elements => stride < that, so a
+      // stride at/above it means the invariant was violated upstream.
+      const uint64_t stride_ceiling = max_tiled_elements();
+      int64_t max_stride = 0;
+      if (!step_plan_specs_[step].tiles.empty()) {
+        const auto &t0 = step_plan_specs_[step].tiles.front();
+        for (int64_t s : t0.strides_a)
+          max_stride = std::max(max_stride, s);
+        for (int64_t s : t0.strides_b)
+          max_stride = std::max(max_stride, s);
+        for (int64_t s : t0.strides_c)
+          max_stride = std::max(max_stride, s);
+      }
+      if (static_cast<uint64_t>(max_stride) >= stride_ceiling) {
         std::stringstream err;
         err << "[AER_TN] tiling step " << step << " of " << num_steps
-            << " would decompose into " << n_tiles
-            << " m6n6k6 sub-contractions (M=" << tile_num_m
-            << " N=" << tile_num_n << " K=" << tile_num_k
-            << " modes), exceeding the AER_TN_MAX_TILE_SUBCONTRACTIONS cap of "
-            << max_tiles << ". A decomposition this deep is unusably slow and "
-               "has been observed to fault the GPU on the sliced path. Options: "
-               "(1) lower AER_TN_SLICE_TARGET_BYTES so the slicer cuts this "
-               "step inside the m6n6k6 envelope in the planner (keeps tiling "
-               "shallow; current default 65536), or (2) raise "
-               "AER_TN_MAX_TILE_SUBCONTRACTIONS only after validating that the "
-               "sliced-and-tiled path executes correctly at the higher depth.";
+            << " (M=" << tile_num_m << " N=" << tile_num_n
+            << " K=" << tile_num_k << ", " << step_plan_specs_[step].tiles.size()
+            << " sub-contractions) produced a tile descriptor with max "
+               "free-mode stride "
+            << max_stride << ", at/above the m6n6k6 tiling ceiling of "
+            << stride_ceiling
+            << " elements. hipTensor's m6n6k6 kernels miscompute and then fault "
+               "during plan creation on strided views this large. The planner "
+               "should have sliced this step inside the envelope; if you raised "
+               "AER_TN_SLICE_TARGET_BYTES, lower it so the slicer keeps "
+               "per-slice intermediates small, or raise AER_TN_MAX_TILED_ELEMENTS "
+               "only after validating that descriptors at this stride build and "
+               "compute correctly on your hipTensor build.";
         throw std::runtime_error(err.str());
       }
     }
