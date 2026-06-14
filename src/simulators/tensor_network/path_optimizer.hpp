@@ -1199,6 +1199,32 @@ public:
         plan.sliced[i].mode = network.tensors[t].modes[p];
       }
     }
+
+    // [MPI DIAG] Every rank dumps each sliced mode's broadcast structural
+    // coordinate (t,p), the extent THIS rank finds at that coordinate, the
+    // re-resolved local mode ID, and the winner's stored slice extent. The
+    // (t,p) pair is broadcast so it is identical everywhere; if the local
+    // extent at (t,p) ever differs from the winner's stored extent, the
+    // network builder is not structurally identical across ranks and the
+    // coordinate names a different physical bond -- i.e. the re-resolution is
+    // the bug. Gated so it is silent unless explicitly requested.
+    if (getenv("AER_TN_MPI_DIAG") || getenv("AER_TN_MPI_DIAG_FULLSLICE")) {
+      for (size_t i = 0;
+           i < plan.sliced.size() && (2 * i + 1) < sliced_coords.size(); i++) {
+        int64_t t = sliced_coords[2 * i];
+        int64_t p = sliced_coords[2 * i + 1];
+        int64_t ext = (t >= 0 && p >= 0 &&
+                       static_cast<size_t>(t) < network.tensors.size() &&
+                       static_cast<size_t>(p) < network.tensors[t].extents.size())
+                          ? network.tensors[t].extents[p]
+                          : -1;
+        fprintf(stderr,
+                "[AER_TN_MPIDIAG] rank %d sliced[%zu] coord=(t%ld,p%ld) "
+                "local_extent=%ld local_mode=%d winner_extent=%ld\n",
+                rank, i, (long)t, (long)p, (long)ext, plan.sliced[i].mode,
+                (long)plan.sliced[i].extent);
+      }
+    }
     return plan;
   }
 };

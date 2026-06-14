@@ -932,6 +932,28 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
       slice_begin_ = myrank_ * plan_.num_slices / nprocs_;
       slice_end_ = (myrank_ + 1) * plan_.num_slices / nprocs_;
 
+      // [MPI DIAG] AER_TN_MPI_DIAG_FULLSLICE forces every rank to contract the
+      // whole slice range; contract() then skips the cross-rank reduction, so
+      // each rank independently reproduces the single-GCD result. A rank whose
+      // full-slice result diverges from the reference has a wrong per-rank plan;
+      // if every rank matches the reference yet the normal distributed sum is
+      // wrong, the bug is in the partition or the reduction. The dump (also
+      // available without the override via AER_TN_MPI_DIAG) prints from every
+      // rank so num_slices and the partition bounds are directly comparable.
+      const bool mpi_diag_fullslice =
+          getenv("AER_TN_MPI_DIAG_FULLSLICE") != nullptr;
+      if (mpi_diag_fullslice) {
+        slice_begin_ = 0;
+        slice_end_ = plan_.num_slices;
+      }
+      if (mpi_diag_fullslice || getenv("AER_TN_MPI_DIAG"))
+        fprintf(stderr,
+                "[AER_TN_MPIDIAG] rank %d/%d num_slices=%lu sliced_modes=%zu "
+                "begin=%lu end=%lu fullslice=%d\n",
+                myrank_, nprocs_, (unsigned long)plan_.num_slices,
+                plan_.sliced.size(), (unsigned long)slice_begin_,
+                (unsigned long)slice_end_, mpi_diag_fullslice ? 1 : 0);
+
       num_devices_used_ = 1;
       if (gpu_mgr_.num_devices() > 1 &&
           (slice_end_ - slice_begin_) > gpu_mgr_.num_devices()) {
@@ -1490,7 +1512,20 @@ void TensorNetContractor_HipTensor<data_t>::contract(
   contract_all();
   accumulate_across_gpus();
 #ifdef AER_MPI
-  accumulate_across_mpi();
+  if (getenv("AER_TN_MPI_DIAG_FULLSLICE")) {
+    // Every rank already contracted the full slice range; skip the reduction
+    // so each rank's buffer holds its OWN independent full result. Print it for
+    // cross-rank comparison against the single-GCD reference, then leave rank
+    // 0's (un-reduced) full result in place for get_output below.
+    std::vector<std::complex<data_t>> r;
+    gpu_mgr_.primary().get_output(r);
+    fprintf(stderr,
+            "[AER_TN_MPIDIAG] rank %d full-slice out_size=%zu result[0]=(%.15e,%.15e)\n",
+            myrank_, out_size_, r.empty() ? 0.0 : (double)r[0].real(),
+            r.empty() ? 0.0 : (double)r[0].imag());
+  } else {
+    accumulate_across_mpi();
+  }
 #endif
   gpu_mgr_.primary().get_output(out);
 }
