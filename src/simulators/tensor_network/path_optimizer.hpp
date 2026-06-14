@@ -1137,17 +1137,69 @@ public:
               size, global_result.rank, global_result.cost);
     }
 
+    // The contraction PATH (steps) is positional -- SSA indices into the input
+    // tensor list, whose order is identical on every rank -- so it broadcasts
+    // verbatim. The SLICED modes are NOT: they are stored as int32 mode IDs,
+    // and those IDs are assigned per-process by the network builder, so they
+    // differ on every rank (visible as the differing set_output mode values).
+    // The winner's int32 sliced IDs name nothing on the other ranks, which
+    // would then recognize zero sliced modes and contract UNSLICED -- oversized
+    // intermediates that trip the contractor's stride guard (and, before that
+    // guard existed, silently miscomputed across ranks). Translate each sliced
+    // mode to a rank-PORTABLE structural coordinate -- (tensor index, mode
+    // position) of its first occurrence -- on the winner, broadcast that, and
+    // resolve it back to each rank's own int32 on receipt. Tensor order and
+    // within-tensor mode order are structural (identical across ranks; the IDs
+    // differ only by a per-process base), so the coordinate names the same
+    // physical bond everywhere. Extents and num_slices are already portable.
     std::vector<int64_t> path_data;
+    std::vector<int64_t> sliced_coords; // [tensor, position] per sliced mode
     int path_size = 0;
+    int ncoords = 0;
     if (rank == global_result.rank) {
       path_data = local.serialize();
       path_size = static_cast<int>(path_data.size());
+      for (const auto &s : local.sliced) {
+        int64_t ft = -1, fp = -1;
+        for (size_t t = 0; t < network.tensors.size() && ft < 0; t++) {
+          const auto &modes = network.tensors[t].modes;
+          for (size_t p = 0; p < modes.size(); p++) {
+            if (modes[p] == s.mode) {
+              ft = static_cast<int64_t>(t);
+              fp = static_cast<int64_t>(p);
+              break;
+            }
+          }
+        }
+        sliced_coords.push_back(ft);
+        sliced_coords.push_back(fp);
+      }
+      ncoords = static_cast<int>(sliced_coords.size());
     }
     MPI_Bcast(&path_size, 1, MPI_INT, global_result.rank, comm_);
+    MPI_Bcast(&ncoords, 1, MPI_INT, global_result.rank, comm_);
     path_data.resize(path_size);
+    sliced_coords.resize(ncoords);
     MPI_Bcast(path_data.data(), path_size, MPI_INT64_T, global_result.rank,
               comm_);
-    return ContractionPlan::deserialize(path_data);
+    MPI_Bcast(sliced_coords.data(), ncoords, MPI_INT64_T, global_result.rank,
+              comm_);
+
+    ContractionPlan plan = ContractionPlan::deserialize(path_data);
+
+    // Re-resolve each sliced mode ID into THIS rank's mode namespace via its
+    // structural coordinate (extents and num_slices are unchanged).
+    for (size_t i = 0; i < plan.sliced.size() && (2 * i + 1) < sliced_coords.size();
+         i++) {
+      int64_t t = sliced_coords[2 * i];
+      int64_t p = sliced_coords[2 * i + 1];
+      if (t >= 0 && p >= 0 &&
+          static_cast<size_t>(t) < network.tensors.size() &&
+          static_cast<size_t>(p) < network.tensors[t].modes.size()) {
+        plan.sliced[i].mode = network.tensors[t].modes[p];
+      }
+    }
+    return plan;
   }
 };
 
