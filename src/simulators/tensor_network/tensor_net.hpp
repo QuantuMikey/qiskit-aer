@@ -1420,6 +1420,11 @@ void TensorNet<data_t>::sample_measure_branch(
     contractor->set_additional_tensors(measured_tensors);
   }
   contractor->setup_contraction(use_cuTensorNet_autotuning_);
+  // Record the slice count on the sample path for result-metadata parity with
+  // the amplitude (get_amplitude) and expectation (expval_pauli) paths, which
+  // both set last_num_slices_. Without this, a distributed sampling run reports
+  // num_slices=0 even though the contractor sliced internally.
+  last_num_slices_ = contractor->num_slices();
 
   // 1st loop, sampling each branch before traversing branches to reuse tensor
   // network
