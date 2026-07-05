@@ -617,7 +617,7 @@ void State<tensor_net_t>::apply_save_amplitudes(const Operations::Op &op,
   if (op.type == Operations::OpType::save_amps) {
     Vector<complex_t> amps(size, false);
     for (int_t i = 0; i < size; ++i) {
-      amps[i] = BaseState::qreg_.get_state(op.int_params[i]);
+      amps[i] = BaseState::qreg_.get_amplitude(op.int_params[i]);
     }
     result.save_data_pershot(BaseState::creg(), op.string_params[0],
                              std::move(amps), op.type, op.save_type);

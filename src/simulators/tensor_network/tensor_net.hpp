@@ -109,6 +109,16 @@ public:
   void set_state(uint_t pos, std::complex<data_t> &val);
   std::complex<data_t> get_state(uint_t pos) const;
 
+  // Single computational-basis amplitude <x|U|0> via a RANK-0 (scalar) sliced
+  // contraction, without buffering the full 2^n statevector. Each qubit's open
+  // output mode is pinned to bit q of pos with a one-hot selector leaf, so the
+  // network contracts to a scalar: the peak is governed by the contraction
+  // width, not by n, and every inner bond is sliceable (there are no open/outer
+  // modes to protect under allow_outer=false). This is the memory-safe path for
+  // save_amplitudes on heavy circuits; get_state()/buffer_statevector() (which
+  // materialise the whole vector) remain for save_statevector only.
+  std::complex<data_t> get_amplitude(uint_t pos) const;
+
   //-----------------------------------------------------------------------
   // Utility functions
   //-----------------------------------------------------------------------
@@ -459,6 +469,53 @@ std::complex<data_t> TensorNet<data_t>::get_state(uint_t pos) const {
     buffer_statevector();
 
   return statevector_[pos];
+}
+
+template <typename data_t>
+std::complex<data_t> TensorNet<data_t>::get_amplitude(uint_t pos) const {
+  if (is_density_matrix_) {
+    throw std::invalid_argument(
+        "TensorNet save_amplitudes are not allowed to use with density matrix "
+        "operations.");
+  }
+
+  TensorNetContractor<data_t> *contractor;
+  create_contractor(contractor);
+
+  // Pin every open output mode to the requested basis state. Selector q is a
+  // rank-1 one-hot leaf [1,0] (bit 0) or [0,1] (bit 1) on the qubit's tail mode
+  // modes_qubits_[q]; bit q is (pos >> q) & 1, matching the column-major
+  // (mode-0-fastest) output ordering get_state() indexes. Appending the
+  // selectors to the network gives each tail mode occurrence-count 2, so the
+  // orphan filter in set_network() keeps the tails even though the contractor
+  // output is a scalar (empty output-mode set).
+  std::vector<std::shared_ptr<Tensor<data_t>>> net = tensors_;
+  for (uint_t q = 0; q < num_qubits_; q++) {
+    uint_t bit = (pos >> q) & 1ull;
+    std::vector<std::complex<data_t>> onehot(2, std::complex<data_t>(0.0, 0.0));
+    onehot[bit] = std::complex<data_t>(1.0, 0.0);
+    std::shared_ptr<Tensor<data_t>> sel = std::make_shared<Tensor<data_t>>();
+    sel->set(static_cast<int>(q), onehot);
+    sel->modes()[0] = modes_qubits_[q];
+    net.push_back(sel);
+  }
+
+  // Scalar (rank-0) output. set_output() MUST precede set_network() (WS-1): the
+  // orphan-drop mask reads the output-mode set; here it is empty and the tails
+  // are held connected by the selectors above.
+  std::vector<int32_t> modes_out;
+  std::vector<int64_t> extents_out;
+  contractor->set_output(modes_out, extents_out);
+  contractor->set_network(net, false);
+  contractor->setup_contraction(use_cuTensorNet_autotuning_);
+  last_num_slices_ = contractor->num_slices();
+
+  std::vector<std::complex<data_t>> out;
+  contractor->contract(out);
+
+  delete contractor;
+
+  return out.empty() ? std::complex<data_t>(0.0, 0.0) : out[0];
 }
 
 template <typename data_t>
@@ -1137,7 +1194,7 @@ double TensorNet<data_t>::norm(const reg_t &qubits,
  ******************************************************************************/
 template <typename data_t>
 double TensorNet<data_t>::probability(const uint_t outcome) const {
-  std::complex<data_t> s = get_state(outcome);
+  std::complex<data_t> s = get_amplitude(outcome);
   return std::real(s * std::conj(s));
 }
 

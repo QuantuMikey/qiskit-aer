@@ -289,6 +289,57 @@ static uint64_t ck_stage_stride_ceiling() {
   return cached;
 }
 
+// Hard ceiling, in ELEMENTS, on the (unsliceable) OUTPUT tensor the final
+// contraction step may produce. DECOUPLED from max_tiled_elements(): that knob
+// (AER_TN_MAX_TILED_ELEMENTS) now governs the per-operand volume of TILED
+// INTERMEDIATE steps for descriptor-stride safety, and is tuned to trade slice
+// count against per-slice peak. The maximum admissible OUTPUT rank is a
+// separate concern -- output (open) modes can never be sliced (allow_outer=
+// false), so the output tensor's own size is a hard lower bound on the
+// per-slice peak, and if the output cannot come from a single m6n6k6 result the
+// final step must be TILED and therefore bounded by what tiling+staging can
+// emit CK-safely. Coupling the two meant that raising the slicing knob to cut
+// slice count on a hard circuit silently raised the accepted output rank (and
+// lowering it for stride safety silently forbade legitimate outputs). This
+// completes the aer-0011 decouple (which separated the staging STRIDE trigger)
+// for the output-ELEMENT concern. Default 2^16 = the same hardware-validated
+// CK-safe tiled volume, so behaviour is unchanged until the knob is set. The
+// rank-0 amplitude path (get_amplitude, output_elements=1) is trivially under
+// this ceiling; the gate exists for save_statevector and reduced-DM outputs.
+static uint64_t output_tiling_ceiling() {
+  static bool checked = false;
+  static uint64_t cached = 65536; // 2^16, CK-safe tiled-output volume
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_MAX_OUTPUT_ELEMENTS");
+    if (val != nullptr) {
+      char *end = nullptr;
+      unsigned long long parsed = std::strtoull(val, &end, 10);
+      if (end != val && parsed > 0) {
+        cached = static_cast<uint64_t>(parsed);
+        // Floor at one m6n6k6 result: a single untiled kernel already emits
+        // 2^kMaxFreeModes elements, so a smaller ceiling would reject outputs
+        // that need no tiling at all.
+        const uint64_t floor_elems = static_cast<uint64_t>(1) << kMaxFreeModes;
+        if (cached < floor_elems) {
+          fprintf(stderr,
+                  "[AER_TN_PATH] warning: AER_TN_MAX_OUTPUT_ELEMENTS=%llu is "
+                  "below one m6n6k6 result (%llu); using %llu.\n",
+                  (unsigned long long)cached, (unsigned long long)floor_elems,
+                  (unsigned long long)floor_elems);
+          cached = floor_elems;
+        }
+      } else {
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: AER_TN_MAX_OUTPUT_ELEMENTS='%s' is not "
+                "a positive integer; using default %llu.\n",
+                val, (unsigned long long)cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // Cotengra search objective, from AER_TN_MINIMIZE. "combo" (default) minimizes
 // FLOPs+write; it can select plans with very wide single steps (huge
 // intermediates) that then require deep m6n6k6 tiling -- the multi-GCD crash
@@ -619,9 +670,10 @@ public:
     // contracted without tiling regardless of this clamp. This is what lets a
     // hard circuit pick a low-slice plan automatically -- drop-in, no flags.
     //
-    // The output-feasibility gate below still uses max_tiled_elements() as the
-    // hard cap on the (unsliceable) OUTPUT tensor; that is intentionally left
-    // in place here and decoupled separately.
+    // The output-feasibility gate below uses output_tiling_ceiling() as the
+    // hard cap on the (unsliceable) OUTPUT tensor -- decoupled from
+    // max_tiled_elements() (the slicing knob) so tuning slice count does not
+    // move the accepted output rank, and vice versa.
     uint64_t target_elements = memory_limit_bytes / element_size_bytes_;
     uint64_t envelope_elements =
         std::max<uint64_t>(1, slice_target_bytes() / element_size_bytes_);
@@ -644,18 +696,18 @@ public:
       // The output cannot come from a single m6n6k6 result -- the final step
       // must be TILED. Feasible only if the output fits the tiling ceiling,
       // because its open modes cannot be sliced to shrink it.
-      if (output_elements > max_tiled_elements()) {
+      if (output_elements > output_tiling_ceiling()) {
         std::ostringstream msg;
         msg << "CotengPathOptimizer: requested output has "
             << network.output_modes.size() << " open modes ("
             << output_elements
-            << " elements), exceeding the m6n6k6 tiling ceiling ("
-            << max_tiled_elements()
+            << " elements), exceeding the output tiling ceiling ("
+            << output_tiling_ceiling()
             << " elements). Output (open) modes cannot be sliced, so this "
                "output rank exceeds m6n6k6 tiling -- request a lower-rank "
                "output (expectation value, amplitude, or a smaller reduced "
                "density matrix). If larger outputs are known CK-safe on this "
-               "hipTensor build, raise AER_TN_MAX_TILED_ELEMENTS after "
+               "hipTensor build, raise AER_TN_MAX_OUTPUT_ELEMENTS after "
                "validation.";
         throw std::runtime_error(msg.str());
       }
@@ -682,8 +734,8 @@ public:
 
     // Output-size clamp: slicing can't shrink the output, so the per-slice
     // peak can't drop below it. Raise the target to at least the output size.
-    // The checks above guarantee output_elements <= max_tiled_elements, so the
-    // target stays inside the tiling ceiling.
+    // The checks above guarantee output_elements <= output_tiling_ceiling(), so
+    // the target stays inside a CK-safe tiled-output volume.
     if (output_elements > target_elements) {
       if (path_verbose()) {
         fprintf(stderr,

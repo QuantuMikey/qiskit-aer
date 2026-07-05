@@ -502,7 +502,7 @@ void Executor<state_t>::apply_save_amplitudes(CircuitExecutor::Branch &root,
     Vector<complex_t> amps(size, false);
     for (uint_t i = 0; i < size; ++i) {
       amps[i] =
-          Base::states_[root.state_index()].qreg().get_state(op.int_params[i]);
+          Base::states_[root.state_index()].qreg().get_amplitude(op.int_params[i]);
     }
     for (uint_t i = 0; i < root.num_shots(); i++) {
       uint_t ip = root.param_index(i);
