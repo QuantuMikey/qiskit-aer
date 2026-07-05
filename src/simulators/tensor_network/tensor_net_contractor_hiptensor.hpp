@@ -446,6 +446,140 @@ public:
   }
 };
 
+// --- WS-3 operand staging: strided <-> packed device copies -----------------
+// When a tiled sub-block's descriptor stride for an operand reaches the CK-safe
+// ceiling (max_tiled_elements), hipTensor faults while BUILDING the plan on that
+// strided view (observed as a GPU memory access fault during prebuild; sweep
+// 19751464). Staging routes around it: pack the strided operand into a packed
+// scratch buffer, contract on the packed buffer (small strides CK can build),
+// and for the output scatter the packed result back into the strided parent.
+// This is value-identical to the direct strided path -- only the memory layout
+// differs -- proved bit-exact on CPU in prove_operand_staging.py.
+static constexpr int kStageMaxRank = 32;
+
+template <typename data_t> struct strided_pack_func_hip {
+  const data_t *src; // parent plane, already base-shifted to the tile origin
+  data_t *dst;       // packed scratch plane (contiguous, column-major)
+  int rank;
+  int64_t ext[kStageMaxRank]; // free-mode extents (packed/descriptor order)
+  int64_t str[kStageMaxRank]; // parent strides of those free modes
+  __host__ __device__ void operator()(const uint_t &i) const {
+    uint_t rem = i;
+    int64_t off = 0;
+    for (int k = 0; k < rank; ++k) {
+      uint_t e = static_cast<uint_t>(ext[k]);
+      off += static_cast<int64_t>(rem % e) * str[k];
+      rem /= e;
+    }
+    dst[i] = src[off];
+  }
+};
+
+template <typename data_t> struct strided_scatter_func_hip {
+  const data_t *src; // packed scratch plane
+  data_t *dst;       // parent plane, already base-shifted to the tile origin
+  bool accumulate;   // add into the parent (K-partials) vs overwrite
+  int rank;
+  int64_t ext[kStageMaxRank];
+  int64_t str[kStageMaxRank];
+  __host__ __device__ void operator()(const uint_t &i) const {
+    uint_t rem = i;
+    int64_t off = 0;
+    for (int k = 0; k < rank; ++k) {
+      uint_t e = static_cast<uint_t>(ext[k]);
+      off += static_cast<int64_t>(rem % e) * str[k];
+      rem /= e;
+    }
+    if (accumulate)
+      dst[off] += src[i];
+    else
+      dst[off] = src[i];
+  }
+};
+
+// Number of elements in a tile sub-block (product of its free-mode extents).
+static uint64_t stage_block_elems(const std::vector<int64_t> &ext) {
+  uint64_t n = 1;
+  for (int64_t e : ext)
+    n *= (e > 0 ? static_cast<uint64_t>(e) : 1);
+  return n;
+}
+
+// If an operand's tile descriptor max free-mode stride reaches the CK-safe
+// ceiling, mark it for staging: stash the parent strides and REWRITE strides in
+// place to packed column-major, so every downstream consumer (plan-cache warm,
+// signature, get_or_create) builds a contiguous plan hipTensor can create.
+static void stage_operand_if_needed(std::vector<int64_t> &strides,
+                                    const std::vector<int64_t> &extents,
+                                    uint64_t ceiling, bool &stage,
+                                    std::vector<int64_t> &parent_strides) {
+  int64_t max_stride = 0;
+  for (size_t k = 0; k < strides.size() && k < extents.size(); ++k)
+    if (extents[k] > 1)
+      max_stride = std::max<int64_t>(max_stride, strides[k]);
+  if (static_cast<uint64_t>(max_stride) < ceiling) {
+    stage = false;
+    return;
+  }
+  stage = true;
+  parent_strides = strides;
+  int64_t st = 1;
+  for (size_t k = 0; k < strides.size(); ++k) {
+    strides[k] = st;
+    st *= (extents[k] > 0 ? extents[k] : 1);
+  }
+}
+
+// Pack a strided parent operand (both split-complex planes) into packed
+// scratch, on the given stream. src planes are already base-shifted to the tile
+// origin; parent_strides index the parent's packed layout.
+template <typename data_t>
+static void stage_pack(hipStream_t stream, const data_t *src_re,
+                       const data_t *src_im, data_t *dst_re, data_t *dst_im,
+                       const std::vector<int64_t> &extents,
+                       const std::vector<int64_t> &parent_strides) {
+  const uint64_t n = stage_block_elems(extents);
+  strided_pack_func_hip<data_t> f;
+  const int rank = static_cast<int>(extents.size());
+  f.rank = rank < kStageMaxRank ? rank : kStageMaxRank;
+  for (int k = 0; k < f.rank; ++k) {
+    f.ext[k] = extents[k];
+    f.str[k] = parent_strides[k];
+  }
+  auto ci = thrust::counting_iterator<uint_t>(0);
+  f.src = src_re;
+  f.dst = dst_re;
+  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  f.src = src_im;
+  f.dst = dst_im;
+  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+}
+
+// Scatter a packed scratch result (both planes) back into the strided parent.
+template <typename data_t>
+static void stage_scatter(hipStream_t stream, const data_t *src_re,
+                          const data_t *src_im, data_t *dst_re, data_t *dst_im,
+                          const std::vector<int64_t> &extents,
+                          const std::vector<int64_t> &parent_strides,
+                          bool accumulate) {
+  const uint64_t n = stage_block_elems(extents);
+  strided_scatter_func_hip<data_t> f;
+  f.accumulate = accumulate;
+  const int rank = static_cast<int>(extents.size());
+  f.rank = rank < kStageMaxRank ? rank : kStageMaxRank;
+  for (int k = 0; k < f.rank; ++k) {
+    f.ext[k] = extents[k];
+    f.str[k] = parent_strides[k];
+  }
+  auto ci = thrust::counting_iterator<uint_t>(0);
+  f.src = src_re;
+  f.dst = dst_re;
+  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  f.src = src_im;
+  f.dst = dst_im;
+  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+}
+
 //=============================================================================
 // TensorNetContractor_HipTensor
 //=============================================================================
@@ -527,10 +661,23 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
       int64_t off_a = 0, off_b = 0, off_c = 0;
       bool accumulate = false;   // true for K-block partials (beta=1)
       bool zero_c_first = false; // true on the first writer of each C region
+      // WS-3 operand staging (see strided_pack_func_hip). When stage_X is true,
+      // strides_X above hold PACKED column-major strides (the plan CK builds is
+      // contiguous), and parent_strides_X holds the original strided-parent
+      // strides used to pack the operand into scratch (inputs A/B) or scatter
+      // the packed result back into the parent (output C).
+      bool stage_a = false, stage_b = false, stage_c = false;
+      std::vector<int64_t> parent_strides_a, parent_strides_b, parent_strides_c;
     };
     std::vector<Tile> tiles;
   };
   std::vector<PlanSpec> step_plan_specs_;
+
+  // WS-3 operand-staging scratch. Sized in the prebuild pass to the largest
+  // staged sub-block; 6 planes per device (re+im for A, B, C) laid out
+  // contiguously. Zero-cost when no step needs staging (stays unallocated).
+  uint64_t stage_scratch_elems_ = 0;
+  std::unordered_map<int, thrust::device_vector<data_t>> stage_scratch_;
 
   std::vector<std::vector<int32_t>> prev_modes_;
   std::vector<std::vector<int64_t>> prev_extents_;
@@ -1338,49 +1485,46 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                 step, tile_num_m, tile_num_n, tile_num_k,
                 step_plan_specs_[step].tiles.size());
 
-      // Verify the actual tile DESCRIPTOR against hipTensor's strided-view
-      // ceiling. The planner bounds intermediate VOLUME (its only lever is
-      // slicing summed bonds), which in turn bounds the descriptor's free-mode
-      // stride; here we check the EXACT strides the kernel will see -- the true
-      // CK constraint, which only the built descriptor exposes (mode order and
-      // extent-1 padding can make the volume->stride relation imperfect, and a
-      // future high-stride-first reorder would decouple them further). A
-      // descriptor whose max free-mode stride reaches the tiling ceiling is
-      // what miscomputes and then faults CK plan creation; refuse it here,
-      // before any kernel for this step runs, as a clean runtime_error (not a
-      // NeedsTilingException) instead of a silent GPU memory fault. This is the
-      // contractor-side half of the envelope invariant the planner enforces by
-      // slicing: planner volume <= max_tiled_elements => stride < that, so a
-      // stride at/above it means the invariant was violated upstream.
+      // Check the EXACT strides each sub-block descriptor will hand hipTensor
+      // (the true CK constraint; only the built descriptor exposes it, since
+      // mode order and extent-1 padding make the volume->stride relation
+      // imperfect). A descriptor whose max free-mode stride reaches the ceiling
+      // is what faults CK plan creation. Rather than refuse the step, ROUTE the
+      // offending operand(s) through packed staging: stage_operand_if_needed
+      // rewrites that operand to packed column-major strides (so the plan CK
+      // builds is contiguous) and stashes the parent strides for
+      // contract_single_slice to pack the operand into scratch (inputs) or
+      // scatter the packed result back (output). Value-identical to the direct
+      // strided path -- proved bit-exact on CPU, prove_operand_staging.py.
       const uint64_t stride_ceiling = max_tiled_elements();
-      int64_t max_stride = 0;
-      if (!step_plan_specs_[step].tiles.empty()) {
-        const auto &t0 = step_plan_specs_[step].tiles.front();
-        for (int64_t s : t0.strides_a)
-          max_stride = std::max(max_stride, s);
-        for (int64_t s : t0.strides_b)
-          max_stride = std::max(max_stride, s);
-        for (int64_t s : t0.strides_c)
-          max_stride = std::max(max_stride, s);
+      size_t nstaged = 0;
+      for (auto &t : step_plan_specs_[step].tiles) {
+        stage_operand_if_needed(t.strides_a, t.extents_a, stride_ceiling,
+                                t.stage_a, t.parent_strides_a);
+        stage_operand_if_needed(t.strides_b, t.extents_b, stride_ceiling,
+                                t.stage_b, t.parent_strides_b);
+        stage_operand_if_needed(t.strides_c, t.extents_c, stride_ceiling,
+                                t.stage_c, t.parent_strides_c);
+        if (t.stage_a)
+          stage_scratch_elems_ = std::max<uint64_t>(
+              stage_scratch_elems_, stage_block_elems(t.extents_a));
+        if (t.stage_b)
+          stage_scratch_elems_ = std::max<uint64_t>(
+              stage_scratch_elems_, stage_block_elems(t.extents_b));
+        if (t.stage_c)
+          stage_scratch_elems_ = std::max<uint64_t>(
+              stage_scratch_elems_, stage_block_elems(t.extents_c));
+        if (t.stage_a || t.stage_b || t.stage_c)
+          ++nstaged;
       }
-      if (static_cast<uint64_t>(max_stride) >= stride_ceiling) {
-        std::stringstream err;
-        err << "[AER_TN] tiling step " << step << " of " << num_steps
-            << " (M=" << tile_num_m << " N=" << tile_num_n
-            << " K=" << tile_num_k << ", " << step_plan_specs_[step].tiles.size()
-            << " sub-contractions) produced a tile descriptor with max "
-               "free-mode stride "
-            << max_stride << ", at/above the m6n6k6 tiling ceiling of "
-            << stride_ceiling
-            << " elements. hipTensor's m6n6k6 kernels miscompute and then fault "
-               "during plan creation on strided views this large. The planner "
-               "should have sliced this step inside the envelope; if you raised "
-               "AER_TN_SLICE_TARGET_BYTES, lower it so the slicer keeps "
-               "per-slice intermediates small, or raise AER_TN_MAX_TILED_ELEMENTS "
-               "only after validating that descriptors at this stride build and "
-               "compute correctly on your hipTensor build.";
-        throw std::runtime_error(err.str());
-      }
+      if (nstaged && tn_verbose())
+        fprintf(stderr,
+                "[AER_TN] tiling step %zu (M=%d N=%d K=%d): %zu/%zu sub-blocks "
+                "route an over-ceiling operand through packed staging "
+                "(ceiling %lu elements)\n",
+                step, tile_num_m, tile_num_n, tile_num_k, nstaged,
+                step_plan_specs_[step].tiles.size(),
+                (unsigned long)stride_ceiling);
     }
 
     // Record the exact per-plan descriptor shape for contract_single_slice.
@@ -1753,8 +1897,53 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         data_t *Cr = all_planes[result_idx].re + t.off_c;
         data_t *Ci = all_planes[result_idx].im + t.off_c;
 
-        dev.execute_contraction_planes(tplan, Ar, Ai, Br, Bi, Cr, Ci,
-                                       workspace, ws_size, t.accumulate);
+        // Operand staging: for any operand flagged over-ceiling in prebuild,
+        // pack the strided parent view into packed scratch and point the
+        // contraction at scratch (inputs A/B), or contract into scratch and
+        // scatter the result back (output C). tplan above was built from
+        // t.strides_* which are PACKED for staged operands, so it matches the
+        // scratch layout; non-staged operands run straight off the parent slot.
+        data_t *aR = Ar, *aI = Ai, *bR = Br, *bI = Bi, *cR = Cr, *cI = Ci;
+        if (t.stage_a || t.stage_b || t.stage_c) {
+          thrust::device_vector<data_t> &buf = stage_scratch_[dev.device_id()];
+          if (buf.size() < 6 * stage_scratch_elems_)
+            buf.resize(6 * stage_scratch_elems_);
+          data_t *sc = thrust::raw_pointer_cast(buf.data());
+          data_t *pA_re = sc + 0 * stage_scratch_elems_;
+          data_t *pA_im = sc + 1 * stage_scratch_elems_;
+          data_t *pB_re = sc + 2 * stage_scratch_elems_;
+          data_t *pB_im = sc + 3 * stage_scratch_elems_;
+          data_t *pC_re = sc + 4 * stage_scratch_elems_;
+          data_t *pC_im = sc + 5 * stage_scratch_elems_;
+          if (t.stage_a) {
+            stage_pack(dev.stream(), Ar, Ai, pA_re, pA_im, t.extents_a,
+                       t.parent_strides_a);
+            aR = pA_re;
+            aI = pA_im;
+          }
+          if (t.stage_b) {
+            stage_pack(dev.stream(), Br, Bi, pB_re, pB_im, t.extents_b,
+                       t.parent_strides_b);
+            bR = pB_re;
+            bI = pB_im;
+          }
+          if (t.stage_c) {
+            cR = pC_re;
+            cI = pC_im;
+          }
+        }
+
+        // Staged C contracts into fresh packed scratch (accumulate=false so the
+        // scratch holds only this block's product), then scatters into the
+        // parent region with the tile's real accumulate flag: the parent slot
+        // was pre-zeroed once, so the first writer's overwrite == add-to-zero
+        // and K-partials add. Non-staged C keeps the direct beta semantics.
+        const bool exec_accum = t.stage_c ? false : t.accumulate;
+        dev.execute_contraction_planes(tplan, aR, aI, bR, bI, cR, cI,
+                                       workspace, ws_size, exec_accum);
+        if (t.stage_c)
+          stage_scatter(dev.stream(), cR, cI, Cr, Ci, t.extents_c,
+                        t.parent_strides_c, t.accumulate);
       }
 
       if (tn_debug()) {
