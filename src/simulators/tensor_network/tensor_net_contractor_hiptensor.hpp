@@ -18,10 +18,13 @@
 #include <climits>
 #include <complex>
 #include <cstdlib>
+#include <exception>
 #include <map>
 #include <memory>
 #include <set>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -729,6 +732,17 @@ private:
                      std::vector<PlanePtrs> &projected);
   void accumulate_across_gpus();
   void accumulate_across_mpi();
+#ifdef AER_MPI
+  // Collective fail-together for the reduction-bearing contraction
+  // entrypoints. A per-rank throw during local contraction (a HIP/CK fault or
+  // a slicing-bookkeeping guard on THIS rank's slice range) must not leave the
+  // other ranks blocked at the cross-rank reduction below. Each caller runs its
+  // local work in a try/catch and reports a 0/1 flag here; Allreduce(MAX)
+  // agrees a global verdict, and if any rank failed, every rank throws together
+  // BEFORE the reduction collective is entered. Mirrors the planner's
+  // MPIParallelPathOptimizer collective-agreement pattern. No-op single-rank.
+  void agree_or_fail_together(int local_failed, const std::string &local_msg);
+#endif
   void contract_all();
   double sample_measure_on_primary(reg_t &samples, std::vector<double> &rnds,
                                    uint_t num_qubits);
@@ -1645,6 +1659,42 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
             dev.pool().total_size(), dev.plan_cache().size(), dev.device_id());
 }
 
+#ifdef AER_MPI
+template <typename data_t>
+void TensorNetContractor_HipTensor<data_t>::agree_or_fail_together(
+    int local_failed, const std::string &local_msg) {
+  // Single rank: no sibling to hang, so just re-raise the local failure.
+  if (nprocs_ <= 1) {
+    if (local_failed)
+      throw std::runtime_error(local_msg);
+    return;
+  }
+
+  // Every rank contributes its 0/1 verdict; MPI_MAX makes the outcome 1 iff
+  // ANY rank failed. This Allreduce is the ONLY collective every rank is
+  // guaranteed to reach after local contraction (the failing rank caught its
+  // throw and continued to here), so it cannot itself desync.
+  int any_failed = 0;
+  MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_MAX,
+                MPI_COMM_WORLD);
+  if (!any_failed)
+    return;
+
+  // The rank that actually failed re-raises its own message so the true cause
+  // (HIP/CK fault, OOM, or a slicing-bookkeeping guard) is surfaced in its
+  // stderr. The ranks that succeeded fail together with a pointer to it, rather
+  // than blocking forever at the reduction below waiting on a rank that has
+  // already unwound (observed job 19214242).
+  if (local_failed)
+    throw std::runtime_error(local_msg);
+  throw std::runtime_error(
+      "[AER_TN] contraction aborted: a sibling MPI rank threw during its "
+      "assigned slice range, so this rank fails together rather than blocking "
+      "at the cross-rank reduction. See the failing rank's stderr for the "
+      "underlying error.");
+}
+#endif
+
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract(
     std::vector<std::complex<data_t>> &out) {
@@ -1653,9 +1703,22 @@ void TensorNetContractor_HipTensor<data_t>::contract(
   // Reduce both layers before reading the result off the primary device —
   // skipping either reduction drops every slice not assigned to (rank 0,
   // device 0). Reduction order is fixed by index (P4).
-  contract_all();
-  accumulate_across_gpus();
 #ifdef AER_MPI
+  // Run the per-rank local contraction under a fail-together guard: a HIP/CK
+  // fault or slicing-bookkeeping throw on THIS rank's slice range is caught,
+  // agreed collectively, and turned into a job-wide abort BEFORE
+  // accumulate_across_mpi() — so no surviving rank blocks at the reduction.
+  int local_failed = 0;
+  std::string local_msg;
+  try {
+    contract_all();
+    accumulate_across_gpus();
+  } catch (const std::exception &e) {
+    local_failed = 1;
+    local_msg = e.what();
+  }
+  agree_or_fail_together(local_failed, local_msg);
+
   if (getenv("AER_TN_MPI_DIAG_FULLSLICE")) {
     // Every rank already contracted the full slice range; skip the reduction
     // so each rank's buffer holds its OWN independent full result. Print it for
@@ -1670,32 +1733,66 @@ void TensorNetContractor_HipTensor<data_t>::contract(
   } else {
     accumulate_across_mpi();
   }
+#else
+  contract_all();
+  accumulate_across_gpus();
 #endif
   gpu_mgr_.primary().get_output(out);
 }
 
 template <typename data_t>
 double TensorNetContractor_HipTensor<data_t>::contract_and_trace(uint_t num_qubits) {
-  contract_all();
-  double ret = 0.0;
-  for (int idev = 0; idev < num_devices_used_; idev++)
-    ret += gpu_mgr_.device(idev).trace_output(num_qubits);
 #ifdef AER_MPI
+  // Fail-together guard (see agree_or_fail_together): a per-rank throw in
+  // contract_all() must abort the job collectively rather than leaving siblings
+  // blocked at the MPI_Allreduce(SUM) below.
+  double ret = 0.0;
+  int local_failed = 0;
+  std::string local_msg;
+  try {
+    contract_all();
+    for (int idev = 0; idev < num_devices_used_; idev++)
+      ret += gpu_mgr_.device(idev).trace_output(num_qubits);
+  } catch (const std::exception &e) {
+    local_failed = 1;
+    local_msg = e.what();
+  }
+  agree_or_fail_together(local_failed, local_msg);
   if (nprocs_ > 1) {
     double sum = ret;
     MPI_Allreduce(&sum, &ret, 1, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD);
   }
-#endif
   return ret;
+#else
+  contract_all();
+  double ret = 0.0;
+  for (int idev = 0; idev < num_devices_used_; idev++)
+    ret += gpu_mgr_.device(idev).trace_output(num_qubits);
+  return ret;
+#endif
 }
 
 template <typename data_t>
 double TensorNetContractor_HipTensor<data_t>::contract_and_sample_measure(
     reg_t &samples, std::vector<double> &rnds, uint_t num_qubits) {
+#ifdef AER_MPI
+  // Fail-together guard (see agree_or_fail_together): a per-rank throw in the
+  // local contraction must abort the job collectively rather than leaving
+  // siblings blocked at accumulate_across_mpi() below.
+  int local_failed = 0;
+  std::string local_msg;
+  try {
+    contract_all();
+    accumulate_across_gpus();
+  } catch (const std::exception &e) {
+    local_failed = 1;
+    local_msg = e.what();
+  }
+  agree_or_fail_together(local_failed, local_msg);
+  accumulate_across_mpi();
+#else
   contract_all();
   accumulate_across_gpus();
-#ifdef AER_MPI
-  accumulate_across_mpi();
 #endif
   return sample_measure_on_primary(samples, rnds, num_qubits);
 }
@@ -1797,6 +1894,24 @@ template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     uint_t slice_index, int device_idx) {
   if (plan_.steps.empty()) return;
+
+  // Fault-injection hook (inert unless set; never a drop-in default, like
+  // AER_TN_FORCE_SLICING). AER_TN_FAULT_INJECT_RANK selects the rank that
+  // throws mid-contraction; AER_TN_FAULT_INJECT_SLICE optionally pins the
+  // slice index (default: the rank's first slice). This deterministically
+  // reproduces the per-rank throw that the fail-together guard must convert
+  // into a fast collective abort instead of a reduction hang (job 19214242).
+  if (const char *fr = getenv("AER_TN_FAULT_INJECT_RANK")) {
+    const char *fs = getenv("AER_TN_FAULT_INJECT_SLICE");
+    uint_t inj_slice = fs ? (uint_t)strtoull(fs, nullptr, 10) : slice_begin_;
+    if (atoi(fr) == myrank_ && slice_index == inj_slice) {
+      std::stringstream err;
+      err << "[AER_TN_FAULT_INJECT] rank " << myrank_ << " forced throw at slice "
+          << slice_index << " (validation hook; unset AER_TN_FAULT_INJECT_RANK "
+          << "to disable).";
+      throw std::runtime_error(err.str());
+    }
+  }
 
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
   hipSetDevice(dev.device_id());
