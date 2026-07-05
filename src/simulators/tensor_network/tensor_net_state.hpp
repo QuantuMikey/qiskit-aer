@@ -109,6 +109,11 @@ public:
   // Return the string name of the State class
   virtual std::string name() const override { return tensor_net_t::name(); }
 
+  // Add tensor-network metadata (currently num_slices from the most recent
+  // contraction) to the experiment result. Called once per experiment by the
+  // circuit/parallel executors after ops are applied.
+  void add_metadata(ExperimentResult &result) const override;
+
   // Apply an operation
   // If the op is not in allowed_ops an exeption will be raised.
   virtual void apply_op(const Operations::Op &op, ExperimentResult &result,
@@ -538,6 +543,11 @@ template <class tensor_net_t>
 double State<tensor_net_t>::expval_pauli(const reg_t &qubits,
                                          const std::string &pauli) {
   return BaseState::qreg_.expval_pauli(qubits, pauli);
+}
+
+template <class tensor_net_t>
+void State<tensor_net_t>::add_metadata(ExperimentResult &result) const {
+  result.metadata.add(BaseState::qreg_.last_num_slices(), "num_slices");
 }
 
 template <class tensor_net_t>

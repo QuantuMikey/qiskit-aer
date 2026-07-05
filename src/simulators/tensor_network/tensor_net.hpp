@@ -81,6 +81,12 @@ protected:
 
   bool cuTensorNet_enable_ = false;
 
+  // Number of contraction slices reported by the most recent contraction that
+  // produced one (0 if none has run yet). Surfaced into the experiment result
+  // metadata as "num_slices" via the State's add_metadata override. Mutable
+  // because the value-returning contraction paths (e.g. expval_pauli) are const.
+  mutable uint_t last_num_slices_ = 0;
+
 public:
   //-----------------------------------------------------------------------
   // Constructors and Destructor
@@ -115,6 +121,10 @@ public:
 
   // Returns the number of qubits for the current vector
   virtual uint_t num_qubits() const { return num_qubits_; }
+
+  // Returns the number of slices used by the most recent contraction that
+  // reported one (0 if none has run). Read by the State to emit "num_slices".
+  uint_t last_num_slices() const { return last_num_slices_; }
 
   // Returns required memory
   size_t required_memory_mb(uint_t num_qubits) const;
@@ -1532,6 +1542,7 @@ double TensorNet<data_t>::expval_pauli(const reg_t &qubits,
 
   contractor->set_output(modes_out, extents_out);
   contractor->setup_contraction(use_cuTensorNet_autotuning_);
+  last_num_slices_ = contractor->num_slices();
   expval = contractor->contract_and_trace(1);
 
   delete contractor;
