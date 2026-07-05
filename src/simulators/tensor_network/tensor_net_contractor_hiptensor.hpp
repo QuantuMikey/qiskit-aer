@@ -15,6 +15,7 @@
 #ifdef AER_THRUST_ROCM
 
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <complex>
 #include <cstdlib>
@@ -71,6 +72,29 @@ static bool tn_debug() {
     checked = true;
   }
   return enabled;
+}
+
+// Opt-in wall-clock profiling. Inert unless AER_TN_PROFILE=1: when off, no
+// timers are read and no GPU stream syncs are added, so the default execution
+// path is byte-for-byte unchanged in both result and performance. When on, each
+// reduction entrypoint prints a one-line per-rank phase breakdown to stderr.
+static bool tn_profile() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_PROFILE");
+    enabled = (val != nullptr && std::string(val) == "1");
+    checked = true;
+  }
+  return enabled;
+}
+
+// Milliseconds elapsed since a captured steady_clock time point.
+static inline double
+tn_ms_since(const std::chrono::steady_clock::time_point &t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
 }
 
 // hipTensor requires every contraction descriptor to have at least one free
@@ -592,6 +616,17 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   GPUResourceManager<data_t> gpu_mgr_;
   int num_devices_used_;
 
+  // Wall-clock phase accumulators (milliseconds) for the current contraction,
+  // populated only when tn_profile() is on. setup/path are filled by
+  // setup_contraction(); contract/reduce_* by the reduction entrypoints; the
+  // per-rank breakdown is emitted by prof_report(). Zero effect when profiling
+  // is off (guarded at every site).
+  double prof_setup_ms_ = 0.0;
+  double prof_path_ms_ = 0.0;
+  double prof_contract_ms_ = 0.0;
+  double prof_reduce_gpu_ms_ = 0.0;
+  double prof_reduce_mpi_ms_ = 0.0;
+
   NetworkDescription network_desc_;
   std::vector<std::shared_ptr<Tensor<data_t>>> input_tensors_;
   bool add_sp_tensors_;
@@ -757,6 +792,13 @@ private:
   std::vector<bool> compute_orphan_mask(
       const std::vector<std::shared_ptr<Tensor<data_t>>> &tensors,
       const std::set<int32_t> &output_modes_set) const;
+
+  // Profiling helpers (tn_profile()). prof_sync_devices() blocks until every
+  // used device stream is idle so async kernel time is attributed to the phase
+  // it belongs to rather than leaking into the next wall-clock measurement.
+  // prof_report() prints a machine-parseable per-rank breakdown to stderr.
+  void prof_sync_devices();
+  void prof_report(const char *entrypoint);
 };
 
 //=============================================================================
@@ -1004,6 +1046,19 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank_);
 #endif
 
+  // setup_contraction is the first call of the setup -> contract sequence, so
+  // it owns resetting the profiling accumulators for this contraction. The
+  // per-rank report is emitted later, by the reduction entrypoint.
+  std::chrono::steady_clock::time_point prof_setup_t0;
+  if (tn_profile()) {
+    prof_setup_ms_ = 0.0;
+    prof_path_ms_ = 0.0;
+    prof_contract_ms_ = 0.0;
+    prof_reduce_gpu_ms_ = 0.0;
+    prof_reduce_mpi_ms_ = 0.0;
+    prof_setup_t0 = std::chrono::steady_clock::now();
+  }
+
   network_desc_.output_modes = modes_out_;
   network_desc_.output_extents = extents_out_;
 
@@ -1061,8 +1116,15 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
                   memory_budget / (1024.0 * 1024.0));
 
         auto optimizer = create_optimizer();
+        std::chrono::steady_clock::time_point prof_path_t0;
+        if (tn_profile())
+          prof_path_t0 = std::chrono::steady_clock::now();
         plan_ = optimizer->find_path(network_desc_, memory_budget,
                                      tn_path_seed(), engaged);
+        // += so an AUTO re-plan (pass 2) adds to pass 1's search cost rather
+        // than hiding it.
+        if (tn_profile())
+          prof_path_ms_ += tn_ms_since(prof_path_t0);
 
         // Slice-count ceiling: refuse an over-sliced plan rather than grind
         // (see tn_max_slices). plan_.num_slices is the MINLOC-broadcast value,
@@ -1166,6 +1228,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
     fprintf(stderr, "[AER_TN] setup: %zu steps, %lu slices, %.2e FLOPs, %d GPUs\n",
             plan_.steps.size(), (unsigned long)plan_.num_slices,
             plan_.total_flops, num_devices_used_);
+
+  if (tn_profile())
+    prof_setup_ms_ += tn_ms_since(prof_setup_t0);
 }
 
 template <typename data_t>
@@ -1696,6 +1761,43 @@ void TensorNetContractor_HipTensor<data_t>::agree_or_fail_together(
 #endif
 
 template <typename data_t>
+void TensorNetContractor_HipTensor<data_t>::prof_sync_devices() {
+  for (int idev = 0; idev < num_devices_used_; idev++) {
+    hipSetDevice(gpu_mgr_.device(idev).device_id());
+    hipStreamSynchronize(gpu_mgr_.device(idev).stream());
+  }
+}
+
+template <typename data_t>
+void TensorNetContractor_HipTensor<data_t>::prof_report(
+    const char *entrypoint) {
+  const uint_t slices_local = slice_end_ - slice_begin_;
+  // This rank contracts slices_local of num_slices; attribute that fraction of
+  // the plan's total FLOPs to it for an honest per-rank throughput. Guard the
+  // divide: a rank-0 scalar output can plan to num_slices==0/1.
+  const double local_flops =
+      (plan_.num_slices > 0)
+          ? plan_.total_flops * (double)slices_local / (double)plan_.num_slices
+          : plan_.total_flops;
+  const double contract_s = prof_contract_ms_ / 1000.0;
+  const double gflops =
+      (contract_s > 0.0) ? (local_flops / contract_s / 1.0e9) : 0.0;
+  const double t_total = prof_setup_ms_ + prof_contract_ms_ +
+                         prof_reduce_gpu_ms_ + prof_reduce_mpi_ms_;
+  fprintf(stderr,
+          "[AER_TN_PROFILE] entry=%s rank=%d nprocs=%d ndev=%d slices=%lu "
+          "slices_local=%lu plan_flops=%.3e local_flops=%.3e "
+          "t_setup_ms=%.3f t_path_ms=%.3f t_contract_ms=%.3f "
+          "t_reduce_gpu_ms=%.3f t_reduce_mpi_ms=%.3f t_total_ms=%.3f "
+          "gflops_local=%.3f out_size=%lu\n",
+          entrypoint, myrank_, nprocs_, num_devices_used_,
+          (unsigned long)plan_.num_slices, (unsigned long)slices_local,
+          plan_.total_flops, local_flops, prof_setup_ms_, prof_path_ms_,
+          prof_contract_ms_, prof_reduce_gpu_ms_, prof_reduce_mpi_ms_, t_total,
+          gflops, (unsigned long)out_size_);
+}
+
+template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract(
     std::vector<std::complex<data_t>> &out) {
   // Each device holds the partial sum of its assigned slice range after
@@ -1711,8 +1813,13 @@ void TensorNetContractor_HipTensor<data_t>::contract(
   int local_failed = 0;
   std::string local_msg;
   try {
+    std::chrono::steady_clock::time_point pt;
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
     contract_all();
+    if (tn_profile()) { prof_sync_devices(); prof_contract_ms_ += tn_ms_since(pt); }
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
     accumulate_across_gpus();
+    if (tn_profile()) { prof_sync_devices(); prof_reduce_gpu_ms_ += tn_ms_since(pt); }
   } catch (const std::exception &e) {
     local_failed = 1;
     local_msg = e.what();
@@ -1731,13 +1838,24 @@ void TensorNetContractor_HipTensor<data_t>::contract(
             myrank_, out_size_, r.empty() ? 0.0 : (double)r[0].real(),
             r.empty() ? 0.0 : (double)r[0].imag());
   } else {
+    std::chrono::steady_clock::time_point pt;
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
     accumulate_across_mpi();
+    if (tn_profile()) prof_reduce_mpi_ms_ += tn_ms_since(pt);
   }
 #else
-  contract_all();
-  accumulate_across_gpus();
+  {
+    std::chrono::steady_clock::time_point pt;
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
+    contract_all();
+    if (tn_profile()) { prof_sync_devices(); prof_contract_ms_ += tn_ms_since(pt); }
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
+    accumulate_across_gpus();
+    if (tn_profile()) { prof_sync_devices(); prof_reduce_gpu_ms_ += tn_ms_since(pt); }
+  }
 #endif
   gpu_mgr_.primary().get_output(out);
+  if (tn_profile()) prof_report("contract");
 }
 
 template <typename data_t>
@@ -1750,24 +1868,38 @@ double TensorNetContractor_HipTensor<data_t>::contract_and_trace(uint_t num_qubi
   int local_failed = 0;
   std::string local_msg;
   try {
+    std::chrono::steady_clock::time_point pt;
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
     contract_all();
+    if (tn_profile()) { prof_sync_devices(); prof_contract_ms_ += tn_ms_since(pt); }
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
     for (int idev = 0; idev < num_devices_used_; idev++)
       ret += gpu_mgr_.device(idev).trace_output(num_qubits);
+    if (tn_profile()) prof_reduce_gpu_ms_ += tn_ms_since(pt);
   } catch (const std::exception &e) {
     local_failed = 1;
     local_msg = e.what();
   }
   agree_or_fail_together(local_failed, local_msg);
   if (nprocs_ > 1) {
+    std::chrono::steady_clock::time_point pt;
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
     double sum = ret;
     MPI_Allreduce(&sum, &ret, 1, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD);
+    if (tn_profile()) prof_reduce_mpi_ms_ += tn_ms_since(pt);
   }
+  if (tn_profile()) prof_report("contract_and_trace");
   return ret;
 #else
+  std::chrono::steady_clock::time_point pt;
+  if (tn_profile()) pt = std::chrono::steady_clock::now();
   contract_all();
+  if (tn_profile()) { prof_sync_devices(); prof_contract_ms_ += tn_ms_since(pt); }
   double ret = 0.0;
+  if (tn_profile()) pt = std::chrono::steady_clock::now();
   for (int idev = 0; idev < num_devices_used_; idev++)
     ret += gpu_mgr_.device(idev).trace_output(num_qubits);
+  if (tn_profile()) { prof_reduce_gpu_ms_ += tn_ms_since(pt); prof_report("contract_and_trace"); }
   return ret;
 #endif
 }
@@ -1782,18 +1914,36 @@ double TensorNetContractor_HipTensor<data_t>::contract_and_sample_measure(
   int local_failed = 0;
   std::string local_msg;
   try {
+    std::chrono::steady_clock::time_point pt;
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
     contract_all();
+    if (tn_profile()) { prof_sync_devices(); prof_contract_ms_ += tn_ms_since(pt); }
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
     accumulate_across_gpus();
+    if (tn_profile()) { prof_sync_devices(); prof_reduce_gpu_ms_ += tn_ms_since(pt); }
   } catch (const std::exception &e) {
     local_failed = 1;
     local_msg = e.what();
   }
   agree_or_fail_together(local_failed, local_msg);
-  accumulate_across_mpi();
+  {
+    std::chrono::steady_clock::time_point pt;
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
+    accumulate_across_mpi();
+    if (tn_profile()) prof_reduce_mpi_ms_ += tn_ms_since(pt);
+  }
 #else
-  contract_all();
-  accumulate_across_gpus();
+  {
+    std::chrono::steady_clock::time_point pt;
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
+    contract_all();
+    if (tn_profile()) { prof_sync_devices(); prof_contract_ms_ += tn_ms_since(pt); }
+    if (tn_profile()) pt = std::chrono::steady_clock::now();
+    accumulate_across_gpus();
+    if (tn_profile()) { prof_sync_devices(); prof_reduce_gpu_ms_ += tn_ms_since(pt); }
+  }
 #endif
+  if (tn_profile()) prof_report("contract_and_sample_measure");
   return sample_measure_on_primary(samples, rnds, num_qubits);
 }
 
