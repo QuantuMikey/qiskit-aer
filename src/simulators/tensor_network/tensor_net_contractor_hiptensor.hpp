@@ -1496,7 +1496,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
       // contract_single_slice to pack the operand into scratch (inputs) or
       // scatter the packed result back (output). Value-identical to the direct
       // strided path -- proved bit-exact on CPU, prove_operand_staging.py.
-      const uint64_t stride_ceiling = max_tiled_elements();
+      const uint64_t stride_ceiling = ck_stage_stride_ceiling();
       size_t nstaged = 0;
       for (auto &t : step_plan_specs_[step].tiles) {
         stage_operand_if_needed(t.strides_a, t.extents_a, stride_ceiling,

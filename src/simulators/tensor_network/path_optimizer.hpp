@@ -256,6 +256,39 @@ static uint64_t max_tiled_elements() {
   return cached;
 }
 
+// Fixed CK-safe descriptor STRIDE ceiling that triggers operand staging in the
+// contractor. DECOUPLED from max_tiled_elements() (which clamps the slicing
+// target): a tiled sub-block whose max free-mode stride reaches THIS value is
+// packed into contiguous scratch instead of handed to hipTensor, which faults
+// building a plan on strided views this large. Kept separate because raising the
+// per-slice peak target (AER_TN_MAX_TILED_ELEMENTS) to reduce slice count must
+// NOT also raise the staging trigger -- otherwise the larger descriptors slip
+// UNDER the trigger and fault CK (observed: sweep 19756385, every over-ceiling
+// step went direct to CK because the trigger tracked the raised ceiling). The
+// default is 2^16: bit-exact vs statevector at stride 2^15, CK faults by ~2^18.
+// Lowering it (e.g. AER_TN_CK_STRIDE_CEILING=8192 for testing) forces smaller
+// descriptors through staging on a circuit that finishes quickly.
+static uint64_t ck_stage_stride_ceiling() {
+  static bool checked = false;
+  static uint64_t cached = 65536;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_CK_STRIDE_CEILING");
+    if (val != nullptr) {
+      char *end = nullptr;
+      unsigned long long parsed = std::strtoull(val, &end, 10);
+      if (end != val && parsed > 0)
+        cached = static_cast<uint64_t>(parsed);
+      else
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: AER_TN_CK_STRIDE_CEILING='%s' is not a "
+                "positive integer; using default %llu.\n",
+                val, (unsigned long long)cached);
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // Cotengra search objective, from AER_TN_MINIMIZE. "combo" (default) minimizes
 // FLOPs+write; it can select plans with very wide single steps (huge
 // intermediates) that then require deep m6n6k6 tiling -- the multi-GCD crash
