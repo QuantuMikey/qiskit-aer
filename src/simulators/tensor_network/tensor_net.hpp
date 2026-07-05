@@ -20,6 +20,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1329,12 +1330,47 @@ void TensorNet<data_t>::sample_measure_branch(
      closed             contract here     branch by probs    fixed probs
   ----------------------------------------------------------------------------*/
 
-  uint_t nqubits = num_sampling_qubits_;
-  uint_t nqubits_branch = num_sampling_qubits_;
+  // aer-0017: drop-in >8-qubit sampling. The per-chunk sample output is DOUBLED
+  // (2^(2*nqubits) diagonal readout; set_output at modes_out(nqubits*2) below),
+  // so a chunk wider than the output-feasibility ceiling allows makes the path
+  // optimizer refuse (open output modes cannot be sliced). The measured qubits
+  // are drawn in chunks of num_sampling_qubits_ by EXACT conditional sampling
+  // (sample a chunk marginally, recurse conditioned on the outcome), so a
+  // SMALLER chunk is mathematically identical -- it only yields more, shot-
+  // bounded branches. Clamp the effective chunk to the largest k with
+  // 2^(2k) <= the same ceiling the gate uses (AER_TN_MAX_OUTPUT_ELEMENTS,
+  // default 2^16, floored at one m6n6k6 result 2^12). At defaults this caps the
+  // chunk at 8 qubits, so an unmodified measure_all on >8 qubits now samples
+  // drop-in instead of refusing. Circuits already feasible (chunk <= 8) are
+  // unchanged, since num_qubits_ % 10 already exceeded the ceiling for >8q.
+  uint_t eff_sampling = num_sampling_qubits_;
+  {
+    uint64_t out_ceiling = static_cast<uint64_t>(1) << 16;
+    if (const char *v = std::getenv("AER_TN_MAX_OUTPUT_ELEMENTS")) {
+      char *end = nullptr;
+      unsigned long long parsed = std::strtoull(v, &end, 10);
+      if (end != v && parsed > 0)
+        out_ceiling = static_cast<uint64_t>(parsed);
+    }
+    const uint64_t out_floor = static_cast<uint64_t>(1) << 12;
+    if (out_ceiling < out_floor)
+      out_ceiling = out_floor;
+    uint_t max_chunk = 1;
+    while (max_chunk < 31 &&
+           (static_cast<uint64_t>(1) << (2 * (max_chunk + 1))) <= out_ceiling)
+      max_chunk++;
+    if (eff_sampling > max_chunk)
+      eff_sampling = max_chunk;
+    if (eff_sampling < 1)
+      eff_sampling = 1;
+  }
+
+  uint_t nqubits = eff_sampling;
+  uint_t nqubits_branch = eff_sampling;
   if (pos_measured == num_qubits_) { // this is 1st call
-    nqubits = num_qubits_ % num_sampling_qubits_;
+    nqubits = num_qubits_ % eff_sampling;
     if (nqubits == 0)
-      nqubits = num_sampling_qubits_;
+      nqubits = eff_sampling;
     nqubits_branch = 0;
   } else {
     if (nqubits > pos_measured)
