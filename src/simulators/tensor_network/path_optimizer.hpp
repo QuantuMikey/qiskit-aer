@@ -596,22 +596,36 @@ public:
     // elements. Two ceilings apply: the device-memory budget (we must fit
     // at all) and the m6n6k6 kernel-envelope budget (every per-step
     // descriptor must stay inside hipTensor's only kernel shape). The
-    // Three bounds on the per-slice peak intermediate; the smallest wins:
+    // Two bounds on the per-slice peak intermediate; the smaller wins:
     //   (1) device memory (must fit VRAM at all);
     //   (2) the optional AER_TN_SLICE_TARGET_BYTES envelope -- a user knob to
-    //       slice HARDER for less per-slice memory. Its default is slack (2 MB,
-    //       above the CK-safe volume), so it does not bind unless set; and
-    //   (3) the CK-safe tiled-operand volume, max_tiled_elements() -- the
-    //       AUTHORITATIVE default clamp. Slicing the per-slice peak down to this
-    //       volume is exactly what keeps every tiled step's strided-view
-    //       descriptor inside the stride hipTensor/CK can build (see
-    //       max_tiled_elements). AER_TN_SLICE_TARGET_BYTES can only slice
-    //       harder, never raise the peak past what CK can tile.
+    //       slice HARDER for less per-slice memory. Its default is slack (2 MB),
+    //       so it does not bind unless set.
+    //
+    // The per-slice peak is NO LONGER clamped to the m6n6k6 tiled-operand
+    // volume (max_tiled_elements()). Before operand staging (aer-0010/0011)
+    // that clamp was mandatory: it sliced the peak down until every tiled
+    // step's strided-view descriptor stayed inside the stride hipTensor/CK
+    // could build a plan on. Staging removed that requirement -- a tiled
+    // sub-block whose free-mode stride reaches ck_stage_stride_ceiling() is
+    // packed into contiguous scratch, contracted, and scattered back, so CK
+    // never sees the over-ceiling strided view. Clamping to max_tiled_elements
+    // here only forced a needlessly high slice count (the slice-grind): the
+    // peak is now governed by memory, and any resulting over-ceiling tiled
+    // descriptor is carried by tiling + staging. Under AUTO the first oversized
+    // step in prebuild (setup_pool_and_cache) throws NeedsTilingException and
+    // the driver re-plans once with tiling engaged; under OFF an oversized step
+    // still refuses (unchanged), since a peak above one m6n6k6 kernel cannot be
+    // contracted without tiling regardless of this clamp. This is what lets a
+    // hard circuit pick a low-slice plan automatically -- drop-in, no flags.
+    //
+    // The output-feasibility gate below still uses max_tiled_elements() as the
+    // hard cap on the (unsliceable) OUTPUT tensor; that is intentionally left
+    // in place here and decoupled separately.
     uint64_t target_elements = memory_limit_bytes / element_size_bytes_;
     uint64_t envelope_elements =
         std::max<uint64_t>(1, slice_target_bytes() / element_size_bytes_);
     target_elements = std::min(target_elements, envelope_elements);
-    target_elements = std::min(target_elements, max_tiled_elements());
 
     // --- Output feasibility & the m6n6k6 tiling ceiling -------------------
     //
@@ -957,16 +971,19 @@ public:
     }
 
     best.num_slices = 1;
-    // Same two-ceiling budget as the cotengra path: device memory and the
-    // m6n6k6 envelope, in elements (16 bytes per logical complex element),
-    // plus the hard m6n6k6 tiling ceiling (see max_tiled_elements).
+    // Same memory-governed budget as the cotengra path (aer-0013): device
+    // memory and the optional AER_TN_SLICE_TARGET_BYTES envelope, in elements
+    // (16 bytes per logical complex element). The per-slice peak is NOT clamped
+    // to max_tiled_elements() -- an over-ceiling tiled descriptor is carried by
+    // tiling + operand staging (aer-0010/0011), and the m6n6k6 envelope is
+    // enforced by tiling at execution, not by over-slicing here. Keeping this
+    // in sync with the cotengra path avoids a latent slice-grind on the greedy
+    // fallback.
     int64_t element_budget =
         static_cast<int64_t>(memory_limit_bytes / 16);
     int64_t envelope_budget =
         std::max<int64_t>(1, static_cast<int64_t>(slice_target_bytes() / 16));
     element_budget = std::min(element_budget, envelope_budget);
-    element_budget =
-        std::min(element_budget, static_cast<int64_t>(max_tiled_elements()));
     // Output (open) modes must never be sliced -- the sliced engine sums
     // slices, correct only for summed bonds (mirrors the cotengra path's
     // allow_outer=false and extract_plan's guard).
