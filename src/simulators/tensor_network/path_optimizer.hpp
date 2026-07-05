@@ -156,17 +156,19 @@ static std::string path_optlib() {
 }
 
 // Per-slice peak-intermediate budget in BYTES, from AER_TN_SLICE_TARGET_BYTES.
-// Default derives from the hipTensor m6n6k6 envelope: a kernel-fitting step
-// has intermediate rank <= 12, so peak per-slice intermediate is at most
-// 2^12 = 4096 elements; one logical complex element occupies 16 bytes
-// (double, split-complex: two 8-byte real planes), giving 65536 bytes. The
-// budget converts to a cotengra `target_size` in ELEMENTS using each
-// optimizer's element size, so a single value covers float and double.
-// Lower it to slice harder (e.g. when interior steps still trip the K<=6
-// limit); raise it only if a future hipTensor ships higher kernels.
+// This is an OPTIONAL user knob to slice HARDER (smaller per-slice memory); the
+// authoritative default per-slice clamp is the CK-safe tiled-operand volume,
+// max_tiled_elements() (see below). The default here is therefore slack --
+// 2097152 bytes = 131072 elements at 16 bytes per logical complex element
+// (double, split-complex: two 8-byte real planes), above the 2^16 CK-safe
+// volume -- so this envelope does NOT bind unless the user sets it. The budget
+// converts to a cotengra `target_size` in ELEMENTS using each optimizer's
+// element size, so a single value covers float and double. Lower it to slice
+// harder (e.g. to shrink per-slice memory); it can only slice harder, never
+// raise the per-slice peak past max_tiled_elements().
 static uint64_t slice_target_bytes() {
   static bool checked = false;
-  static uint64_t cached = 65536;
+  static uint64_t cached = 2097152;
   if (!checked) {
     const char *val = std::getenv("AER_TN_SLICE_TARGET_BYTES");
     if (val != nullptr) {
@@ -188,8 +190,10 @@ static uint64_t slice_target_bytes() {
 
 // Free-mode envelope of hipTensor's only kernel shape: m6n6k6 admits at most
 // 6 M-modes + 6 N-modes per contraction, so one kernel result holds at most
-// 2^12 = 4096 elements. This count grounds both the tiling ceiling below and
-// the planner's oversized-output gate.
+// 2^12 = 4096 elements. This count is one single-kernel result: it grounds the
+// planner's oversized-output gate and the FLOOR of the tiling ceiling below (a
+// tiled operand can never be smaller than one kernel result), but no longer the
+// ceiling's DEFAULT, which is now the hardware-validated CK-safe volume.
 static constexpr size_t kMaxFreeModes = 12; // 6 M-modes + 6 N-modes (m6n6k6)
 
 // Hard ceiling, in ELEMENTS, on any tensor a TILED step may touch. Tiling
@@ -200,17 +204,26 @@ static constexpr size_t kMaxFreeModes = 12; // 6 M-modes + 6 N-modes (m6n6k6)
 // at stride ~= volume/2). Bounding every tiled operand's volume therefore
 // bounds its descriptor stride and keeps every block inside what CK can build.
 //
-// The DEFAULT is DERIVED from the kernel shape (2^kMaxFreeModes), the most
-// conservative bound -- at this size a tile descriptor's max stride is <= 2^11,
-// far below anything observed to fault. It is not a measured magic number.
-// Raise AER_TN_MAX_TILED_ELEMENTS only after empirically validating that
-// descriptors at the larger size both build and compute correctly on the
-// target hipTensor build (observed safe to 2^16 on ROCm 6.4.2 / gfx90a; a 2^18
-// descriptor faults). Raising it also admits larger non-sliceable outputs
-// (e.g. full-statevector extraction above 12 qubits).
+// The DEFAULT is 2^16 = 65536 elements: the largest tiled-operand volume
+// empirically validated CK-safe on ROCm 6.4.2 / gfx90a. At this size a tile
+// descriptor's max free-mode stride is <= 2^15, which produces bit-exact
+// results vs statevector (4x4 periodic QAOA <Z0Z1>, |TN-SV| ~ 1e-16). A ceiling
+// sweep (job 19751464) found CK plan creation still succeeds at per-slice peak
+// 2^18 but FAULTS (GPU memory access fault, during prebuild descriptor/plan
+// creation) at 2^20; correctness above 2^15 stride is unvalidated, so the
+// default stays at the validated bound rather than the survives-prebuild bound.
+// The earlier kernel-derived default (2^kMaxFreeModes = 4096) was far below
+// this and forced a catastrophic slice-grind on any circuit whose natural peak
+// exceeded 4096 (e.g. the 4x4 grid above sliced to 2^15 slices). Raise
+// AER_TN_MAX_TILED_ELEMENTS above 2^16 only after validating that descriptors
+// at the larger size both build AND compute correctly on the target hipTensor
+// build; increment B (operand staging) removes this ceiling's correctness role
+// by routing oversized-stride steps through packed scratch. Raising it also
+// admits larger non-sliceable outputs (e.g. an 8-qubit reduced density matrix,
+// 4^8 = 65536, or full-statevector extraction above 12 qubits).
 static uint64_t max_tiled_elements() {
   static bool checked = false;
-  static uint64_t cached = (static_cast<uint64_t>(1) << kMaxFreeModes); // 4096
+  static uint64_t cached = 65536; // 2^16, hardware-validated CK-safe (see above)
   if (!checked) {
     const char *val = std::getenv("AER_TN_MAX_TILED_ELEMENTS");
     if (val != nullptr) {
@@ -550,17 +563,21 @@ public:
     // elements. Two ceilings apply: the device-memory budget (we must fit
     // at all) and the m6n6k6 kernel-envelope budget (every per-step
     // descriptor must stay inside hipTensor's only kernel shape). The
-    // envelope is by far the tighter bound on LUMI (4 Ki elements vs ~7 Gi);
-    // taking the min keeps the memory bound authoritative for tiny GPUs and
-    // makes the planner's behavior identical on every node class otherwise.
+    // Three bounds on the per-slice peak intermediate; the smallest wins:
+    //   (1) device memory (must fit VRAM at all);
+    //   (2) the optional AER_TN_SLICE_TARGET_BYTES envelope -- a user knob to
+    //       slice HARDER for less per-slice memory. Its default is slack (2 MB,
+    //       above the CK-safe volume), so it does not bind unless set; and
+    //   (3) the CK-safe tiled-operand volume, max_tiled_elements() -- the
+    //       AUTHORITATIVE default clamp. Slicing the per-slice peak down to this
+    //       volume is exactly what keeps every tiled step's strided-view
+    //       descriptor inside the stride hipTensor/CK can build (see
+    //       max_tiled_elements). AER_TN_SLICE_TARGET_BYTES can only slice
+    //       harder, never raise the peak past what CK can tile.
     uint64_t target_elements = memory_limit_bytes / element_size_bytes_;
     uint64_t envelope_elements =
         std::max<uint64_t>(1, slice_target_bytes() / element_size_bytes_);
     target_elements = std::min(target_elements, envelope_elements);
-
-    // Hard m6n6k6 tiling ceiling (see max_tiled_elements). Independent of the
-    // memory and slice budgets above: AER_TN_SLICE_TARGET_BYTES can only slice
-    // HARDER, never raise the per-slice peak past what CK can tile.
     target_elements = std::min(target_elements, max_tiled_elements());
 
     // --- Output feasibility & the m6n6k6 tiling ceiling -------------------
