@@ -367,13 +367,19 @@ static std::string path_minimize() {
 // without recompiling. The HyperOptimizer stops at whichever of these two
 // limits it reaches first: max_repeats hyperopt trials, or max_time seconds
 // of wall clock. More trials (or more time) tends to find a cheaper
-// contraction at the cost of longer planning. Defaults match the historical
-// hardcoded values (128 trials / 60 s). Lower them for fast iteration; raise
-// them for a hard high-treewidth network where plan quality dominates
-// execution. Read once and cached, so a process uses one consistent budget.
+// contraction at the cost of longer planning. Default is 64 trials / 30 s
+// (aer-0021): a per-amplitude budget sweep (5 repeats/budget, 25q + 36q,
+// natural slicing) showed the historical 128/60 to be over-provisioned --
+// path search is 70-90% of wall, and 64/30 finds the same-quality plan (stable
+// num_slices across all repeats) in ~1.6x less search time. Going below 64/30
+// begins to draw over-sliced plans on a single search (mitigated on multi-GCD
+// by the MINLOC best-of-ranks), so 64/30 is the conservative knee. Lower them
+// for fast iteration; raise toward 128/60 for a hard high-treewidth network
+// where plan quality dominates. Read once and cached, so a process uses one
+// consistent budget.
 static int path_max_repeats() {
   static bool checked = false;
-  static int cached = 128;
+  static int cached = 64;
   if (!checked) {
     const char *val = std::getenv("AER_TN_PATH_MAX_REPEATS");
     if (val != nullptr) {
@@ -395,7 +401,7 @@ static int path_max_repeats() {
 
 static double path_max_time() {
   static bool checked = false;
-  static double cached = 60.0;
+  static double cached = 30.0;
   if (!checked) {
     const char *val = std::getenv("AER_TN_PATH_MAX_TIME");
     if (val != nullptr) {
