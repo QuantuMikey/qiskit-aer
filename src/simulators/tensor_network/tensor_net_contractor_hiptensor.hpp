@@ -720,6 +720,11 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   std::vector<std::vector<int32_t>> prev_modes_;
   std::vector<std::vector<int64_t>> prev_extents_;
   bool prev_valid_;
+  // Tiling-engaged state the cached plan was built with. A reused plan must be
+  // set up with the same engaged value; otherwise setup_pool_and_cache re-trips
+  // the m6n6k6 gate (throwing NeedsTilingException) on a plan that needed
+  // tiling, forcing a wasteful re-plan and defeating the cache.
+  bool prev_engaged_;
 
 public:
   TensorNetContractor_HipTensor();
@@ -810,7 +815,7 @@ TensorNetContractor_HipTensor<data_t>::TensorNetContractor_HipTensor()
     : num_devices_used_(1), add_sp_tensors_(true), num_base_tensors_(0),
       num_additional_tensors_(0), out_size_(0), plan_valid_(false),
       slice_begin_(0), slice_end_(0), nprocs_(1), myrank_(0),
-      pool_ready_(false), prev_valid_(false) {}
+      pool_ready_(false), prev_valid_(false), prev_engaged_(false) {}
 
 template <typename data_t>
 TensorNetContractor_HipTensor<data_t>::~TensorNetContractor_HipTensor() {}
@@ -1092,6 +1097,11 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
   while (true) {
     try {
       if (prev_valid_ && plan_valid_ && topology_matches_previous()) {
+        // Restore the tiling state this plan was planned/set-up with. engaged is
+        // re-initialized to false each setup (AUTO + scalar output), so without
+        // this a tiled plan would re-trip the m6n6k6 gate below and force a
+        // needless re-plan -- the reuse must skip the search AND the re-setup.
+        engaged = prev_engaged_;
         if (tn_verbose() && myrank_ == 0)
           fprintf(stderr, "[AER_TN] reusing previous contraction path\n");
       } else {
@@ -1143,6 +1153,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
         plan_valid_ = true;
         pool_ready_ = false;
         cache_topology();
+        prev_engaged_ = engaged;
       }
 
       build_sliced_specs();
