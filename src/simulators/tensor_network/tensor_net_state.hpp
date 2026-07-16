@@ -614,17 +614,21 @@ void State<tensor_net_t>::apply_save_amplitudes(const Operations::Op &op,
         "Invalid save_amplitudes instructions (empty params).");
   }
   const int_t size = op.int_params.size();
+  // One contractor for the whole amplitude batch: the path search (dominant on
+  // the tensor-network method) is paid once for the instruction, not per x.
+  std::vector<complex_t> batch;
+  BaseState::qreg_.get_amplitudes(op.int_params, batch);
   if (op.type == Operations::OpType::save_amps) {
     Vector<complex_t> amps(size, false);
     for (int_t i = 0; i < size; ++i) {
-      amps[i] = BaseState::qreg_.get_amplitude(op.int_params[i]);
+      amps[i] = batch[i];
     }
     result.save_data_pershot(BaseState::creg(), op.string_params[0],
                              std::move(amps), op.type, op.save_type);
   } else {
     rvector_t amps_sq(size, 0);
     for (int_t i = 0; i < size; ++i) {
-      amps_sq[i] = BaseState::qreg_.probability(op.int_params[i]);
+      amps_sq[i] = std::real(batch[i] * std::conj(batch[i]));
     }
     result.save_data_average(BaseState::creg(), op.string_params[0],
                              std::move(amps_sq), op.type, op.save_type);

@@ -498,11 +498,14 @@ void Executor<state_t>::apply_save_amplitudes(CircuitExecutor::Branch &root,
         "Invalid save_amplitudes instructions (empty params).");
   }
   const uint_t size = op.int_params.size();
+  // One contractor for the whole amplitude batch: the path search (dominant on
+  // the tensor-network method) is paid once for the instruction, not per x.
+  std::vector<complex_t> batch;
+  Base::states_[root.state_index()].qreg().get_amplitudes(op.int_params, batch);
   if (op.type == Operations::OpType::save_amps) {
     Vector<complex_t> amps(size, false);
     for (uint_t i = 0; i < size; ++i) {
-      amps[i] =
-          Base::states_[root.state_index()].qreg().get_amplitude(op.int_params[i]);
+      amps[i] = batch[i];
     }
     for (uint_t i = 0; i < root.num_shots(); i++) {
       uint_t ip = root.param_index(i);
@@ -514,8 +517,7 @@ void Executor<state_t>::apply_save_amplitudes(CircuitExecutor::Branch &root,
   } else {
     rvector_t amps_sq(size, 0);
     for (uint_t i = 0; i < size; ++i) {
-      amps_sq[i] = Base::states_[root.state_index()].qreg().probability(
-          op.int_params[i]);
+      amps_sq[i] = std::real(batch[i] * std::conj(batch[i]));
     }
     std::vector<bool> copied(Base::num_bind_params_, false);
     for (uint_t i = 0; i < root.num_shots(); i++) {

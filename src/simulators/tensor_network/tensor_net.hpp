@@ -120,6 +120,15 @@ public:
   // materialise the whole vector) remain for save_statevector only.
   std::complex<data_t> get_amplitude(uint_t pos) const;
 
+  // Batched amplitudes: compute <x|U|0> for every x in positions with ONE
+  // contractor. Every amplitude shares the same network topology (the per-x
+  // one-hot selectors differ only in value, not modes/extents), so the
+  // contraction path is identical; reusing one contractor lets
+  // setup_contraction reuse the cached path for x[1..] and skip the (dominant)
+  // cotengra search. Result i corresponds to positions[i].
+  void get_amplitudes(const std::vector<uint_t> &positions,
+                      std::vector<complex_t> &out) const;
+
   //-----------------------------------------------------------------------
   // Utility functions
   //-----------------------------------------------------------------------
@@ -517,6 +526,66 @@ std::complex<data_t> TensorNet<data_t>::get_amplitude(uint_t pos) const {
   delete contractor;
 
   return out.empty() ? std::complex<data_t>(0.0, 0.0) : out[0];
+}
+
+template <typename data_t>
+void TensorNet<data_t>::get_amplitudes(
+    const std::vector<uint_t> &positions,
+    std::vector<complex_t> &out) const {
+  if (is_density_matrix_) {
+    throw std::invalid_argument(
+        "TensorNet save_amplitudes are not allowed to use with density matrix "
+        "operations.");
+  }
+  out.assign(positions.size(), complex_t(0.0, 0.0));
+  if (positions.empty())
+    return;
+
+  // ONE contractor for the whole batch. Each amplitude appends a fresh set of
+  // one-hot selector leaves whose modes/extents are identical across x (only
+  // the [1,0]/[0,1] values differ), so topology_matches_previous() holds and
+  // setup_contraction skips the cotengra path search for every amplitude after
+  // the first. set_network() re-uploads each amplitude's selector values, so
+  // the reused path contracts the correct data. In MPI every rank sees the
+  // same identical topology and skips the search together, so there is no
+  // collective divergence. This pays the (dominant) path search once per
+  // save_amplitudes instruction instead of once per amplitude.
+  TensorNetContractor<data_t> *contractor;
+  create_contractor(contractor);
+
+  // Scalar (rank-0) output, identical for every amplitude; set once. WS-1:
+  // set_output() precedes set_network() so the orphan-drop mask sees the
+  // (empty) output-mode set.
+  std::vector<int32_t> modes_out;
+  std::vector<int64_t> extents_out;
+  contractor->set_output(modes_out, extents_out);
+
+  for (size_t k = 0; k < positions.size(); k++) {
+    const uint_t pos = positions[k];
+    std::vector<std::shared_ptr<Tensor<data_t>>> net = tensors_;
+    for (uint_t q = 0; q < num_qubits_; q++) {
+      uint_t bit = (pos >> q) & 1ull;
+      std::vector<std::complex<data_t>> onehot(2,
+                                               std::complex<data_t>(0.0, 0.0));
+      onehot[bit] = std::complex<data_t>(1.0, 0.0);
+      std::shared_ptr<Tensor<data_t>> sel = std::make_shared<Tensor<data_t>>();
+      sel->set(static_cast<int>(q), onehot);
+      sel->modes()[0] = modes_qubits_[q];
+      net.push_back(sel);
+    }
+    contractor->set_network(net, false);
+    contractor->setup_contraction(use_cuTensorNet_autotuning_);
+    last_num_slices_ = contractor->num_slices();
+
+    std::vector<std::complex<data_t>> amp;
+    contractor->contract(amp);
+    // amp holds native-precision std::complex<data_t>; the save format is
+    // complex_t (double), so widen explicitly, matching what the previous
+    // per-amplitude get_amplitude() -> complex_t assignment did.
+    out[k] = amp.empty() ? complex_t(0.0, 0.0) : complex_t(amp[0]);
+  }
+
+  delete contractor;
 }
 
 template <typename data_t>
