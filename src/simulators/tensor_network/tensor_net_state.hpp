@@ -147,6 +147,14 @@ public:
   virtual double expval_pauli(const reg_t &qubits,
                               const std::string &pauli) override;
 
+  // TN-local replacement for QuantumState::Base::apply_save_expval, which loops
+  // expval_pauli() once per Pauli term (state.hpp). Every term of one
+  // instruction shares an identical network topology, so a single contractor can
+  // serve the whole term list and pay the cotengra path search once instead of
+  // once per term. Accumulation and save format are identical to the base.
+  void apply_save_expval_batched(const Operations::Op &op,
+                                 ExperimentResult &result);
+
   //-----------------------------------------------------------------------
   // Additional methods
   //-----------------------------------------------------------------------
@@ -492,7 +500,7 @@ void State<tensor_net_t>::apply_op(const Operations::Op &op,
       break;
     case OpType::save_expval:
     case OpType::save_expval_var:
-      BaseState::apply_save_expval(op, result);
+      apply_save_expval_batched(op, result);
       break;
     case OpType::save_densmat:
       apply_save_density_matrix(op, result);
@@ -543,6 +551,43 @@ template <class tensor_net_t>
 double State<tensor_net_t>::expval_pauli(const reg_t &qubits,
                                          const std::string &pauli) {
   return BaseState::qreg_.expval_pauli(qubits, pauli);
+}
+
+template <class tensor_net_t>
+void State<tensor_net_t>::apply_save_expval_batched(const Operations::Op &op,
+                                                    ExperimentResult &result) {
+  if (op.expval_params.empty()) {
+    throw std::invalid_argument(
+        "Invalid save expval instruction (Pauli components are empty).");
+  }
+  const bool variance = (op.type == OpType::save_expval_var);
+
+  std::vector<std::string> paulis;
+  paulis.reserve(op.expval_params.size());
+  for (const auto &param : op.expval_params)
+    paulis.push_back(std::get<0>(param));
+
+  std::vector<double> vals;
+  BaseState::qreg_.expval_pauli_batch(op.qubits, paulis, vals);
+
+  double expval = 0.0;
+  double sq_expval = 0.0;
+  for (size_t k = 0; k < op.expval_params.size(); k++) {
+    expval += std::get<1>(op.expval_params[k]) * vals[k];
+    if (variance)
+      sq_expval += std::get<2>(op.expval_params[k]) * vals[k];
+  }
+
+  if (variance) {
+    std::vector<double> expval_var(2);
+    expval_var[0] = expval;
+    expval_var[1] = sq_expval - expval * expval;
+    result.save_data_average(BaseState::creg(), op.string_params[0], expval_var,
+                             op.type, op.save_type);
+  } else {
+    result.save_data_average(BaseState::creg(), op.string_params[0], expval,
+                             op.type, op.save_type);
+  }
 }
 
 template <class tensor_net_t>

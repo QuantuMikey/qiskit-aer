@@ -317,6 +317,20 @@ public:
   double expval_pauli(const reg_t &qubits, const std::string &pauli,
                       const complex_t initial_phase = 1.0) const;
 
+  // Batched variant: evaluate several Pauli strings over the SAME qubit list
+  // with ONE contractor. Every string of a single save_expval instruction
+  // produces additional-tensor leaves with identical modes and extents (2x2
+  // matrices whose VALUES differ with I/X/Y/Z but whose topology does not), so
+  // topology_matches_previous() holds and setup_contraction skips the cotengra
+  // path search -- and, because it stays inside the cache branch, also the
+  // hipTensor workspace probe and the pool/plan build -- for every string after
+  // the first. Same mechanism as get_amplitudes (aer-0019 + aer-0020), lifted
+  // from the amplitude batch to the Pauli-term loop.
+  void expval_pauli_batch(const reg_t &qubits,
+                          const std::vector<std::string> &paulis,
+                          std::vector<double> &out,
+                          const complex_t initial_phase = 1.0) const;
+
   //-----------------------------------------------------------------------
   // JSON configuration settings
   //-----------------------------------------------------------------------
@@ -1731,6 +1745,145 @@ double TensorNet<data_t>::expval_pauli(const reg_t &qubits,
   }
 
   return expval;
+}
+
+template <typename data_t>
+void TensorNet<data_t>::expval_pauli_batch(
+    const reg_t &qubits, const std::vector<std::string> &paulis,
+    std::vector<double> &out, const complex_t initial_phase) const {
+  out.assign(paulis.size(), 0.0);
+  if (paulis.empty())
+    return;
+
+  const uint_t size = qubits.size();
+
+  // Validate every string BEFORE the network is rewired below. The single-term
+  // expval_pauli() can throw on a bad Pauli character while the network is
+  // still pristine; here the rewiring is hoisted out of the loop, so a throw
+  // from inside the loop would leave qubits_sp_ permanently mis-wired. Reject
+  // up front instead.
+  for (size_t k = 0; k < paulis.size(); k++) {
+    if (paulis[k].size() != size)
+      throw std::invalid_argument(
+          "TensorNet expval_pauli_batch: every Pauli string must cover the "
+          "instruction's qubit list.");
+    for (uint_t i = 0; i < size; i++) {
+      const char c = paulis[k][i];
+      if (c != 'I' && c != 'X' && c != 'Y' && c != 'Z')
+        throw std::invalid_argument(std::string("Invalid Pauli \"") + c + "\".");
+    }
+  }
+
+  // Mode bookkeeping is computed ONCE and replayed verbatim for every string,
+  // which is what makes the networks topologically identical and the path cache
+  // hit. tmp_index must start above the true maximum mode present anywhere in
+  // the network (bra AND conjugate ket sides); mode_index_ alone is not safe --
+  // see the CSC zero-output note in expval_pauli() above.
+  std::vector<int32_t> tmp_modes = modes_qubits_;
+  int32_t tmp_index = mode_index_;
+  for (const auto &tn : tensors_) {
+    if (!tn)
+      continue;
+    for (int32_t m : tn->modes())
+      if (m >= tmp_index)
+        tmp_index = m + 1;
+  }
+
+  std::vector<int32_t> mode_in(size), mode_out(size);
+  for (uint_t i = 0; i < size; i++) {
+    mode_in[i] = tmp_modes[qubits[i]];
+    mode_out[i] = tmp_index++;
+    tmp_modes[qubits[i]] = mode_out[i];
+  }
+
+  // Connect qubits not used for trace. Done ONCE: the search below matches
+  // modes_qubits_sp_[i], so a second pass would find nothing and silently skip,
+  // and the restore at the end is the exact inverse of this single pass.
+  for (uint_t i = 0; i < num_qubits_; i++) {
+    if (i != qubits[0]) {
+      for (int_t j = 0; j < qubits_sp_[i]->rank(); j++) {
+        if (qubits_sp_[i]->modes()[j] == modes_qubits_sp_[i]) {
+          qubits_sp_[i]->modes()[j] = tmp_modes[i];
+          break;
+        }
+      }
+    }
+  }
+
+  TensorNetContractor<data_t> *contractor;
+  create_contractor(contractor);
+  contractor->set_network(tensors_);
+  contractor->allocate_additional_tensors(size * 4);
+
+  // Output is the open 2x2 pair on qubits[0], identical for every string.
+  std::vector<int32_t> modes_out(2);
+  std::vector<int64_t> extents_out(2);
+  modes_out[0] = tmp_modes[qubits[0]];
+  modes_out[1] = modes_qubits_sp_[qubits[0]];
+  extents_out[0] = 2;
+  extents_out[1] = 2;
+  contractor->set_output(modes_out, extents_out);
+
+  cvector_t<data_t> mat_phase(4, 0.0);
+  mat_phase[0] = 1.0;
+  mat_phase[3] = initial_phase;
+
+  for (size_t k = 0; k < paulis.size(); k++) {
+    const std::string &pauli = paulis[k];
+    std::vector<std::shared_ptr<Tensor<data_t>>> pauli_tensors;
+    pauli_tensors.reserve(size);
+
+    for (uint_t i = 0; i < size; i++) {
+      cvector_t<data_t> mat(4, 0.0);
+      switch (pauli[size - 1 - i]) {
+      case 'I':
+        mat[0] = 1.0;
+        mat[3] = 1.0;
+        break;
+      case 'X':
+        mat[1] = 1.0;
+        mat[2] = 1.0;
+        break;
+      case 'Y':
+        mat[1] = {0.0, -1.0};
+        mat[2] = {0.0, 1.0};
+        break;
+      default:
+        mat[0] = 1.0;
+        mat[3] = -1.0;
+        break;
+      }
+      std::shared_ptr<Tensor<data_t>> t = std::make_shared<Tensor<data_t>>();
+      t->set(qubits[i], mat);
+      t->modes()[0] = mode_in[i];
+      t->modes()[1] = mode_out[i];
+      if (initial_phase != 1.0)
+        t->mult_matrix(mat_phase);
+      pauli_tensors.push_back(t);
+    }
+
+    contractor->set_additional_tensors(pauli_tensors);
+    contractor->setup_contraction(use_cuTensorNet_autotuning_);
+    last_num_slices_ = contractor->num_slices();
+    out[k] = contractor->contract_and_trace(1);
+
+    for (size_t i = 0; i < pauli_tensors.size(); i++)
+      pauli_tensors[i].reset();
+  }
+
+  delete contractor;
+
+  // restore connected qubits
+  for (uint_t i = 0; i < num_qubits_; i++) {
+    if (i != qubits[0]) {
+      for (int_t j = 0; j < qubits_sp_[i]->rank(); j++) {
+        if (qubits_sp_[i]->modes()[j] == tmp_modes[i]) {
+          qubits_sp_[i]->modes()[j] = modes_qubits_sp_[i];
+          break;
+        }
+      }
+    }
+  }
 }
 
 /*******************************************************************************
