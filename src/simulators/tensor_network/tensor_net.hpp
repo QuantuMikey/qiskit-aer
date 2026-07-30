@@ -45,6 +45,76 @@ using cvector_t = std::vector<std::complex<T>>;
 template <typename T>
 using cdict_t = std::map<std::string, std::complex<T>>;
 
+// aer-0023 --- expectation-value magnitude guard.
+//
+// <psi|P|psi> for a Pauli string P on a normalised state satisfies |<P>| <= 1.
+// A value outside that is not a precision issue, it is a corrupt output buffer.
+// Job 20452283 arm B produced <ZZ> = +5.74e13 on a 16q grid lightcone whose
+// true value is -0.0497: thirteen orders out, num_slices=1, no error raised.
+// That matches the hipTensor gfx90a failure already documented in
+// setup_pool_and_cache (certain shapes silently write only part of the output
+// tensor, leaving the rest as whatever was in memory).
+//
+// The bound is free to check and catches the whole class. Because
+// tn_path_seed()'s own comment records that loky's trial completion order makes
+// the cotengra search non-reproducible, discarding the contractor and planning
+// again lands on a different path, which is overwhelmingly likely to be a good
+// one -- job 20452283 measured 59/60 good at the default budget and 29/30 at a
+// clamped budget. So the response is retry, not refuse; a hard error is raised
+// only if every attempt is out of bounds.
+//
+// MPI note: contract_and_trace returns the value AFTER the cross-rank
+// MPI_Allreduce, so every rank sees the identical number and reaches the
+// identical retry decision. The re-plan is therefore collective and cannot
+// desync the ranks.
+//
+// AER_TN_EXPVAL_GUARD=0        disable entirely (default on)
+// AER_TN_EXPVAL_TOL=<float>    slack above 1.0 (default 1e-6)
+// AER_TN_EXPVAL_RETRIES=<int>  re-plan attempts before throwing (default 3)
+static bool tn_expval_guard() {
+  static bool checked = false;
+  static bool cached = true;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_EXPVAL_GUARD");
+    if (v != nullptr && v[0] == '0' && v[1] == '\0')
+      cached = false;
+    checked = true;
+  }
+  return cached;
+}
+
+static double tn_expval_tol() {
+  static bool checked = false;
+  static double cached = 1e-6;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_EXPVAL_TOL");
+    if (v != nullptr) {
+      char *end = nullptr;
+      double parsed = std::strtod(v, &end);
+      if (end != v && parsed >= 0.0)
+        cached = parsed;
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+static int tn_expval_retries() {
+  static bool checked = false;
+  static int cached = 3;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_EXPVAL_RETRIES");
+    if (v != nullptr) {
+      char *end = nullptr;
+      long parsed = std::strtol(v, &end, 10);
+      if (end != v && parsed >= 0)
+        cached = static_cast<int>(parsed);
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 enum class Rotation {
   x,
   y,
@@ -1626,125 +1696,18 @@ template <typename data_t>
 double TensorNet<data_t>::expval_pauli(const reg_t &qubits,
                                        const std::string &pauli,
                                        const complex_t initial_phase) const {
-  int_t iqubit = 0;
-  double expval = 0.0;
-  uint_t size = qubits.size();
-  std::vector<std::shared_ptr<Tensor<data_t>>> pauli_tensors;
-  std::vector<int32_t> tmp_modes = modes_qubits_;
-
-  // CSC fix (expval zero-output bug, found by Bell <ZZ> repro on gfx90a):
-  // the appended Pauli tensors below take fresh mode IDs from tmp_index++.
-  // Starting that at mode_index_ is NOT safe here: expval_pauli contracts
-  // against the CONJUGATE ('sp') half of the network, whose tensors already
-  // carry mode IDs that can equal or exceed mode_index_ depending on build
-  // order. When a Pauli mode collides with a live sp-tensor mode (observed:
-  // mode 13 shared between the conjugate tensor [3,7,13,11] and a Pauli
-  // tensor [8,13]), hipTensor sees an ill-formed contraction and silently
-  // returns a zero tensor — the whole expectation value comes out exactly
-  // 0.0. Start above the true maximum mode ID present anywhere in the
-  // network (both bra and conjugate ket sides) so the new Pauli modes are
-  // provably disjoint from every existing mode.
-  int32_t tmp_index = mode_index_;
-  for (const auto &tn : tensors_) {
-    if (!tn)
-      continue;
-    for (int32_t m : tn->modes())
-      if (m >= tmp_index)
-        tmp_index = m + 1;
-  }
-
-  pauli_tensors.reserve(size * 2);
-  cvector_t<data_t> mat_phase(4, 0.0);
-  mat_phase[0] = 1.0;
-  mat_phase[3] = initial_phase;
-
-  // add Pauli ops to qubits
-  for (uint_t i = 0; i < size; i++) {
-    cvector_t<data_t> mat(4, 0.0);
-
-    switch (pauli[size - 1 - i]) {
-    case 'I':
-      mat[0] = 1.0;
-      mat[3] = 1.0;
-      break;
-    case 'X':
-      mat[1] = 1.0;
-      mat[2] = 1.0;
-      break;
-    case 'Y':
-      mat[1] = {0.0, -1.0};
-      mat[2] = {0.0, 1.0};
-      break;
-    case 'Z':
-      mat[0] = 1.0;
-      mat[3] = -1.0;
-      break;
-    default:
-      throw std::invalid_argument("Invalid Pauli \"" +
-                                  std::to_string(pauli[size - 1 - i]) + "\".");
-      break;
-    }
-    std::shared_ptr<Tensor<data_t>> t = std::make_shared<Tensor<data_t>>();
-    t->set(qubits[iqubit + i], mat);
-    t->modes()[0] = tmp_modes[qubits[i]];
-    t->modes()[1] = tmp_index++;
-    tmp_modes[qubits[i]] = t->modes()[1];
-    if (initial_phase != 1.0)
-      t->mult_matrix(mat_phase);
-    pauli_tensors.push_back(t);
-  }
-
-  // connect qubits not used for trace
-  for (uint_t i = 0; i < num_qubits_; i++) {
-    if (i != qubits[0]) {
-      for (int_t j = 0; j < qubits_sp_[i]->rank(); j++) {
-        if (qubits_sp_[i]->modes()[j] == modes_qubits_sp_[i]) {
-          qubits_sp_[i]->modes()[j] = tmp_modes[i];
-          break;
-        }
-      }
-    }
-  }
-
-  TensorNetContractor<data_t> *contractor;
-  create_contractor(contractor);
-  contractor->set_network(tensors_);
-  contractor->allocate_additional_tensors(pauli_tensors.size() * 4);
-  contractor->set_additional_tensors(pauli_tensors);
-
-  std::vector<int32_t> modes_out(2);
-  std::vector<int64_t> extents_out(2);
-
-  // output tensor, only qubits[0] is used for contraction
-  modes_out[0] = tmp_modes[qubits[0]];
-  modes_out[1] = modes_qubits_sp_[qubits[0]];
-  extents_out[0] = 2;
-  extents_out[1] = 2;
-
-  contractor->set_output(modes_out, extents_out);
-  contractor->setup_contraction(use_cuTensorNet_autotuning_);
-  last_num_slices_ = contractor->num_slices();
-  expval = contractor->contract_and_trace(1);
-
-  delete contractor;
-
-  // restore connected qubits
-  for (uint_t i = 0; i < num_qubits_; i++) {
-    if (i != qubits[0]) {
-      for (int_t j = 0; j < qubits_sp_[i]->rank(); j++) {
-        if (qubits_sp_[i]->modes()[j] == tmp_modes[i]) {
-          qubits_sp_[i]->modes()[j] = modes_qubits_sp_[i];
-          break;
-        }
-      }
-    }
-  }
-
-  for (uint_t i = 0; i < pauli_tensors.size(); i++) {
-    pauli_tensors[i].reset();
-  }
-
-  return expval;
+  // aer-0023: delegate to the batch implementation so the single-term path and
+  // the save_expval batch share ONE code path, one set of mode bookkeeping and
+  // one magnitude guard. The previous standalone body was a duplicate of the
+  // batch loop for a single string; keeping two copies meant the guard, and any
+  // future fix, would have to be written twice. Behaviour for one string is
+  // unchanged: same tmp_index seeding above the true maximum mode, same
+  // not-traced-qubit rewiring, same call order of set_additional_tensors ->
+  // set_output -> setup_contraction, same contract_and_trace(1).
+  std::vector<double> out;
+  expval_pauli_batch(qubits, std::vector<std::string>(1, pauli), out,
+                     initial_phase);
+  return out.empty() ? 0.0 : out[0];
 }
 
 template <typename data_t>
@@ -1822,11 +1785,11 @@ void TensorNet<data_t>::expval_pauli_batch(
   modes_out[1] = modes_qubits_sp_[qubits[0]];
   extents_out[0] = 2;
   extents_out[1] = 2;
-  contractor->set_output(modes_out, extents_out);
-
   cvector_t<data_t> mat_phase(4, 0.0);
   mat_phase[0] = 1.0;
   mat_phase[3] = initial_phase;
+
+  const double bound = 1.0 + tn_expval_tol();
 
   for (size_t k = 0; k < paulis.size(); k++) {
     const std::string &pauli = paulis[k];
@@ -1862,10 +1825,56 @@ void TensorNet<data_t>::expval_pauli_batch(
       pauli_tensors.push_back(t);
     }
 
-    contractor->set_additional_tensors(pauli_tensors);
-    contractor->setup_contraction(use_cuTensorNet_autotuning_);
-    last_num_slices_ = contractor->num_slices();
-    out[k] = contractor->contract_and_trace(1);
+    // set_output() is issued INSIDE the loop, after set_additional_tensors(),
+    // to keep the call order byte-identical to the single-term expval_pauli()
+    // this batch replaced. set_output() only reassigns modes/extents and sizes
+    // the output allocation, so repeating it is free.
+    int attempt = 0;
+    while (true) {
+      contractor->set_additional_tensors(pauli_tensors);
+      contractor->set_output(modes_out, extents_out);
+      contractor->setup_contraction(use_cuTensorNet_autotuning_);
+      last_num_slices_ = contractor->num_slices();
+      const double value = contractor->contract_and_trace(1);
+
+      if (!tn_expval_guard() ||
+          (std::isfinite(value) && std::fabs(value) <= bound)) {
+        out[k] = value;
+        break;
+      }
+
+      if (attempt >= tn_expval_retries()) {
+        delete contractor;
+        std::stringstream err;
+        err << "[AER_TN] expectation value " << value << " for Pauli \""
+            << pauli << "\" is outside the |<P>| <= 1 bound after "
+            << (attempt + 1) << " contraction attempt(s) on distinct paths. "
+               "This indicates a corrupt contraction output rather than a "
+               "precision issue (see the hipTensor shape-specific output-write "
+               "bug noted in setup_pool_and_cache). Re-run to draw a different "
+               "path, raise AER_TN_EXPVAL_RETRIES, or set AER_TN_EXPVAL_GUARD=0 "
+               "to accept the value unchecked.";
+        throw std::runtime_error(err.str());
+      }
+
+      // Discard the contractor so the next attempt plans from scratch. The
+      // cotengra search is not reproducible (tn_path_seed()), so the retry gets
+      // a different contraction path rather than repeating the bad one.
+      attempt++;
+      // Always reported, never silent: a re-plan means the backend produced a
+      // corrupt number, and the rate of that is exactly what a run needs to
+      // disclose. Grep [AER_TN_EXPVAL_GUARD] to count occurrences in a job.
+      fprintf(stderr,
+              "[AER_TN_EXPVAL_GUARD] value %.6e exceeds |<P>| <= %.6g for "
+              "pauli=%s; discarding the plan and re-planning (attempt %d of "
+              "%d)\n",
+              value, bound, pauli.c_str(), attempt + 1,
+              tn_expval_retries() + 1);
+      delete contractor;
+      create_contractor(contractor);
+      contractor->set_network(tensors_);
+      contractor->allocate_additional_tensors(size * 4);
+    }
 
     for (size_t i = 0; i < pauli_tensors.size(); i++)
       pauli_tensors[i].reset();
