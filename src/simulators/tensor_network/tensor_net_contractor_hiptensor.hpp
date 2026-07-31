@@ -1170,16 +1170,60 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
                   workspace_estimate / (1024.0 * 1024.0),
                   memory_budget / (1024.0 * 1024.0));
 
-        auto optimizer = create_optimizer();
+        // aer-0027: consult the cross-instruction plan cache before searching.
+        //
+        // Guarded on nprocs_ == 1 by design. Under MPI create_optimizer()
+        // returns MPIParallelPathOptimizer, whose find_path runs an allreduce
+        // and a broadcast; a rank that hit the cache would skip a collective a
+        // missing rank still enters, and the job would hang. Rather than rely
+        // on canonical keys always agreeing across ranks, multi-rank simply
+        // does not use the cache.
+        //
+        // elem_bytes mirrors create_optimizer() exactly (2 * sizeof(data_t)),
+        // not sizeof(std::complex<data_t>), so the key cannot drift from the
+        // value the optimizer actually clamps against.
+        const size_t plan_elem_bytes = 2 * sizeof(data_t);
+        std::string plan_key;
+        bool plan_from_cache = false;
+        if (tn_plan_cache_enabled() && nprocs_ == 1) {
+          plan_key = canonical_network_key(
+              network_desc_, engaged,
+              plan_key_target_elements(memory_budget, plan_elem_bytes),
+              tn_path_seed(), plan_elem_bytes);
+          if (!plan_key.empty())
+            plan_from_cache =
+                plan_cache_instance().get(plan_key, network_desc_, plan_);
+        }
+
         std::chrono::steady_clock::time_point prof_path_t0;
         if (tn_profile())
           prof_path_t0 = std::chrono::steady_clock::now();
-        plan_ = optimizer->find_path(network_desc_, memory_budget,
-                                     tn_path_seed(), engaged);
+        if (!plan_from_cache) {
+          auto optimizer = create_optimizer();
+          plan_ = optimizer->find_path(network_desc_, memory_budget,
+                                       tn_path_seed(), engaged);
+          if (!plan_key.empty())
+            plan_cache_instance().put(plan_key, network_desc_, plan_,
+                                      tn_plan_cache_max());
+        }
         // += so an AUTO re-plan (pass 2) adds to pass 1's search cost rather
-        // than hiding it.
+        // than hiding it. A cache hit contributes ~0 here, which is the whole
+        // point: t_path_ms collapsing is how a hit is visible in the profile.
         if (tn_profile())
           prof_path_ms_ += tn_ms_since(prof_path_t0);
+
+        // Printed per setup so a run shows the cache working live rather than
+        // only in aggregate at the end.
+        if (tn_plan_cache_enabled() && tn_verbose() && myrank_ == 0) {
+          uint64_t ch = 0, cm = 0;
+          size_t cn = 0;
+          plan_cache_instance().stats(ch, cm, cn);
+          fprintf(stderr,
+                  "[AER_TN_PLAN_CACHE] %s hits=%llu misses=%llu entries=%zu%s\n",
+                  plan_from_cache ? "HIT " : "miss",
+                  (unsigned long long)ch, (unsigned long long)cm, cn,
+                  plan_key.empty() ? " (network not keyable; not cached)" : "");
+        }
 
         // Slice-count ceiling: refuse an over-sliced plan rather than grind
         // (see tn_max_slices). plan_.num_slices is the MINLOC-broadcast value,

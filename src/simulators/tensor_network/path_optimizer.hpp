@@ -18,12 +18,14 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 // aer-0026: sched_getaffinity()/CPU_COUNT for the cotengra worker count. Linux
@@ -630,6 +632,269 @@ struct ContractionPlan {
     return plan;
   }
 };
+
+//=============================================================================
+// aer-0027: cross-instruction contraction-plan cache
+//=============================================================================
+//
+// WHY
+// A contractor is created and destroyed per instruction (create_contractor /
+// delete contractor throughout tensor_net.hpp), and both gpu_mgr_ and plan_ are
+// contractor MEMBERS. So every evaluation re-runs the cotengra search from
+// scratch. Measured on grid n=64 p=2 (job 20508223): t_path 3393 ms of 6666 ms
+// setup, against t_contract 8.49 ms. The contraction is 0.127% of the cost.
+//
+// The plan depends only on the network TOPOLOGY: TensorSpec carries {modes,
+// extents} and no values, so the identical plan is valid for every choice of
+// gate angles. That is what makes this worth caching -- a QAOA angle sweep
+// re-contracts one topology thousands of times.
+//
+// SCOPE: this caches the ContractionPlan only, which is plain integer data
+// (steps, sliced, num_slices, total_flops, peak_intermediate_elements) and
+// already round-trips through serialize()/deserialize() for the MPI broadcast.
+// It holds NO device pointers and allocates NO VRAM. The hipTensor plan cache
+// and the memory pool are deliberately NOT persisted here: those own GPU
+// allocations whose lifetime is currently bounded by the contractor, and
+// changing that is a separate problem with real use-after-free and eviction
+// hazards. This half is ~50% of setup at a fraction of the risk.
+//
+// THE CORRECTNESS TRAP, AND WHY THE KEY IS CANONICAL
+// Mode IDs are NOT stable. tensor_net.hpp assigns them from mode_index_, a
+// monotonic counter on the TensorNet that advances as gates are applied
+// (tensor_net.hpp:534, 840-845, 877-914). Two structurally identical cones
+// built at different points in a circuit therefore carry DIFFERENT mode IDs.
+// A key built from raw IDs would never hit, and the feature would silently do
+// nothing while appearing to work. So modes are relabelled by first appearance
+// in tensor order before hashing.
+//
+// The same trap bites the stored plan. ContractionStep holds {left, right},
+// which are tensor POSITIONS and replay safely. But SliceInfo holds a MODE ID.
+// Replaying a raw sliced mode into a network whose IDs differ would slice the
+// wrong index and silently return a wrong answer. Slices are therefore stored
+// as structural coordinates (tensor, position) and re-resolved on every hit --
+// precisely what MPIParallelPathOptimizer does after its MPI_Bcast, for
+// precisely this reason.
+//
+// MPI: the cache is consulted ONLY when nprocs_ == 1. create_optimizer()
+// returns MPIParallelPathOptimizer under MPI, which runs an allreduce and a
+// broadcast; if one rank hit the cache and another missed, the missing rank
+// would block in a collective the other never enters. Rather than reason about
+// whether canonical keys always agree across ranks, the multi-rank path simply
+// does not use the cache. Single-rank is also the intended topology for the
+// benchmark driver (SLURM fan-out, not MPI ranks).
+//
+// Off by default. AER_TN_PLAN_CACHE=1 enables; AER_TN_PLAN_CACHE_MAX caps
+// entries (LRU). Host memory only.
+
+static bool tn_plan_cache_enabled() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_PLAN_CACHE");
+    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
+}
+
+static size_t tn_plan_cache_max() {
+  static bool checked = false;
+  static size_t cached = 64;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_PLAN_CACHE_MAX");
+    if (v != nullptr) {
+      char *end = nullptr;
+      long long p = std::strtoll(v, &end, 10);
+      if (end != v && p > 0)
+        cached = static_cast<size_t>(p);
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+// Mirrors the clamp in CotengPathOptimizer::find_path (target_elements =
+// min(budget/element_size, slice_target_bytes()/element_size)). Keying on the
+// CLAMPED value matters: the raw budget tracks free VRAM and jitters run to
+// run, which would poison the key even though the clamped value is constant.
+inline uint64_t plan_key_target_elements(uint64_t memory_budget,
+                                         size_t element_size_bytes) {
+  const uint64_t es = (element_size_bytes > 0) ? element_size_bytes : 1;
+  const uint64_t from_budget = memory_budget / es;
+  const uint64_t envelope = std::max<uint64_t>(1, slice_target_bytes() / es);
+  return std::min(from_budget, envelope);
+}
+
+// Empty return means "do not cache this network" -- used when an output mode
+// appears in no tensor and therefore cannot be canonicalised consistently.
+// Refusing to key is always safe; a wrong key is not.
+inline std::string canonical_network_key(const NetworkDescription &net,
+                                         bool engaged,
+                                         uint64_t target_elements,
+                                         uint64_t seed,
+                                         size_t element_size_bytes) {
+  std::map<int32_t, int32_t> relabel;
+  int32_t next_id = 0;
+  std::ostringstream os;
+  os << "T" << net.tensors.size();
+  for (size_t t = 0; t < net.tensors.size(); t++) {
+    const TensorSpec &ts = net.tensors[t];
+    if (ts.modes.size() != ts.extents.size())
+      return std::string();
+    os << "|" << ts.modes.size();
+    for (size_t i = 0; i < ts.modes.size(); i++) {
+      std::map<int32_t, int32_t>::iterator it = relabel.find(ts.modes[i]);
+      if (it == relabel.end())
+        it = relabel.insert(std::make_pair(ts.modes[i], next_id++)).first;
+      os << "," << it->second << ":" << ts.extents[i];
+    }
+  }
+  // The output spec is part of the key. setup_pool_and_cache() writes the final
+  // step's C descriptor in modes_out_ order, so a plan reused against a
+  // different output contracts into the wrong shape. This is aer-0024's bug,
+  // and across instructions its blast radius is larger.
+  if (net.output_modes.size() != net.output_extents.size())
+    return std::string();
+  os << "|OUT" << net.output_modes.size();
+  for (size_t i = 0; i < net.output_modes.size(); i++) {
+    std::map<int32_t, int32_t>::const_iterator it =
+        relabel.find(net.output_modes[i]);
+    if (it == relabel.end())
+      return std::string();
+    os << "," << it->second << ":" << net.output_extents[i];
+  }
+  os << "|E" << (engaged ? 1 : 0) << "|TE" << target_elements << "|S" << seed
+     << "|ES" << element_size_bytes;
+  return os.str();
+}
+
+// sliced mode ID -> (tensor, position). Returns false if any sliced mode is not
+// found, in which case the plan is simply not cached.
+inline bool
+sliced_modes_to_coords(const NetworkDescription &net,
+                       const ContractionPlan &plan,
+                       std::vector<std::pair<int64_t, int64_t>> &out) {
+  out.clear();
+  for (size_t s = 0; s < plan.sliced.size(); s++) {
+    int64_t ft = -1, fp = -1;
+    for (size_t t = 0; t < net.tensors.size() && ft < 0; t++) {
+      const std::vector<int32_t> &m = net.tensors[t].modes;
+      for (size_t p = 0; p < m.size(); p++) {
+        if (m[p] == plan.sliced[s].mode) {
+          ft = static_cast<int64_t>(t);
+          fp = static_cast<int64_t>(p);
+          break;
+        }
+      }
+    }
+    if (ft < 0)
+      return false;
+    out.push_back(std::make_pair(ft, fp));
+  }
+  return true;
+}
+
+// (tensor, position) -> this network's mode ID. Returns false rather than
+// leaving a stale ID in place, so a caller can fall back to a fresh search.
+inline bool
+coords_to_sliced_modes(const NetworkDescription &net,
+                       const std::vector<std::pair<int64_t, int64_t>> &coords,
+                       ContractionPlan &plan) {
+  if (coords.size() != plan.sliced.size())
+    return false;
+  for (size_t s = 0; s < coords.size(); s++) {
+    const int64_t t = coords[s].first;
+    const int64_t p = coords[s].second;
+    if (t < 0 || static_cast<size_t>(t) >= net.tensors.size())
+      return false;
+    const std::vector<int32_t> &m = net.tensors[t].modes;
+    if (p < 0 || static_cast<size_t>(p) >= m.size())
+      return false;
+    plan.sliced[s].mode = m[p];
+  }
+  return true;
+}
+
+class PlanCache {
+public:
+  struct Entry {
+    ContractionPlan plan;
+    std::vector<std::pair<int64_t, int64_t>> sliced_coords;
+    uint64_t last_used;
+    Entry() : last_used(0) {}
+  };
+
+  // Mutex-guarded: Aer may execute circuits on parallel threads, and this is
+  // process-global state. The critical section is a map lookup plus a copy of
+  // a few hundred integers, against a path search measured in seconds.
+  bool get(const std::string &key, const NetworkDescription &net,
+           ContractionPlan &out) {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::unordered_map<std::string, Entry>::iterator it = map_.find(key);
+    if (it == map_.end()) {
+      misses_++;
+      return false;
+    }
+    ContractionPlan candidate = it->second.plan;
+    if (!coords_to_sliced_modes(net, it->second.sliced_coords, candidate)) {
+      map_.erase(it);
+      misses_++;
+      return false;
+    }
+    it->second.last_used = ++tick_;
+    out = candidate;
+    hits_++;
+    return true;
+  }
+
+  void put(const std::string &key, const NetworkDescription &net,
+           const ContractionPlan &plan, size_t max_entries) {
+    std::vector<std::pair<int64_t, int64_t>> coords;
+    if (!sliced_modes_to_coords(net, plan, coords))
+      return;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (map_.size() >= max_entries && map_.find(key) == map_.end())
+      evict_lru_locked();
+    Entry e;
+    e.plan = plan;
+    e.sliced_coords = coords;
+    e.last_used = ++tick_;
+    map_[key] = e;
+  }
+
+  void stats(uint64_t &h, uint64_t &m, size_t &n) {
+    std::lock_guard<std::mutex> lock(mu_);
+    h = hits_;
+    m = misses_;
+    n = map_.size();
+  }
+
+private:
+  void evict_lru_locked() {
+    std::unordered_map<std::string, Entry>::iterator victim = map_.end();
+    uint64_t best = std::numeric_limits<uint64_t>::max();
+    for (std::unordered_map<std::string, Entry>::iterator it = map_.begin();
+         it != map_.end(); ++it) {
+      if (it->second.last_used < best) {
+        best = it->second.last_used;
+        victim = it;
+      }
+    }
+    if (victim != map_.end())
+      map_.erase(victim);
+  }
+
+  std::unordered_map<std::string, Entry> map_;
+  std::mutex mu_;
+  uint64_t tick_ = 0;
+  uint64_t hits_ = 0;
+  uint64_t misses_ = 0;
+};
+
+inline PlanCache &plan_cache_instance() {
+  static PlanCache inst;   // C++11 guarantees thread-safe initialisation
+  return inst;
+}
 
 //=============================================================================
 // PathOptimizer interface
