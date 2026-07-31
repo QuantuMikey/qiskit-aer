@@ -55,22 +55,29 @@ using cdict_t = std::map<std::string, std::complex<T>>;
 // setup_pool_and_cache (certain shapes silently write only part of the output
 // tensor, leaving the rest as whatever was in memory).
 //
-// The bound is free to check and catches the whole class. Because
-// tn_path_seed()'s own comment records that loky's trial completion order makes
-// the cotengra search non-reproducible, discarding the contractor and planning
-// again lands on a different path, which is overwhelmingly likely to be a good
-// one -- job 20452283 measured 59/60 good at the default budget and 29/30 at a
-// clamped budget. So the response is retry, not refuse; a hard error is raised
-// only if every attempt is out of bounds.
+// The bound is free to check and catches the whole class. aer-0023 responded by
+// discarding the contractor and planning again, relying on the cotengra search
+// being non-reproducible so the retry landed on a different path (job 20452283
+// measured 59/60 good). aer-0025 replaced that: the corruption is transient
+// rather than plan-dependent, so the response is to CONTRACT AGAIN with the
+// same plan -- about 875x cheaper, since aer-0024 lets setup_contraction() skip
+// both the search and the prebuild on a topology match. A re-plan is kept only
+// as the final attempt, for the case that some corruption does turn out to be
+// plan-attached. A hard error is raised only if every attempt is out of bounds.
 //
 // MPI note: contract_and_trace returns the value AFTER the cross-rank
 // MPI_Allreduce, so every rank sees the identical number and reaches the
-// identical retry decision. The re-plan is therefore collective and cannot
-// desync the ranks.
+// identical retry decision. Re-contracting is therefore collective and cannot
+// desync the ranks, exactly as the re-plan was.
 //
 // AER_TN_EXPVAL_GUARD=0        disable entirely (default on)
 // AER_TN_EXPVAL_TOL=<float>    slack above 1.0 (default 1e-6)
-// AER_TN_EXPVAL_RETRIES=<int>  re-plan attempts before throwing (default 3)
+// AER_TN_EXPVAL_RETRIES=<int>  recovery attempts before throwing (default 3):
+//                              the first RETRIES-1 re-contract, the last
+//                              re-plans (aer-0025)
+// AER_TN_EXPVAL_INJECT_N=<int> corrupt the first n contraction results on
+//                              purpose so the recovery can be regression
+//                              tested (aer-0025); unset/0 = inert
 static bool tn_expval_guard() {
   static bool checked = false;
   static bool cached = true;
@@ -113,6 +120,46 @@ static int tn_expval_retries() {
     checked = true;
   }
   return cached;
+}
+
+// aer-0025: deterministic corruption injection, so the guard's RECOVERY can be
+// regression-tested instead of waiting on a ~0.48%-per-contraction event.
+// Returns the true value unchanged unless AER_TN_EXPVAL_INJECT_N=<n> is set, in
+// which case the first n values seen by this process come back with 1e12 added
+// -- far outside |<P>| <= 1 + tol for any real expectation value, so the guard
+// fires on exactly the first n contractions and on nothing else.
+//
+// The point is what happens NEXT: with n=1 the retry must return the true value
+// and the run must still match terra. That verifies the recovery end to end.
+//
+// MPI: the counter is process-local, but contract_and_trace() returns the value
+// AFTER the cross-rank Allreduce, so every rank reaches this function the same
+// number of times in the same order and decrements in lockstep. All ranks
+// therefore inject on the identical contractions and reach the identical retry
+// decision, which keeps the recovery collective. Set the variable identically on
+// every rank (SINGULARITYENV_ propagates it) or that guarantee is void.
+static double tn_expval_inject(double value) {
+  static bool checked = false;
+  static long remaining = 0;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_EXPVAL_INJECT_N");
+    if (v != nullptr) {
+      char *end = nullptr;
+      long parsed = std::strtol(v, &end, 10);
+      if (end != v && parsed > 0)
+        remaining = parsed;
+    }
+    checked = true;
+  }
+  if (remaining > 0) {
+    remaining--;
+    fprintf(stderr,
+            "[AER_TN_EXPVAL_INJECT] corrupting a contraction result on purpose "
+            "(%ld injection(s) left after this one)\n",
+            remaining);
+    return value + 1.0e12;
+  }
+  return value;
 }
 
 enum class Rotation {
@@ -1835,7 +1882,7 @@ void TensorNet<data_t>::expval_pauli_batch(
       contractor->set_output(modes_out, extents_out);
       contractor->setup_contraction(use_cuTensorNet_autotuning_);
       last_num_slices_ = contractor->num_slices();
-      const double value = contractor->contract_and_trace(1);
+      const double value = tn_expval_inject(contractor->contract_and_trace(1));
 
       if (!tn_expval_guard() ||
           (std::isfinite(value) && std::fabs(value) <= bound)) {
@@ -1848,32 +1895,60 @@ void TensorNet<data_t>::expval_pauli_batch(
         std::stringstream err;
         err << "[AER_TN] expectation value " << value << " for Pauli \""
             << pauli << "\" is outside the |<P>| <= 1 bound after "
-            << (attempt + 1) << " contraction attempt(s) on distinct paths. "
+            << (attempt + 1) << " contraction attempt(s). "
                "This indicates a corrupt contraction output rather than a "
                "precision issue (see the hipTensor shape-specific output-write "
-               "bug noted in setup_pool_and_cache). Re-run to draw a different "
-               "path, raise AER_TN_EXPVAL_RETRIES, or set AER_TN_EXPVAL_GUARD=0 "
+               "bug noted in setup_pool_and_cache). Re-run, raise "
+               "AER_TN_EXPVAL_RETRIES, or set AER_TN_EXPVAL_GUARD=0 "
                "to accept the value unchecked.";
         throw std::runtime_error(err.str());
       }
 
-      // Discard the contractor so the next attempt plans from scratch. The
-      // cotengra search is not reproducible (tn_path_seed()), so the retry gets
-      // a different contraction path rather than repeating the bad one.
       attempt++;
-      // Always reported, never silent: a re-plan means the backend produced a
-      // corrupt number, and the rate of that is exactly what a run needs to
-      // disclose. Grep [AER_TN_EXPVAL_GUARD] to count occurrences in a job.
+      // aer-0025: RE-CONTRACT, do not re-plan.
+      //
+      // aer-0023 discarded the contractor and planned again, on the premise
+      // that a fresh path avoids the bad one. The data since contradicts the
+      // premise: the corruption is transient (~0.48% per contraction, not
+      // plan-dependent -- confirmed by cross-referencing jobs that reused an
+      // identical plan), so re-planning pays a full cotengra search plus a
+      // ~101-step prebuild -- measured ~875x the cost of simply contracting
+      // again -- to escape something that was never attached to the plan.
+      //
+      // Re-contracting is nearly free after aer-0024: set_additional_tensors()
+      // re-uploads the same leaves, and setup_contraction() then hits the
+      // topology/output match, so both the path search and the prebuild are
+      // skipped and only the contraction re-runs.
+      //
+      // The re-plan is KEPT as the final attempt rather than deleted. Transient
+      // corruption is cleared by the first re-contract, so the escalation costs
+      // nothing in the common case; but nothing proves every corruption is
+      // transient, and a plan-dependent one would otherwise become a hard error
+      // where aer-0023 recovered. Note the escalation only helps while the
+      // cotengra search is non-reproducible -- see aer-0026, which makes the
+      // worker count explicit and can make the search deterministic, at which
+      // point the re-plan draws the SAME path and this last attempt degenerates
+      // into a third re-contract. That is why the two changes ship together.
+      const bool last_chance = (attempt >= tn_expval_retries());
+      // Always reported, never silent: a guard event means the backend produced
+      // a corrupt number, and the rate of that is exactly what a run needs to
+      // disclose. Grep [AER_TN_EXPVAL_GUARD] to count occurrences in a job; the
+      // wording distinguishes which recovery ran.
       fprintf(stderr,
               "[AER_TN_EXPVAL_GUARD] value %.6e exceeds |<P>| <= %.6g for "
-              "pauli=%s; discarding the plan and re-planning (attempt %d of "
-              "%d)\n",
-              value, bound, pauli.c_str(), attempt + 1,
-              tn_expval_retries() + 1);
-      delete contractor;
-      create_contractor(contractor);
-      contractor->set_network(tensors_);
-      contractor->allocate_additional_tensors(size * 4);
+              "pauli=%s; %s (attempt %d of %d)\n",
+              value, bound, pauli.c_str(),
+              last_chance ? "re-contract exhausted, discarding the plan and "
+                            "re-planning"
+                          : "re-contracting the same plan",
+              attempt + 1, tn_expval_retries() + 1);
+
+      if (last_chance) {
+        delete contractor;
+        create_contractor(contractor);
+        contractor->set_network(tensors_);
+        contractor->allocate_additional_tensors(size * 4);
+      }
     }
 
     for (size_t i = 0; i < pauli_tensors.size(); i++)
