@@ -26,6 +26,10 @@
 #include <utility>
 #include <vector>
 
+// aer-0026: sched_getaffinity()/CPU_COUNT for the cotengra worker count. Linux
+// only, which this file already is (ROCm/HIP, MPICH, LUMI).
+#include <sched.h>
+
 #ifdef AER_HIPTENSOR
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -166,6 +170,98 @@ static std::string path_optlib() {
 // element size, so a single value covers float and double. Lower it to slice
 // harder (e.g. to shrink per-slice memory); it can only slice harder, never
 // raise the per-slice peak past max_tiled_elements().
+// aer-0026: how many worker processes cotengra may use for the path search.
+//
+// The fork never passed `parallel`, so cotengra applied its own default of
+// 'auto'. 'auto' sizes the pool from the machine's CPU count, and inside the
+// container that reads the WHOLE NODE: job 20497440 reported 256 visible CPUs
+// while the allocation was a handful of cores. Every path search has therefore
+// been trying to start ~256 loky workers into a small cgroup, which is the most
+// likely cause of the 20-36% worker deaths already recorded -- dead workers
+// silently truncate the search, so the plan that comes back is whatever
+// survived rather than the best of max_repeats trials.
+//
+// Return value: -2 leave cotengra's 'auto' (the pre-aer-0026 behaviour),
+//               -1 pass False (serial, no pool at all), N>=1 pass N workers.
+//
+// AER_TN_PATH_PARALLEL: unset = auto-detect (below); "auto" = -2; "0"/"false" =
+// -1; a positive integer = that many workers. The knob exists so the three can
+// be compared inside one job without another rebuild.
+//
+// Auto-detection deliberately takes the MINIMUM of two independent signals and
+// clamps the result, because neither is guaranteed here and I have not been
+// able to verify which one LUMI actually provides through Singularity:
+//   * sched_getaffinity() -- the cores this process may run on. Reflects SLURM
+//     cpu-binding and the GPU affinity wrapper if either applied.
+//   * SLURM_CPUS_PER_TASK -- what was requested. Absent outside SLURM.
+// If both fail we fall back to 1 (serial), which is slow but never
+// oversubscribes. The cap of 32 stops a whole-node affinity mask from
+// reproducing the very problem this fixes.
+//
+// The chosen value and BOTH inputs are printed once per process, so the first
+// job after this lands says outright whether affinity is visible inside the
+// container. That question is why this is measured rather than assumed.
+static int path_parallel_setting() {
+  static bool checked = false;
+  static int cached = -2;
+  if (checked)
+    return cached;
+  checked = true;
+
+  long affinity = -1;
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  if (sched_getaffinity(0, sizeof(mask), &mask) == 0)
+    affinity = static_cast<long>(CPU_COUNT(&mask));
+
+  long slurm = -1;
+  const char *sc = std::getenv("SLURM_CPUS_PER_TASK");
+  if (sc != nullptr) {
+    char *end = nullptr;
+    long parsed = std::strtol(sc, &end, 10);
+    if (end != sc && parsed > 0)
+      slurm = parsed;
+  }
+
+  const char *v = std::getenv("AER_TN_PATH_PARALLEL");
+  std::string source = "auto-detected";
+  if (v != nullptr) {
+    std::string s(v);
+    source = "AER_TN_PATH_PARALLEL";
+    if (s == "auto") {
+      cached = -2;
+    } else if (s == "0" || s == "false" || s == "False") {
+      cached = -1;
+    } else {
+      char *end = nullptr;
+      long parsed = std::strtol(v, &end, 10);
+      cached = (end != v && parsed > 0) ? static_cast<int>(parsed) : -2;
+    }
+  } else {
+    long n = affinity;
+    if (slurm > 0 && (n <= 0 || slurm < n))
+      n = slurm;
+    if (n <= 0)
+      n = 1;
+    if (n > 32)
+      n = 32;
+    cached = (n <= 1) ? -1 : static_cast<int>(n);
+  }
+
+  char desc[64];
+  if (cached == -2)
+    snprintf(desc, sizeof(desc), "cotengra 'auto' (whole-node CPU count)");
+  else if (cached == -1)
+    snprintf(desc, sizeof(desc), "False (serial)");
+  else
+    snprintf(desc, sizeof(desc), "%d worker(s)", cached);
+  fprintf(stderr,
+          "[AER_TN_PATH] parallel: sched_getaffinity=%ld "
+          "SLURM_CPUS_PER_TASK=%ld -> %s [%s]\n",
+          affinity, slurm, desc, source.c_str());
+  return cached;
+}
+
 static uint64_t slice_target_bytes() {
   static bool checked = false;
   static uint64_t cached = 2097152;
@@ -827,6 +923,20 @@ public:
       kwargs["slicing_opts"] = slicing_opts;
       kwargs["reconf_opts"] = reconf_opts;
       kwargs["progbar"] = false;
+
+      // aer-0026: state the worker count instead of letting cotengra's 'auto'
+      // read the whole node's CPU count through the container. Omitted entirely
+      // when the knob asks for 'auto', so the old behaviour stays reachable for
+      // an A/B without a rebuild.
+      //
+      // This CHANGES PATHS. Worker count decides how many trials finish inside
+      // max_time and in what order, so plans found before and after this commit
+      // are not comparable and neither are timings taken against them.
+      const int par = path_parallel_setting();
+      if (par == -1)
+        kwargs["parallel"] = false;
+      else if (par >= 1)
+        kwargs["parallel"] = par;
 
       if (optlib == "optuna") {
         // Flows to optuna_init_optimizers(sampler_opts=...) then TPESampler.
