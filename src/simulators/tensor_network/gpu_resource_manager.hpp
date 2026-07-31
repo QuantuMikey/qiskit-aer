@@ -272,7 +272,11 @@ template <typename data_t> class HipTensorPlanCache {
   // aer-0028: guards cache_ so a process-wide instance can be reached from
   // concurrent contractors. Uncontended and negligible for the per-contractor
   // instance. NOT recursive: get_or_create must not call trim.
-  std::mutex mu_;
+  // mutable: max_workspace_bytes() and size() are const readers that iterate
+  // cache_, and under a process-wide instance a concurrent insert from another
+  // contractor makes that iteration a data race. aer-0028 introduced the
+  // sharing, so aer-0028 owns guarding them.
+  mutable std::mutex mu_;
   uint64_t tick_ = 0;
   uint64_t hits_ = 0;
   uint64_t misses_ = 0;
@@ -445,14 +449,24 @@ public:
     return cp;
   }
 
+  // WARNING: this is the max over EVERY plan in the cache. With the aer-0028
+  // process-wide cache that spans every circuit ever run on this device, not
+  // the circuit being set up, so sizing a pool from it over-reserves by
+  // whatever the largest plan ever seen needed. setup_pool_and_cache()
+  // therefore accumulates its own per-circuit maximum from the prebuild loop
+  // and does not call this. Kept for diagnostics only.
   uint64_t max_workspace_bytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
     uint64_t max_ws = 0;
     for (auto it = cache_.begin(); it != cache_.end(); ++it)
       max_ws = std::max(max_ws, it->second.workspace_bytes);
     return max_ws;
   }
 
-  size_t size() const { return cache_.size(); }
+  size_t size() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return cache_.size();
+  }
   void clear() {
     std::lock_guard<std::mutex> lock(mu_);
     cache_.clear();
@@ -550,7 +564,29 @@ static bool tn_shared_plan_cache() {
   static bool cached = false;
   if (!checked) {
     const char *v = std::getenv("AER_TN_SHARED_PLAN_CACHE");
-    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    bool want = (v != nullptr && v[0] == '1' && v[1] == '\0');
+
+    // AER_TN_DISABLE_PLAN_CACHE wins. Its path returns a reference to
+    // overwritten_slot_, a single MEMBER of the cache that every call
+    // rewrites; the comment on it says the reference is valid only "until the
+    // next call to get_or_create". That is tolerable for a per-contractor
+    // cache, where the sole caller consumes the reference before calling
+    // again. It is NOT tolerable for a process-wide one, where a second
+    // contractor's call can rewrite the slot while the first still holds the
+    // reference -- and the reference is used outside the mutex, so no lock
+    // makes it safe. The two knobs are mutually exclusive rather than silently
+    // corrupting, and the diagnostic kill switch takes precedence because its
+    // whole purpose is to rule out cache-relocation hazards.
+    const char *d = std::getenv("AER_TN_DISABLE_PLAN_CACHE");
+    if (want && d != nullptr && std::string(d) == "1") {
+      fprintf(stderr,
+              "[AER_TN] AER_TN_DISABLE_PLAN_CACHE=1 overrides "
+              "AER_TN_SHARED_PLAN_CACHE=1: the disable path hands back a "
+              "reference to one overwritten slot, which cannot be shared "
+              "between contractors. Plan-cache sharing is OFF for this run.\n");
+      want = false;
+    }
+    cached = want;
     checked = true;
   }
   return cached;

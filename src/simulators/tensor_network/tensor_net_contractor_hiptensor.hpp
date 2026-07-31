@@ -1099,22 +1099,17 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
   // setup_contraction is the first call of the setup -> contract sequence, so
   // it owns resetting the profiling accumulators for this contraction. The
   // per-rank report is emitted later, by the reduction entrypoint.
-  std::chrono::steady_clock::time_point prof_setup_t0;
-  if (tn_profile()) {
-    prof_setup_ms_ = 0.0;
-    prof_path_ms_ = 0.0;
-    prof_contract_ms_ = 0.0;
-    prof_reduce_gpu_ms_ = 0.0;
-    prof_reduce_mpi_ms_ = 0.0;
-    prof_setup_t0 = std::chrono::steady_clock::now();
-  }
-
   // aer-0028: the ONLY safe point to evict from the shared hipTensor plan
   // cache. hipTensor retains pointers into each CachedPlan's own storage, and
   // contract_single_slice holds `const CachedPlan &` across its per-tile loop,
   // so erasing an entry any later is a use-after-free whose symptom is silent
   // zero-output rather than a fault. Here nothing holds a reference yet: the
   // prebuild loop has not run and contraction is two phases away.
+  //
+  // Placed ABOVE the profiling reset on purpose: trim and the stats read are
+  // bookkeeping, and charging them to t_setup_ms would contaminate the exact
+  // number used to measure this change. myrank_ is already set by the MPI
+  // block above.
   if (tn_shared_plan_cache() && gpu_mgr_.num_devices() > 0) {
     gpu_mgr_.primary().plan_cache().trim(tn_shared_plan_cache_max());
     if (tn_verbose() && myrank_ == 0) {
@@ -1126,6 +1121,16 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
               "misses=%llu entries=%zu\n",
               (unsigned long long)ph, (unsigned long long)pm, pn);
     }
+  }
+
+  std::chrono::steady_clock::time_point prof_setup_t0;
+  if (tn_profile()) {
+    prof_setup_ms_ = 0.0;
+    prof_path_ms_ = 0.0;
+    prof_contract_ms_ = 0.0;
+    prof_reduce_gpu_ms_ = 0.0;
+    prof_reduce_mpi_ms_ = 0.0;
+    prof_setup_t0 = std::chrono::steady_clock::now();
   }
 
   network_desc_.output_modes = modes_out_;
@@ -1765,6 +1770,13 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   if (num_steps > 0)
     last_used[num_inputs + num_steps - 1] = static_cast<int>(num_steps - 1);
 
+  // aer-0028: per-CIRCUIT workspace maximum. It must NOT come from
+  // plan_cache().max_workspace_bytes(), which now spans every circuit in the
+  // shared cache; a small circuit after a large one would reserve the large
+  // one's workspace. Accumulated from BOTH get_or_create sites below so a
+  // tiled step cannot under-reserve.
+  uint64_t circuit_max_ws = 0;
+
   for (size_t step = 0; step < num_steps; step++) {
     // Use the padded per-step descriptor shape, not the raw all_specs_
     // (which for inputs may differ from what this specific plan needs).
@@ -1776,7 +1788,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
 
     if (!ps.tiles.empty()) {
       // WS-3 tiled step: pre-build each sub-block plan so its workspace is
-      // counted by max_workspace_bytes() below. The untiled whole-step plan is
+      // counted into circuit_max_ws below (max_workspace_bytes() would now span
+      // the whole shared cache). The untiled whole-step plan is
       // never executed for a tiled step, so we do NOT build it here.
       for (const auto &t : ps.tiles) {
         std::vector<int32_t> ma_safe, mb_safe, mc_safe;
@@ -1785,9 +1798,13 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         auto tsig = build_signature(ma_safe, t.extents_a, mb_safe, t.extents_b,
                                     mc_safe, t.extents_c, t.strides_a, t.strides_b,
                                     t.strides_c);
-        dev.plan_cache().get_or_create(
-            tsig, ma_safe, t.extents_a, mb_safe, t.extents_b,
-            mc_safe, t.extents_c, t.strides_a, t.strides_b, t.strides_c);
+        circuit_max_ws = std::max(
+            circuit_max_ws,
+            dev.plan_cache()
+                .get_or_create(tsig, ma_safe, t.extents_a, mb_safe,
+                               t.extents_b, mc_safe, t.extents_c, t.strides_a,
+                               t.strides_b, t.strides_c)
+                .workspace_bytes);
       }
       continue;
     }
@@ -1805,12 +1822,13 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         modes_c_safe, ps.extents_c,
         ps.strides_a, ps.strides_b);
 
-    dev.plan_cache().get_or_create(
-        sig,
-        modes_a_safe, ps.extents_a,
-        modes_b_safe, ps.extents_b,
-        modes_c_safe, ps.extents_c,
-        ps.strides_a, ps.strides_b);
+    circuit_max_ws = std::max(
+        circuit_max_ws,
+        dev.plan_cache()
+            .get_or_create(sig, modes_a_safe, ps.extents_a, modes_b_safe,
+                           ps.extents_b, modes_c_safe, ps.extents_c,
+                           ps.strides_a, ps.strides_b)
+            .workspace_bytes);
   }
 
   // Each intermediate occupies a split-complex tensor slot: two planes
@@ -1832,7 +1850,16 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   if (tn_verbose())
     fprintf(stderr, "[AER_TN] prebuild loop done; computing workspace\n");
 
-  uint64_t max_ws = dev.plan_cache().max_workspace_bytes();
+  // aer-0028 FIX: the workspace must be sized from THIS circuit's plans.
+  // plan_cache().max_workspace_bytes() is the max over the WHOLE cache, which
+  // before aer-0028 was per-contractor and therefore per-circuit by
+  // construction. With the cache shared it spans every circuit ever run on this
+  // device, so a small circuit following a large one would reserve the large
+  // one's workspace -- not a wrong answer, but a VRAM over-reservation that
+  // grows without bound and makes the memory budget fed to cotengra
+  // inconsistent with what is actually allocated. Accumulated from the prebuild
+  // loop above instead, which is exact in both shared and private mode.
+  uint64_t max_ws = circuit_max_ws;
 
   if (tn_verbose())
     fprintf(stderr, "[AER_TN] workspace computed (max_ws=%lu); laying out pool\n",
@@ -2284,6 +2311,22 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         const CachedPlan<data_t> &tplan = dev.plan_cache().get_or_create(
             tsig, ma_safe, t.extents_a, mb_safe, t.extents_b,
             mc_safe, t.extents_c, t.strides_a, t.strides_b, t.strides_c);
+        // aer-0029: the pool's workspace reservation is sized from
+        // circuit_max_ws in setup_pool_and_cache, and hipTensor is handed that
+        // size with no check of its own. An under-reservation is therefore
+        // SILENT. Since aer-0028 made the plan cache process-wide, execution
+        // can legitimately hit a plan another circuit created, so this asserts
+        // the invariant the sizing depends on rather than trusting it.
+        if (ws_size < tplan.workspace_bytes) {
+          std::stringstream werr;
+          werr << "[AER_TN] workspace under-reservation: pool reserved "
+               << ws_size << " bytes but tiled sub-block plan for step " << step
+               << " needs " << tplan.workspace_bytes
+               << ". setup_pool_and_cache must accumulate every plan it will "
+                  "execute (see circuit_max_ws).";
+          throw std::runtime_error(werr.str());
+        }
+
 
         // Apply this block's column-major element offsets as base-pointer
         // shifts to BOTH split-complex planes (mirrors project_slice). Use the
@@ -2395,6 +2438,22 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         modes_b_safe, ps.extents_b,
         modes_c_safe, ps.extents_c,
         ps.strides_a, ps.strides_b);
+    // aer-0029: the pool's workspace reservation is sized from
+    // circuit_max_ws in setup_pool_and_cache, and hipTensor is handed that
+    // size with no check of its own. An under-reservation is therefore
+    // SILENT. Since aer-0028 made the plan cache process-wide, execution
+    // can legitimately hit a plan another circuit created, so this asserts
+    // the invariant the sizing depends on rather than trusting it.
+    if (ws_size < plan.workspace_bytes) {
+      std::stringstream werr;
+      werr << "[AER_TN] workspace under-reservation: pool reserved "
+           << ws_size << " bytes but untiled plan for step " << step
+           << " needs " << plan.workspace_bytes
+           << ". setup_pool_and_cache must accumulate every plan it will "
+              "execute (see circuit_max_ws).";
+      throw std::runtime_error(werr.str());
+    }
+
 
     // Defense in depth against two orthogonal failure modes:
     //   1. The pool memory for this intermediate is freshly allocated or
