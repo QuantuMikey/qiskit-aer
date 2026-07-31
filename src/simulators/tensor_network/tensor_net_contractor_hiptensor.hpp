@@ -1109,6 +1109,25 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
     prof_setup_t0 = std::chrono::steady_clock::now();
   }
 
+  // aer-0028: the ONLY safe point to evict from the shared hipTensor plan
+  // cache. hipTensor retains pointers into each CachedPlan's own storage, and
+  // contract_single_slice holds `const CachedPlan &` across its per-tile loop,
+  // so erasing an entry any later is a use-after-free whose symptom is silent
+  // zero-output rather than a fault. Here nothing holds a reference yet: the
+  // prebuild loop has not run and contraction is two phases away.
+  if (tn_shared_plan_cache() && gpu_mgr_.num_devices() > 0) {
+    gpu_mgr_.primary().plan_cache().trim(tn_shared_plan_cache_max());
+    if (tn_verbose() && myrank_ == 0) {
+      uint64_t ph = 0, pm = 0;
+      size_t pn = 0;
+      gpu_mgr_.primary().plan_cache().stats(ph, pm, pn);
+      fprintf(stderr,
+              "[AER_TN_HTPLAN] shared hipTensor plan cache: hits=%llu "
+              "misses=%llu entries=%zu\n",
+              (unsigned long long)ph, (unsigned long long)pm, pn);
+    }
+  }
+
   network_desc_.output_modes = modes_out_;
   network_desc_.output_extents = extents_out_;
 

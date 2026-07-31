@@ -18,6 +18,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -252,6 +253,11 @@ template <typename data_t> struct CachedPlan {
   // tiled away the surviving axes are no longer contiguous and C must carry
   // explicit strides — same mechanism as the A/B sliced-view strides above.
   std::vector<int64_t> strides_c_storage;
+
+  // aer-0028: LRU stamp. A plain integer, so adding it cannot move the storage
+  // vectors above -- hipTensor retains pointers INTO those, and relocating them
+  // is the documented silent-zero-output failure.
+  uint64_t last_used = 0;
 };
 
 template <typename data_t> class HipTensorPlanCache {
@@ -263,6 +269,13 @@ template <typename data_t> class HipTensorPlanCache {
   CachedPlan<data_t> overwritten_slot_;
   hiptensorHandle_t *handle_;
   int device_id_;
+  // aer-0028: guards cache_ so a process-wide instance can be reached from
+  // concurrent contractors. Uncontended and negligible for the per-contractor
+  // instance. NOT recursive: get_or_create must not call trim.
+  std::mutex mu_;
+  uint64_t tick_ = 0;
+  uint64_t hits_ = 0;
+  uint64_t misses_ = 0;
 
 public:
   HipTensorPlanCache() : handle_(nullptr), device_id_(0) {}
@@ -290,10 +303,20 @@ public:
     bool cache_disabled =
         (disable_cache_env != nullptr && std::string(disable_cache_env) == "1");
 
+    // aer-0028: the lock covers only the map operations. The returned
+    // reference is used by the caller outside it, which is sound because
+    // nothing erases from cache_ except trim(), and trim() is called only from
+    // setup_contraction() before any reference exists. Insert may rehash;
+    // unordered_map preserves references to elements across rehash.
+    std::lock_guard<std::mutex> cache_lock(mu_);
     if (!cache_disabled) {
       auto it = cache_.find(sig);
-      if (it != cache_.end())
+      if (it != cache_.end()) {
+        it->second.last_used = ++tick_;
+        hits_++;
         return it->second;
+      }
+      misses_++;
     }
 
     if (gpu_verbose()) {
@@ -430,7 +453,152 @@ public:
   }
 
   size_t size() const { return cache_.size(); }
-  void clear() { cache_.clear(); }
+  void clear() {
+    std::lock_guard<std::mutex> lock(mu_);
+    cache_.clear();
+  }
+
+  // aer-0028: evict down to max_entries, least-recently-used first.
+  //
+  // MUST NOT be called while any CachedPlan reference is live: hipTensor holds
+  // pointers into the entry's own storage, so erasing one under a live
+  // reference is a use-after-free that shows up as silent zero-output rather
+  // than a fault. The only call site is the top of setup_contraction(), before
+  // the prebuild loop and long before contract_single_slice takes a reference.
+  void trim(size_t max_entries) {
+    std::lock_guard<std::mutex> lock(mu_);
+    while (cache_.size() > max_entries) {
+      auto victim = cache_.end();
+      uint64_t best = UINT64_MAX;
+      for (auto it = cache_.begin(); it != cache_.end(); ++it) {
+        if (it->second.last_used < best) {
+          best = it->second.last_used;
+          victim = it;
+        }
+      }
+      if (victim == cache_.end())
+        break;
+      cache_.erase(victim);
+    }
+  }
+
+  void stats(uint64_t &h, uint64_t &m, size_t &n) {
+    std::lock_guard<std::mutex> lock(mu_);
+    h = hits_;
+    m = misses_;
+    n = cache_.size();
+  }
+};
+
+//=============================================================================
+// aer-0028: process-wide hipTensor plan cache
+//=============================================================================
+//
+// WHY
+// GPUResourceManager is a MEMBER of the contractor, and a contractor is built
+// and destroyed per instruction (create_contractor / delete contractor
+// throughout tensor_net.hpp). So GPUDevice::init() runs hiptensorCreate and
+// starts an EMPTY plan cache every evaluation, and ~101 hipTensor plans are
+// rebuilt from nothing each time.
+//
+// aer-0027 removed the cotengra search (t_path_ms=0 on a repeat). Job 20512566
+// measured what is left: with t_path already zero, t_setup is still 3431 ms
+// (grid n=16) and 2603 ms (rand3 n=64) against a GPU contraction of 7.8 ms and
+// 5.7 ms. The contraction is 0.22% of its own setup, and essentially all the
+// remainder is this cache being thrown away and rebuilt. Target: ~450x.
+//
+// WHY ONLY THE HANDLE AND THE PLAN CACHE MOVE
+// CachedPlan owns hipTensor descriptors, the plan object, and HOST-side mode /
+// extent / stride vectors. It owns no device memory and calls no hipMalloc.
+// Every device pointer, the workspace and the stream are passed as arguments to
+// hiptensorContraction at call time (see contract_split_complex). So the pool,
+// the tensor arena, the stream and the thrust buffers stay per-contractor,
+// where their lifetime is already correct, and only {handle, plan cache} are
+// shared. The handle must move WITH the plans because the descriptors are
+// initialised against it; a plan built on one handle and executed on another is
+// undefined.
+//
+// THE LIFETIME TRAP
+// hiptensorInitContractionDescriptor and hiptensorInitContractionPlan retain
+// pointers INTO the CachedPlan's own storage (documented at the top of
+// get_or_create). Destroying or relocating an entry while a reference to it is
+// live is a use-after-free whose symptom is silent zero-output, not a crash.
+// contract_single_slice holds `const CachedPlan &` across a per-tile loop, so:
+//   * rehash on insert is SAFE -- unordered_map preserves references to
+//     elements across rehash, invalidating only iterators;
+//   * erase is NOT safe mid-contraction.
+// Eviction is therefore never performed inside get_or_create. trim() exists as
+// a separate call, made only from setup_contraction() before any reference has
+// been taken.
+//
+// THREAD SAFETY
+// A process-wide cache can be reached from concurrent contractors. get_or_create
+// and trim take a mutex; the returned reference is used outside it, which is
+// sound only because of the no-erase rule above. Plan CREATION on the shared
+// handle is serialised by the same mutex.
+//
+// MPI: setup_pool_and_cache contains no collectives, so this is rank-local and
+// needs none of aer-0027's nprocs_ == 1 restriction. Each rank is its own
+// process and gets its own registry.
+//
+// Off by default. AER_TN_SHARED_PLAN_CACHE=1 enables;
+// AER_TN_SHARED_PLAN_CACHE_MAX caps entries (default 4096, host memory only,
+// roughly a kilobyte or two each).
+
+static bool tn_shared_plan_cache() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_SHARED_PLAN_CACHE");
+    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
+}
+
+static size_t tn_shared_plan_cache_max() {
+  static bool checked = false;
+  static size_t cached = 4096;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_SHARED_PLAN_CACHE_MAX");
+    if (v != nullptr) {
+      char *end = nullptr;
+      long long p = std::strtoll(v, &end, 10);
+      if (end != v && p > 0)
+        cached = static_cast<size_t>(p);
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+// One {handle, cache} per device id, created on first use and DELIBERATELY
+// never destroyed. Tearing a hiptensorHandle_t down during static destruction
+// would order it against the HIP runtime's own teardown, and any plan still
+// referencing it would be used-after-free; leaking one handle per device for
+// the life of the process is the safer trade.
+template <typename data_t> class SharedPlanRegistry {
+public:
+  struct Slot {
+    hiptensorHandle_t *handle;
+    HipTensorPlanCache<data_t> cache;
+    Slot() : handle(nullptr) {}
+  };
+
+  static Slot *acquire(int device_id) {
+    static std::mutex reg_mu;
+    static std::map<int, Slot *> slots;
+    std::lock_guard<std::mutex> lock(reg_mu);
+    typename std::map<int, Slot *>::iterator it = slots.find(device_id);
+    if (it != slots.end())
+      return it->second;
+    Slot *s = new Slot();          // never deleted, by design (see above)
+    check_hiptensor(hiptensorCreate(&s->handle), "hiptensorCreate(shared)",
+                    device_id);
+    s->cache.init(s->handle, device_id);
+    slots[device_id] = s;
+    return s;
+  }
 };
 
 //=============================================================================
@@ -615,6 +783,12 @@ template <typename data_t> class GPUDevice {
   bool handle_valid_;
 
   HipTensorPlanCache<data_t> plan_cache_;
+  // aer-0028: when shared-plan-cache mode is on this points at the process-wide
+  // slot for this device and plan_cache_ above goes unused. The pool, the
+  // arena, the stream and the thrust buffers are deliberately NOT shared --
+  // they own device memory whose lifetime is already correct per contractor,
+  // and only the handle and the plans need to outlive one.
+  typename SharedPlanRegistry<data_t>::Slot *shared_slot_ = nullptr;
   MemoryPool pool_;
   std::vector<bool> peer_access_;
   void *tensor_data_ptr_;
@@ -649,9 +823,19 @@ public:
     check_hip(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
               "hipStreamCreateWithFlags", device_id_);
 
-    check_hiptensor(hiptensorCreate(&ht_handle_), "hiptensorCreate", device_id_);
-    handle_valid_ = true;
-    plan_cache_.init(ht_handle_, device_id_);
+    if (tn_shared_plan_cache()) {
+      // Reuse the process-wide handle. handle_valid_ stays FALSE so release()
+      // does not hiptensorDestroy it out from under plans that outlive this
+      // contractor -- that would be a use-after-free on the next instruction.
+      shared_slot_ = SharedPlanRegistry<data_t>::acquire(device_id_);
+      ht_handle_ = shared_slot_->handle;
+      handle_valid_ = false;
+    } else {
+      check_hiptensor(hiptensorCreate(&ht_handle_), "hiptensorCreate",
+                      device_id_);
+      handle_valid_ = true;
+      plan_cache_.init(ht_handle_, device_id_);
+    }
 
     peer_access_.resize(total_device_count, false);
     for (int other = 0; other < total_device_count; other++) {
@@ -928,7 +1112,10 @@ public:
   bool has_peer_access(int other_device) const { return peer_access_[other_device]; }
   hipStream_t stream() const { return stream_; }
   hiptensorHandle_t *handle() { return ht_handle_; }
-  HipTensorPlanCache<data_t> &plan_cache() { return plan_cache_; }
+  HipTensorPlanCache<data_t> &plan_cache() {
+    return shared_slot_ ? shared_slot_->cache : plan_cache_;
+  }
+  bool plan_cache_is_shared() const { return shared_slot_ != nullptr; }
   MemoryPool &pool() { return pool_; }
   thrust::device_vector<thrust::complex<data_t>> &output_buffer() { return dev_out_; }
   void *tensor_data_ptr() const { return tensor_data_ptr_; }
@@ -938,7 +1125,12 @@ public:
     if (device_id_ < 0) return;
     hipSetDevice(device_id_);
     pool_.release();
-    plan_cache_.clear();
+    // aer-0028: never clear the shared cache here -- surviving this
+    // contractor is the entire point, and the plans are still valid because
+    // the shared handle is never destroyed. The private cache is cleared as
+    // before so non-shared mode is byte-for-byte unchanged.
+    if (!shared_slot_)
+      plan_cache_.clear();
     if (tensor_data_ptr_) { hipFree(tensor_data_ptr_); tensor_data_ptr_ = nullptr; }
     tensor_data_size_ = 0;
     dev_out_.clear(); dev_out_.shrink_to_fit();
