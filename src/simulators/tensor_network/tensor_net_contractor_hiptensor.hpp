@@ -74,6 +74,24 @@ static bool tn_debug() {
   return enabled;
 }
 
+// aer-0024: keep the prebuilt plan cache and memory pool across a
+// topology-matching set_network() / set_additional_tensors(). Default ON.
+// Set AER_TN_POOL_REUSE=0 to restore the pre-aer-0024 behaviour, in which
+// every such call invalidated pool_ready_ and re-ran the whole prebuild pass.
+// The knob exists so both arms can be measured in ONE job: prebuild count,
+// pool allocations and tiled-plan-creation exposure are all directly
+// comparable without a rebuild between arms.
+static bool tn_pool_reuse() {
+  static bool checked = false;
+  static bool enabled = true;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_POOL_REUSE");
+    enabled = !(val != nullptr && std::string(val) == "0");
+    checked = true;
+  }
+  return enabled;
+}
+
 // Opt-in wall-clock profiling. Inert unless AER_TN_PROFILE=1: when off, no
 // timers are read and no GPU stream syncs are added, so the default execution
 // path is byte-for-byte unchanged in both result and performance. When on, each
@@ -719,6 +737,17 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
 
   std::vector<std::vector<int32_t>> prev_modes_;
   std::vector<std::vector<int64_t>> prev_extents_;
+  // aer-0024: the OUTPUT spec the cached plan and the cached step_plan_specs_
+  // were built for. setup_pool_and_cache() reorders the final step's C
+  // descriptor into modes_out_ order (see the `step == num_steps - 1` branch),
+  // so the prebuilt specs are only valid for the output they were built with.
+  // Before aer-0024 that was masked: every set_additional_tensors() cleared
+  // pool_ready_ and the specs were rebuilt from the current modes_out_. Now
+  // that they persist, the reuse predicate must cover the output too, or a
+  // caller that varied modes_out_ while holding the inputs fixed would contract
+  // with a stale C mode order and return a silently wrong answer.
+  std::vector<int32_t> prev_modes_out_;
+  std::vector<int64_t> prev_extents_out_;
   bool prev_valid_;
   // Tiling-engaged state the cached plan was built with. A reused plan must be
   // set up with the same engaged value; otherwise setup_pool_and_cache re-trips
@@ -908,7 +937,16 @@ void TensorNetContractor_HipTensor<data_t>::set_network(
 
   tensor_device_ptrs_ = gpu_mgr_.primary().copy_tensor_data(input_tensors_, true);
   build_network_description();
-  pool_ready_ = false;
+  // aer-0024: do NOT invalidate the pool here. The pool holds only
+  // plan-derived intermediates and the shape-keyed hipTensor plan cache;
+  // neither depends on tensor VALUES, and input data is addressed through
+  // tensor_device_ptrs_, which was just refreshed above and is re-read on
+  // every contraction. A topology or output-spec change is caught by
+  // topology_matches_previous() in setup_contraction(), whose cache-miss
+  // branch clears pool_ready_ itself. Keeping it set turns get_amplitudes()'
+  // N-amplitude loop from N full prebuild passes into 1.
+  if (!tn_pool_reuse())
+    pool_ready_ = false;
 
   if (tn_verbose()) {
     fprintf(stderr,
@@ -980,7 +1018,14 @@ void TensorNetContractor_HipTensor<data_t>::set_additional_tensors(
   // points at real, dedicated slots.
   tensor_device_ptrs_ = gpu_mgr_.primary().copy_tensor_data(input_tensors_, true);
   build_network_description();
-  pool_ready_ = false;
+  // aer-0024: same reasoning as set_network(). The Pauli leaves of a
+  // save_expval batch differ only in their VALUES; their modes and extents are
+  // identical across I/X/Y/Z, so the plan, the step specs and the pool stay
+  // valid. This is the site that made aer-0022's reuse partial: the path
+  // search was skipped but the ~101-step prebuild still ran once per term,
+  // which is what multiplied tiled-plan-creation fault exposure by M.
+  if (!tn_pool_reuse())
+    pool_ready_ = false;
 
   if (tn_verbose())
     fprintf(stderr, "[AER_TN] set_additional_tensors: %zu additional (%zu total)\n",
@@ -1161,6 +1206,13 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
       if (!pool_ready_) {
         setup_pool_and_cache(0, engaged);
         pool_ready_ = true;
+      } else if (tn_verbose() && myrank_ == 0) {
+        // aer-0024: the counterpart of "reusing previous contraction path".
+        // Its ABSENCE on a term that printed the path-reuse line is exactly the
+        // partial-reuse symptom aer-0024 removes, so the diagnostic greps for
+        // this line rather than inferring reuse from a missing prebuild block.
+        fprintf(stderr,
+                "[AER_TN] reusing prebuilt plan cache and memory pool\n");
       }
 
       slice_begin_ = myrank_ * plan_.num_slices / nprocs_;
@@ -1991,6 +2043,15 @@ bool TensorNetContractor_HipTensor<data_t>::topology_matches_previous() const {
     for (size_t j = 0; j < ext.size(); j++)
       if (ext[j] != prev_extents_[i][j]) return false;
   }
+  // aer-0024: the output spec is part of the topology. The cached plan was
+  // searched against network_desc_.output_modes, and the cached step specs
+  // carry a final-step C descriptor written in modes_out_ order. Reusing
+  // either against a different output is wrong, and now that pool_ready_
+  // survives set_network()/set_additional_tensors() it would be silently
+  // wrong rather than merely wasteful. Both batch callers hold the output
+  // fixed across the batch, so this costs nothing on the paths that matter.
+  if (modes_out_ != prev_modes_out_) return false;
+  if (extents_out_ != prev_extents_out_) return false;
   return true;
 }
 
@@ -2002,6 +2063,11 @@ void TensorNetContractor_HipTensor<data_t>::cache_topology() {
     prev_modes_.push_back(input_tensors_[i]->modes());
     prev_extents_.push_back(input_tensors_[i]->extents());
   }
+  // aer-0024: record the output this plan and these step specs were built for.
+  // Called from the cache-miss branch of setup_contraction(), after
+  // network_desc_.output_modes/_extents have been assigned from modes_out_.
+  prev_modes_out_ = modes_out_;
+  prev_extents_out_ = extents_out_;
   prev_valid_ = true;
 }
 
