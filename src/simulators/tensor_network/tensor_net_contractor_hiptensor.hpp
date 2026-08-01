@@ -1162,6 +1162,14 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
   if (tiling_mode == TilingMode::Auto && modes_out_.size() > 12)
     engaged = true;
 
+  // aer-0030: if the m6n6k6 gate has already fired anywhere in this process,
+  // do not pay a search to rediscover it. An intermediate-only oversized step
+  // is invisible until a plan exists, so the FIRST contraction still pays the
+  // discovery; every later one starts where that one ended. Set in the catch
+  // below; see tn_tiling_latch_set() for why this is MPI-safe.
+  if (tiling_mode == TilingMode::Auto && tn_tiling_latched())
+    engaged = true;
+
   bool retried = false;
   while (true) {
     try {
@@ -1343,10 +1351,16 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
       if (tn_verbose() && myrank_ == 0)
         fprintf(stderr,
                 "[AER_TN] oversized step detected at %s; tiling auto-enabled "
-                "for this run (re-planning once)\n",
-                e.where());
+                "%s (re-planning once)\n",
+                e.where(),
+                tn_tiling_latch_enabled() ? "for the rest of this process"
+                                          : "for this contraction only");
       engaged = true;
       retried = true;
+      // aer-0030: record it process-wide so the next topology does not repeat
+      // the discovery. This is the whole point: the discovery costs a full
+      // cotengra search whose plan is then thrown away.
+      tn_tiling_latch_set();
       // Force a fresh path search on pass 2: the held-back plan must not be
       // reused, and pool/topology caches from pass 1 are stale.
       plan_valid_ = false;

@@ -13,6 +13,7 @@
 #define _path_optimizer_hpp_
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -78,6 +79,68 @@ static bool path_verbose() {
 // AER_TN_ENABLE_TILING is unset, AER_TN_TILING is consulted: "on"/"off"/"auto"
 // (case-insensitive); unset or unrecognised is AUTO.
 enum class TilingMode { Off, On, Auto };
+
+// aer-0030: process-wide latch on the AUTO tiling decision.
+//
+// WHY. Under AUTO, `engaged` is a LOCAL re-initialised on every
+// setup_contraction call, so a workload in which every contraction needs
+// tiling rediscovers that fact every single time: pass 1 runs a full cotengra
+// search with tiling held back, trips the m6n6k6 gate, throws the plan away,
+// and pass 2 searches again with tiling engaged. Job 20539864 (10000-vertex
+// random 3-regular MaxCut at depth 3) retried on 48 of its 50 contractions and
+// measured 9871 ms of cold path per class -- that is TWO searches of about
+// 4935 ms. Roughly 123 s of that 308 s run was spent searching for plans
+// discarded by design.
+//
+// The message the retry already prints claims tiling is enabled "for this
+// run". It was not; this makes it true. After the gate has fired once, every
+// later setup starts engaged, so a new topology pays one search instead of two
+// and a repeat topology skips the doomed pass-1 lookup entirely.
+//
+// SAFETY. The latch can only ever turn tiling ON, and tiling is the validated
+// WS-3 path: an oversized step decomposes into m6n6k6 sub-contractions, and a
+// step that does not need it produces no tiles and is untouched. What does
+// change is that the planner is handed tiling_available=true from the start,
+// so it may return a DIFFERENT contraction order. Any order is exact, so this
+// is a performance question and not a correctness one, but it is why the knob
+// below exists.
+//
+// MPI. The latch is per-process, which is safe because the decision is already
+// collective: the planner gate throws collectively after an Allreduce, and the
+// contractor gate fires on a MINLOC-broadcast plan that is identical on every
+// rank. Every rank therefore latches on the same contraction.
+//
+// AER_TN_TILING_LATCH=0 (or off/false) restores the per-contraction
+// rediscovery, which is how to A/B it without a rebuild.
+static std::atomic<bool> &tn_tiling_latch_flag() {
+  static std::atomic<bool> latched(false);
+  return latched;
+}
+
+static bool tn_tiling_latch_enabled() {
+  static bool checked = false;
+  static bool cached = true;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_TILING_LATCH");
+    if (val != nullptr) {
+      std::string s(val);
+      for (char &c : s) c = static_cast<char>(std::tolower(c));
+      cached = !(s == "0" || s == "off" || s == "false");
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+static bool tn_tiling_latched() {
+  return tn_tiling_latch_enabled() &&
+         tn_tiling_latch_flag().load(std::memory_order_relaxed);
+}
+
+static void tn_tiling_latch_set() {
+  if (tn_tiling_latch_enabled())
+    tn_tiling_latch_flag().store(true, std::memory_order_relaxed);
+}
 
 static TilingMode tn_tiling_mode() {
   static bool checked = false;
