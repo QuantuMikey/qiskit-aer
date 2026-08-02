@@ -1789,18 +1789,49 @@ public:
     // engaged in lockstep. A non-tiling failure (OOM, CK error) is not this type
     // and is left to propagate uniformly.
     ContractionPlan local;
-    int local_needs_tiling = 0;
+    int local_status = 0; // 0 ok, 1 needs tiling, 2 hard failure
+    std::string local_msg;
     try {
       local = inner_->find_path(network, memory_limit_bytes, seed + rank,
                                 tiling_available);
     } catch (const NeedsTilingException &) {
-      local_needs_tiling = 1;
+      local_status = 1;
+    } catch (const std::exception &e) {
+      // aer-0037: this catch is new and it closes a real hang. The per-rank
+      // seed is seed + rank, so ranks search DIFFERENT trajectories and a
+      // failure is genuinely not uniform: cotengra's "no feasible contraction
+      // path" error, a py::error_already_set from a dead loky worker, or a
+      // std::bad_alloc can strike one rank and not another. Before this, such
+      // an exception escaped BEFORE the Allreduce below, so the throwing rank
+      // unwound while every sibling blocked in that Allreduce forever.
+      // py::error_already_set derives from std::runtime_error, so it is caught
+      // here. The NeedsTilingException catch must stay first: it also derives
+      // from std::runtime_error and is a control signal, not a failure.
+      local_status = 2;
+      local_msg = e.what();
+    } catch (...) {
+      // Nothing of unknown type may escape either: it would unwind this
+      // rank alone and leave every sibling in the Allreduce below.
+      local_status = 2;
+      local_msg =
+          "[AER_TN] the contraction path search raised an exception of "
+          "unknown type on this rank; caught so the ranks fail together.";
     }
 
-    int any_needs_tiling = 0;
-    MPI_Allreduce(&local_needs_tiling, &any_needs_tiling, 1, MPI_INT, MPI_MAX,
-                  comm_);
-    if (any_needs_tiling) {
+    // MPI_MAX: a hard failure on any rank outranks a tiling retry on another,
+    // so a real error is never masked by a re-plan.
+    int global_status = 0;
+    MPI_Allreduce(&local_status, &global_status, 1, MPI_INT, MPI_MAX, comm_);
+    if (global_status >= 2) {
+      if (local_status >= 2)
+        throw std::runtime_error(local_msg);
+      throw std::runtime_error(
+          "[AER_TN] MPI path search aborted: at least one rank failed during "
+          "its contraction-path search, so every rank fails together rather "
+          "than blocking at the cross-rank reduction. The failing rank reports "
+          "the underlying cause.");
+    }
+    if (global_status == 1) {
       throw NeedsTilingException(
           NeedsTilingException::Gate::Planner,
           "MPI path search: at least one rank produced an above-envelope "

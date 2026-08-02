@@ -869,6 +869,13 @@ private:
   void agree_or_fail_together(int local_failed, const std::string &local_msg);
   bool agree_plan_cache_hit(bool local_hit);
 #endif
+  // aer-0037. Declared OUTSIDE the AER_MPI guard above, matching its definition:
+  // it is written to work single-rank as well, where it degenerates to
+  // rethrow-locally, so setup_contraction keeps one code path instead of two.
+  // Both call sites are likewise unguarded. If this were inside the guard, a
+  // build without AER_MPI would fail to compile -- the definition would name a
+  // non-member and the calls an undeclared function.
+  int agree_setup_status(int local_status, const std::string &local_msg);
   void contract_all();
   double sample_measure_on_primary(reg_t &samples, std::vector<double> &rnds,
                                    uint_t num_qubits);
@@ -1149,46 +1156,85 @@ void TensorNetContractor_HipTensor<data_t>::set_output(
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     bool use_autotune) {
-  // aer-0031: the flag used to be discarded here while the cuTensorNet path
-  // honoured it. Latch the hipTensor selector from it on first use, so
-  // config.use_cuTensorNet_autotuning=True reaches this backend instead of
-  // dead-ending. AER_TN_HIPTENSOR_ALGO overrides. See tn_hiptensor_algo() for
-  // why the choice is process-wide rather than per-call.
-  (void)tn_hiptensor_algo(use_autotune);
 #ifdef AER_MPI
   MPI_Comm_size(MPI_COMM_WORLD, &nprocs_);
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank_);
 #endif
 
+  // aer-0037 WINDOW 0: everything before the retry loop. tn_hiptensor_algo()
+  // THROWS on an unrecognised AER_TN_HIPTENSOR_ALGO, the shared-cache trim and
+  // the network_desc_ assignments allocate, and none of it was reachable by any
+  // agreement -- a throw here left the siblings blocked at window 1's collective
+  // below. tn_hiptensor_algo() moved BELOW MPI_Comm_size so nprocs_ is known
+  // before anything can throw; it reads only the environment and the flag, so
+  // the move is behaviour-neutral.
+  //
+  // The two network_desc_ assignments moved ABOVE the profiling reset so they
+  // sit inside this guard. They are two vector copies of a handful of ints; the
+  // sub-microsecond they no longer contribute to t_setup_ms is far below the
+  // measurement's resolution.
+  {
+    int w0_status = 0;
+    std::string w0_msg;
+    try {
+      // aer-0031: the flag used to be discarded here while the cuTensorNet path
+      // honoured it. Latch the hipTensor selector from it on first use, so
+      // config.use_cuTensorNet_autotuning=True reaches this backend instead of
+      // dead-ending. AER_TN_HIPTENSOR_ALGO overrides. See tn_hiptensor_algo()
+      // for why the choice is process-wide rather than per-call.
+      (void)tn_hiptensor_algo(use_autotune);
+      network_desc_.output_modes = modes_out_;
+      network_desc_.output_extents = extents_out_;
+
+      // aer-0028: the ONLY safe point to evict from the shared hipTensor plan
+      // cache. hipTensor retains pointers into each CachedPlan's own storage,
+      // and contract_single_slice holds `const CachedPlan &` across its
+      // per-tile loop, so erasing an entry any later is a use-after-free whose
+      // symptom is silent zero-output rather than a fault. Here nothing holds a
+      // reference yet: the prebuild loop has not run and contraction is two
+      // phases away.
+      //
+      // Still ABOVE the profiling reset: trim and the stats read are
+      // bookkeeping, and charging them to t_setup_ms would contaminate the
+      // exact number used to measure aer-0028. myrank_ is set by the MPI block
+      // above.
+      if (tn_shared_plan_cache() && gpu_mgr_.num_devices() > 0) {
+        gpu_mgr_.primary().plan_cache().trim(tn_shared_plan_cache_max());
+        if (tn_verbose() && myrank_ == 0) {
+          uint64_t ph = 0, pm = 0;
+          size_t pn = 0;
+          gpu_mgr_.primary().plan_cache().stats(ph, pm, pn);
+          fprintf(stderr, "[AER_TN] hipTensor algorithm selector: %s\n",
+                  tn_hiptensor_algo_name());
+          fprintf(stderr,
+                  "[AER_TN_HTPLAN] shared hipTensor plan cache: hits=%llu "
+                  "misses=%llu entries=%zu\n",
+                  (unsigned long long)ph, (unsigned long long)pm, pn);
+        }
+      }
+    } catch (const std::exception &e) {
+      w0_status = 2;
+      w0_msg = e.what();
+    } catch (...) {
+      w0_status = 2;
+      w0_msg =
+          "[AER_TN] setup raised an exception of unknown type; caught so the "
+          "ranks fail together rather than one rank unwinding alone.";
+    }
+    // ONE agreement for the whole pre-loop region rather than two. Both halves
+    // sit above the profiling reset, so neither this collective nor the work it
+    // covers is charged to t_setup_ms -- the reason the trim was placed there in
+    // the first place. Merging matters because this region is on the WARM path
+    // too: a reused topology skips windows 1 and 2 entirely, so its whole MPI
+    // cost is this agreement plus the end-of-pass one, two collectives against a
+    // 5.25 ms warm setup. Single-rank pays nothing at all: agree_setup_status
+    // makes no MPI call when nprocs_ <= 1.
+    (void)agree_setup_status(w0_status, w0_msg);
+  }
+
   // setup_contraction is the first call of the setup -> contract sequence, so
   // it owns resetting the profiling accumulators for this contraction. The
   // per-rank report is emitted later, by the reduction entrypoint.
-  // aer-0028: the ONLY safe point to evict from the shared hipTensor plan
-  // cache. hipTensor retains pointers into each CachedPlan's own storage, and
-  // contract_single_slice holds `const CachedPlan &` across its per-tile loop,
-  // so erasing an entry any later is a use-after-free whose symptom is silent
-  // zero-output rather than a fault. Here nothing holds a reference yet: the
-  // prebuild loop has not run and contraction is two phases away.
-  //
-  // Placed ABOVE the profiling reset on purpose: trim and the stats read are
-  // bookkeeping, and charging them to t_setup_ms would contaminate the exact
-  // number used to measure this change. myrank_ is already set by the MPI
-  // block above.
-  if (tn_shared_plan_cache() && gpu_mgr_.num_devices() > 0) {
-    gpu_mgr_.primary().plan_cache().trim(tn_shared_plan_cache_max());
-    if (tn_verbose() && myrank_ == 0) {
-      uint64_t ph = 0, pm = 0;
-      size_t pn = 0;
-      gpu_mgr_.primary().plan_cache().stats(ph, pm, pn);
-      fprintf(stderr, "[AER_TN] hipTensor algorithm selector: %s\n",
-              tn_hiptensor_algo_name());
-      fprintf(stderr,
-              "[AER_TN_HTPLAN] shared hipTensor plan cache: hits=%llu "
-              "misses=%llu entries=%zu\n",
-              (unsigned long long)ph, (unsigned long long)pm, pn);
-    }
-  }
-
   std::chrono::steady_clock::time_point prof_setup_t0;
   if (tn_profile()) {
     prof_setup_ms_ = 0.0;
@@ -1198,9 +1244,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_reduce_mpi_ms_ = 0.0;
     prof_setup_t0 = std::chrono::steady_clock::now();
   }
-
-  network_desc_.output_modes = modes_out_;
-  network_desc_.output_extents = extents_out_;
 
   // Tiling enable policy for THIS setup (AUTO lazy retry).
   //
@@ -1239,6 +1282,14 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
   bool retried = false;
   while (true) {
     try {
+      // aer-0037: one status for every throw site AFTER the last collective of
+      // this pass. 0 = ok, 1 = this rank needs tiling, 2 = hard failure. The
+      // agreement at the end of the pass takes MPI_MAX, so a hard failure on
+      // any rank outranks a tiling retry on another -- masking a real failure
+      // behind a retry would be worse than either.
+      int setup_status = 0;
+      std::string setup_msg;
+      std::exception_ptr setup_tiling;
       if (prev_valid_ && plan_valid_ && topology_matches_previous()) {
         // Restore the tiling state this plan was planned/set-up with. engaged is
         // re-initialized to false each setup (AUTO + scalar output), so without
@@ -1248,14 +1299,41 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
         if (tn_verbose() && myrank_ == 0)
           fprintf(stderr, "[AER_TN] reusing previous contraction path\n");
       } else {
-        gpu_mgr_.primary().refresh_free_memory();
-        size_t free_bytes = gpu_mgr_.primary().free_memory();
+        // aer-0037 WINDOW 1. Everything from here to the budget Allreduce is
+        // local and hardware-dependent: refresh_free_memory() throws through
+        // check_hip(hipMemGetInfo), and query_workspace_for_size() builds
+        // hipTensor descriptors and can throw too. Both depend on THIS rank's
+        // device, so they are not uniform across ranks. A throw here escapes
+        // setup_contraction -- there is no try/catch anywhere in
+        // tensor_net.hpp or tensor_net_state.hpp, and agree_or_fail_together
+        // wraps only contract_all/accumulate_across_gpus inside the contract
+        // entrypoints -- while every sibling walks into the budget Allreduce
+        // below and blocks forever. Catch, agree, and fail together instead.
+        size_t free_bytes = 0;
+        uint64_t workspace_estimate = 0;
+        {
+          int w1_status = 0;
+          std::string w1_msg;
+          try {
+            gpu_mgr_.primary().refresh_free_memory();
+            free_bytes = gpu_mgr_.primary().free_memory();
 
-        int64_t max_possible_elements = 1;
-        for (size_t i = 0; i < extents_out_.size(); i++)
-          max_possible_elements *= extents_out_[i];
-        uint64_t workspace_estimate =
-            gpu_mgr_.query_workspace_for_size(max_possible_elements);
+            int64_t max_possible_elements = 1;
+            for (size_t i = 0; i < extents_out_.size(); i++)
+              max_possible_elements *= extents_out_[i];
+            workspace_estimate =
+                gpu_mgr_.query_workspace_for_size(max_possible_elements);
+          } catch (const std::exception &e) {
+            w1_status = 2;
+            w1_msg = e.what();
+          } catch (...) {
+            w1_status = 2;
+            w1_msg =
+                "[AER_TN] setup raised an exception of unknown type; caught so the "
+                "ranks fail together rather than one rank unwinding alone.";
+          }
+          (void)agree_setup_status(w1_status, w1_msg);
+        }
 
         uint64_t memory_budget = free_bytes;
         if (workspace_estimate < free_bytes)
@@ -1317,10 +1395,33 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
         // elem_bytes mirrors create_optimizer() exactly (2 * sizeof(data_t)),
         // not sizeof(std::complex<data_t>), so the key cannot drift from the
         // value the optimizer actually clamps against.
+        // aer-0037 WINDOW 2. The optimizer is constructed HERE rather than
+        // lazily at the search below, so that a failure to construct it is
+        // caught inside this guarded region and agreed by the cache verdict's
+        // collective. Constructed lazily it sat between two collectives with no
+        // agreement point, and a throw there hung every sibling inside
+        // find_path's allreduce. Hoisting is free: CotengPathOptimizer's
+        // constructor is pure member initialisation -- the cotengra import
+        // lives in build_mode_mapping(), which find_path calls -- so building
+        // it on a cache hit costs two small heap objects and no Python at all.
         const size_t plan_elem_bytes = 2 * sizeof(data_t);
         std::string plan_key;
         bool plan_from_cache = false;
-        if (tn_plan_cache_enabled()) {
+        std::unique_ptr<PathOptimizer> optimizer;
+        int w2_status = 0;
+        std::string w2_msg;
+        try {
+          optimizer = create_optimizer();
+        } catch (const std::exception &e) {
+          w2_status = 2;
+          w2_msg = e.what();
+        } catch (...) {
+          w2_status = 2;
+          w2_msg =
+              "[AER_TN] setup raised an exception of unknown type; caught so the "
+              "ranks fail together rather than one rank unwinding alone.";
+        }
+        if (tn_plan_cache_enabled() && w2_status == 0) {
           plan_key = canonical_network_key(
               network_desc_, engaged,
               plan_key_target_elements(memory_budget, plan_elem_bytes),
@@ -1328,17 +1429,23 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           if (!plan_key.empty())
             plan_from_cache =
                 plan_cache_instance().get(plan_key, network_desc_, plan_);
-#ifdef AER_MPI
-          if (nprocs_ > 1)
-            plan_from_cache = agree_plan_cache_hit(plan_from_cache);
-#endif
         }
+        // Agreed AFTER the cache block, not inside it: a rank whose optimizer
+        // failed to construct must still reach this collective, or the ranks
+        // that succeeded would block in it alone. A failed rank reports a miss,
+        // which is the safe direction -- everyone searches -- and the hard
+        // failure is then agreed immediately below.
+#ifdef AER_MPI
+        if (nprocs_ > 1)
+          plan_from_cache =
+              agree_plan_cache_hit(w2_status == 0 && plan_from_cache);
+#endif
+        (void)agree_setup_status(w2_status, w2_msg);
 
         std::chrono::steady_clock::time_point prof_path_t0;
         if (tn_profile())
           prof_path_t0 = std::chrono::steady_clock::now();
         if (!plan_from_cache) {
-          auto optimizer = create_optimizer();
           plan_ = optimizer->find_path(network_desc_, memory_budget,
                                        tn_path_seed(), engaged);
           if (!plan_key.empty())
@@ -1364,42 +1471,83 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
                   plan_key.empty() ? " (network not keyable; not cached)" : "");
         }
 
-        // Slice-count ceiling: refuse an over-sliced plan rather than grind
-        // (see tn_max_slices). plan_.num_slices is the MINLOC-broadcast value,
-        // identical on every rank, so this throws collectively and cleanly.
-        if (tn_max_slices() > 0 && plan_.num_slices > tn_max_slices()) {
-          std::stringstream err;
-          err << "[AER_TN] plan has " << plan_.num_slices
-              << " slices, exceeding the AER_TN_MAX_SLICES ceiling of "
-              << tn_max_slices() << ". The per-slice budget is too tight for "
-                 "this circuit (a slice-grind). Raise AER_TN_SLICE_TARGET_BYTES, "
-                 "raise AER_TN_MAX_SLICES if the cost is acceptable, or use "
-                 "method='statevector'.";
-          throw std::runtime_error(err.str());
+        // aer-0037 WINDOW 3a: the tail of this branch runs AFTER the last
+        // collective of the pass, so a throw here leaves the siblings blocked
+        // at the end-of-pass agreement below rather than at a collective. It is
+        // caught into setup_status for the same reason.
+        try {
+          // Slice-count ceiling: refuse an over-sliced plan rather than grind
+          // (see tn_max_slices). plan_.num_slices is the MINLOC-broadcast
+          // value, identical on every rank, so every rank raises this together
+          // and each reports its own message.
+          if (tn_max_slices() > 0 && plan_.num_slices > tn_max_slices()) {
+            std::stringstream err;
+            err << "[AER_TN] plan has " << plan_.num_slices
+                << " slices, exceeding the AER_TN_MAX_SLICES ceiling of "
+                << tn_max_slices() << ". The per-slice budget is too tight for "
+                   "this circuit (a slice-grind). Raise "
+                   "AER_TN_SLICE_TARGET_BYTES, raise AER_TN_MAX_SLICES if the "
+                   "cost is acceptable, lower AER_TN_MIN_SLICES_PER_RANK if "
+                   "the distribution floor put it here (aer-0035 asks for at "
+                   "least that many slices PER RANK, so the floor scales with "
+                   "the rank count), or use method='statevector'.";
+            throw std::runtime_error(err.str());
+          }
+
+          plan_valid_ = true;
+          pool_ready_ = false;
+          cache_topology();
+          prev_engaged_ = engaged;
+        } catch (const NeedsTilingException &) {
+          // Nothing in 3a raises this today -- the slice ceiling is a
+          // runtime_error and cache_topology only copies vectors. It is handled
+          // anyway so 3a and 3b behave identically: without it, a tiling gate
+          // added here later would be silently demoted to a hard failure by the
+          // std::exception catch below, because NeedsTilingException derives from
+          // std::runtime_error.
+          setup_status = 1;
+          setup_tiling = std::current_exception();
+        } catch (const std::exception &e) {
+          setup_status = 2;
+          setup_msg = e.what();
+        } catch (...) {
+          setup_status = 2;
+          setup_msg =
+              "[AER_TN] setup raised an exception of unknown type; caught so the "
+              "ranks fail together rather than one rank unwinding alone.";
         }
-
-        plan_valid_ = true;
-        pool_ready_ = false;
-        cache_topology();
-        prev_engaged_ = engaged;
       }
 
-      build_sliced_specs();
+      // aer-0037 WINDOW 3b: build_sliced_specs, the pool prebuild and the
+      // per-device setup. This is where hipMalloc for the pool, hipTensor plan
+      // creation and aer-0033's tile-list ceiling live -- every one of them
+      // resource-dependent and therefore NOT uniform across ranks. Skipped when
+      // 3a already failed, so the first cause is the one reported.
+      //
+      // NeedsTilingException is separated out and NOT treated as a failure: it
+      // is the AUTO retry signal, and folding it into the hard-failure path
+      // would disable mode tiling entirely. It is agreed on its own code so the
+      // ranks retry in lockstep, exactly as MPIParallelPathOptimizer does for
+      // the planner gate.
+      if (setup_status == 0) {
+        try {
+          build_sliced_specs();
 
-      if (!pool_ready_) {
-        setup_pool_and_cache(0, engaged);
-        pool_ready_ = true;
-      } else if (tn_verbose() && myrank_ == 0) {
-        // aer-0024: the counterpart of "reusing previous contraction path".
-        // Its ABSENCE on a term that printed the path-reuse line is exactly the
-        // partial-reuse symptom aer-0024 removes, so the diagnostic greps for
-        // this line rather than inferring reuse from a missing prebuild block.
-        fprintf(stderr,
-                "[AER_TN] reusing prebuilt plan cache and memory pool\n");
-      }
+          if (!pool_ready_) {
+            setup_pool_and_cache(0, engaged);
+            pool_ready_ = true;
+          } else if (tn_verbose() && myrank_ == 0) {
+            // aer-0024: the counterpart of "reusing previous contraction path".
+            // Its ABSENCE on a term that printed the path-reuse line is exactly
+            // the partial-reuse symptom aer-0024 removes, so the diagnostic
+            // greps for this line rather than inferring reuse from a missing
+            // prebuild block.
+            fprintf(stderr,
+                    "[AER_TN] reusing prebuilt plan cache and memory pool\n");
+          }
 
-      slice_begin_ = myrank_ * plan_.num_slices / nprocs_;
-      slice_end_ = (myrank_ + 1) * plan_.num_slices / nprocs_;
+          slice_begin_ = myrank_ * plan_.num_slices / nprocs_;
+          slice_end_ = (myrank_ + 1) * plan_.num_slices / nprocs_;
 
       // [MPI DIAG] AER_TN_MPI_DIAG_FULLSLICE forces every rank to contract the
       // whole slice range; contract() then skips the cross-rank reduction, so
@@ -1409,30 +1557,60 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
       // wrong, the bug is in the partition or the reduction. The dump (also
       // available without the override via AER_TN_MPI_DIAG) prints from every
       // rank so num_slices and the partition bounds are directly comparable.
-      const bool mpi_diag_fullslice =
-          getenv("AER_TN_MPI_DIAG_FULLSLICE") != nullptr;
-      if (mpi_diag_fullslice) {
-        slice_begin_ = 0;
-        slice_end_ = plan_.num_slices;
-      }
-      if (mpi_diag_fullslice || getenv("AER_TN_MPI_DIAG"))
-        fprintf(stderr,
-                "[AER_TN_MPIDIAG] rank %d/%d num_slices=%lu sliced_modes=%zu "
-                "begin=%lu end=%lu fullslice=%d\n",
-                myrank_, nprocs_, (unsigned long)plan_.num_slices,
-                plan_.sliced.size(), (unsigned long)slice_begin_,
-                (unsigned long)slice_end_, mpi_diag_fullslice ? 1 : 0);
+          const bool mpi_diag_fullslice =
+              getenv("AER_TN_MPI_DIAG_FULLSLICE") != nullptr;
+          if (mpi_diag_fullslice) {
+            slice_begin_ = 0;
+            slice_end_ = plan_.num_slices;
+          }
+          if (mpi_diag_fullslice || getenv("AER_TN_MPI_DIAG"))
+            fprintf(stderr,
+                    "[AER_TN_MPIDIAG] rank %d/%d num_slices=%lu "
+                    "sliced_modes=%zu begin=%lu end=%lu fullslice=%d\n",
+                    myrank_, nprocs_, (unsigned long)plan_.num_slices,
+                    plan_.sliced.size(), (unsigned long)slice_begin_,
+                    (unsigned long)slice_end_, mpi_diag_fullslice ? 1 : 0);
 
-      num_devices_used_ = 1;
-      if (gpu_mgr_.num_devices() > 1 &&
-          (slice_end_ - slice_begin_) > gpu_mgr_.num_devices()) {
-        num_devices_used_ = gpu_mgr_.num_devices();
-        for (size_t i = 1; i < gpu_mgr_.num_devices(); i++) {
-          gpu_mgr_.device(i).copy_tensor_data_from(gpu_mgr_.primary());
-          gpu_mgr_.device(i).allocate_output(out_size_);
-          if (!gpu_mgr_.device(i).pool().is_allocated())
-            setup_pool_and_cache(i, engaged);
+          num_devices_used_ = 1;
+          if (gpu_mgr_.num_devices() > 1 &&
+              (slice_end_ - slice_begin_) > gpu_mgr_.num_devices()) {
+            num_devices_used_ = gpu_mgr_.num_devices();
+            for (size_t i = 1; i < gpu_mgr_.num_devices(); i++) {
+              gpu_mgr_.device(i).copy_tensor_data_from(gpu_mgr_.primary());
+              gpu_mgr_.device(i).allocate_output(out_size_);
+              if (!gpu_mgr_.device(i).pool().is_allocated())
+                setup_pool_and_cache(i, engaged);
+            }
+          }
+        } catch (const NeedsTilingException &) {
+          setup_status = 1;
+          setup_tiling = std::current_exception();
+        } catch (const std::exception &e) {
+          setup_status = 2;
+          setup_msg = e.what();
+        } catch (...) {
+          setup_status = 2;
+          setup_msg =
+              "[AER_TN] setup raised an exception of unknown type; caught so the "
+              "ranks fail together rather than one rank unwinding alone.";
         }
+      }
+
+      // aer-0037: the single agreement point for this pass. Throws on every
+      // rank if any rank failed hard; returns 1 if any rank needs tiling and
+      // none failed. Reached by every rank, because every throw site after the
+      // last collective has been caught above.
+      if (agree_setup_status(setup_status, setup_msg) == 1) {
+        // Re-raise the ORIGINAL exception on the rank that produced it, so its
+        // gate and shape reach the retry's info line unchanged; ranks that did
+        // not throw raise an equivalent one so the retry is collective. Mirrors
+        // MPIParallelPathOptimizer's handling of the planner gate.
+        if (setup_tiling)
+          std::rethrow_exception(setup_tiling);
+        throw NeedsTilingException(
+            NeedsTilingException::Gate::Contractor,
+            "a sibling MPI rank hit the m6n6k6 envelope during prebuild; "
+            "re-planning all ranks with tiling engaged in lockstep.");
       }
 
       break;
@@ -2092,6 +2270,57 @@ bool TensorNetContractor_HipTensor<data_t>::agree_plan_cache_hit(
   return true;
 }
 #endif
+
+// aer-0037: agree the outcome of a setup phase across ranks.
+//
+//   0 = this rank is fine
+//   1 = this rank needs tiling (the AUTO retry signal)
+//   2 = this rank failed hard
+//
+// MPI_MAX, so a hard failure anywhere outranks a tiling retry anywhere. The
+// other order would leave the run re-planning a network that cannot be set up,
+// which is worse than either outcome alone. Returns the agreed code, 0 or 1; a
+// 2 never returns, because every rank throws.
+//
+// WHY THIS EXISTS. setup_contraction is not covered by agree_or_fail_together,
+// which wraps only contract_all/accumulate_across_gpus inside the three contract
+// entrypoints, and there is no try/catch anywhere in tensor_net.hpp or
+// tensor_net_state.hpp -- all nine setup_contraction call sites are unguarded.
+// So a device-dependent throw during setup (hipMemGetInfo, the workspace query,
+// the pool hipMalloc, hipTensor plan creation, aer-0033's tile-list ceiling)
+// unwound one rank while its siblings blocked forever in the next collective.
+// The symptom was a hang with no error anywhere, which is the worst way for a
+// distributed run to fail.
+//
+// Deliberately defined OUTSIDE #ifdef AER_MPI. With one rank it degenerates to
+// "rethrow locally", which is the correct single-rank behaviour, and keeps one
+// code path rather than two.
+//
+// The sibling message says what it can honestly say: agree_or_fail_together's
+// comment claims the failing rank's cause reaches its stderr, and it does not --
+// nothing prints, the text reaches result.message via circuit_executor.hpp:726.
+// This message does not repeat that claim.
+template <typename data_t>
+int TensorNetContractor_HipTensor<data_t>::agree_setup_status(
+    int local_status, const std::string &local_msg) {
+  int global_status = local_status;
+#ifdef AER_MPI
+  if (nprocs_ > 1)
+    MPI_Allreduce(&local_status, &global_status, 1, MPI_INT, MPI_MAX,
+                  MPI_COMM_WORLD);
+#endif
+  if (global_status < 2)
+    return global_status;
+  if (local_status >= 2)
+    throw std::runtime_error(local_msg);
+  throw std::runtime_error(
+      "[AER_TN] contraction setup aborted: a sibling MPI rank threw while "
+      "preparing this contraction -- device memory query, contraction path "
+      "search, memory pool allocation, plan prebuild or the tile-list ceiling "
+      "-- so this rank fails together rather than blocking at the next "
+      "collective. The failing rank reports the underlying cause through the "
+      "same result message channel as this one.");
+}
 
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::prof_sync_devices() {
