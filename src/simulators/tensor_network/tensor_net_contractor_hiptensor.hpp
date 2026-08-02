@@ -19,6 +19,7 @@
 #include <climits>
 #include <complex>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <map>
 #include <memory>
@@ -811,6 +812,7 @@ private:
   // BEFORE the reduction collective is entered. Mirrors the planner's
   // MPIParallelPathOptimizer collective-agreement pattern. No-op single-rank.
   void agree_or_fail_together(int local_failed, const std::string &local_msg);
+  bool agree_plan_cache_hit(bool local_hit);
 #endif
   void contract_all();
   double sample_measure_on_primary(reg_t &samples, std::vector<double> &rnds,
@@ -1204,6 +1206,30 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
         if (workspace_estimate < free_bytes)
           memory_budget = free_bytes - workspace_estimate;
 
+#ifdef AER_MPI
+        // aer-0032: agree the budget across ranks BEFORE anything consumes it.
+        // It feeds two quantities that must be identical on every rank -- the
+        // planner's per-slice target_size and the plan-cache key computed by
+        // plan_key_target_elements() -- and free VRAM is a per-rank number that
+        // jitters independently. Job 20516615 printed five distinct budgets
+        // (65133.0, 65133.5, 65137.5, 65244.5 and 65276.0 MB) across the
+        // contractions of a single job on a single device.
+        //
+        // MPI_MIN is the conservative direction: the agreed budget fits every
+        // rank by construction. This sits in the same branch as find_path's own
+        // allreduce and broadcast, so it introduces no divergence risk that is
+        // not already present -- whether a rank takes this branch depends only
+        // on the driver's call sequence, which is identical on every rank.
+        if (nprocs_ > 1) {
+          unsigned long long local_budget =
+              static_cast<unsigned long long>(memory_budget);
+          unsigned long long agreed_budget = 0;
+          MPI_Allreduce(&local_budget, &agreed_budget, 1,
+                        MPI_UNSIGNED_LONG_LONG, MPI_MIN, MPI_COMM_WORLD);
+          memory_budget = static_cast<uint64_t>(agreed_budget);
+        }
+#endif
+
         if (tn_verbose() && myrank_ == 0)
           fprintf(stderr,
                   "[AER_TN] memory: %.1f MB free, %.1f MB ws, %.1f MB budget\n",
@@ -1213,12 +1239,21 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
 
         // aer-0027: consult the cross-instruction plan cache before searching.
         //
-        // Guarded on nprocs_ == 1 by design. Under MPI create_optimizer()
-        // returns MPIParallelPathOptimizer, whose find_path runs an allreduce
-        // and a broadcast; a rank that hit the cache would skip a collective a
-        // missing rank still enters, and the job would hang. Rather than rely
-        // on canonical keys always agreeing across ranks, multi-rank simply
-        // does not use the cache.
+        // aer-0032 removed the nprocs_ == 1 guard. The hazard that guard
+        // avoided is real: under MPI create_optimizer() returns
+        // MPIParallelPathOptimizer, whose find_path runs an allreduce and a
+        // broadcast, so a rank that hit the cache while a sibling missed would
+        // skip collectives the sibling enters and the job would hang. The answer
+        // is to make the VERDICT collective rather than to switch the feature
+        // off -- see agree_plan_cache_hit(). Leaving it off costs a distributed
+        // run a full cotengra path search on every contraction, which is exactly
+        // the cost the two caches exist to remove (4595.1 ms warm setup with
+        // them off against 5.8 ms with them on -- job 20516615, arm4 vs arm5).
+        //
+        // put() below needs no equivalent treatment: under MPI plan_ after
+        // find_path is the MINLOC-broadcast plan, so every rank stores the same
+        // plan. A rank whose key happens to differ simply misses next time and
+        // drags the communicator into a search, which is safe.
         //
         // elem_bytes mirrors create_optimizer() exactly (2 * sizeof(data_t)),
         // not sizeof(std::complex<data_t>), so the key cannot drift from the
@@ -1226,7 +1261,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
         const size_t plan_elem_bytes = 2 * sizeof(data_t);
         std::string plan_key;
         bool plan_from_cache = false;
-        if (tn_plan_cache_enabled() && nprocs_ == 1) {
+        if (tn_plan_cache_enabled()) {
           plan_key = canonical_network_key(
               network_desc_, engaged,
               plan_key_target_elements(memory_budget, plan_elem_bytes),
@@ -1234,6 +1269,10 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           if (!plan_key.empty())
             plan_from_cache =
                 plan_cache_instance().get(plan_key, network_desc_, plan_);
+#ifdef AER_MPI
+          if (nprocs_ > 1)
+            plan_from_cache = agree_plan_cache_hit(plan_from_cache);
+#endif
         }
 
         std::chrono::steady_clock::time_point prof_path_t0;
@@ -1933,6 +1972,62 @@ void TensorNetContractor_HipTensor<data_t>::agree_or_fail_together(
       "assigned slice range, so this rank fails together rather than blocking "
       "at the cross-rank reduction. See the failing rank's stderr for the "
       "underlying error.");
+}
+
+// aer-0032: turn a per-rank plan-cache verdict into a collective one, so the
+// cross-instruction cache can be USED under MPI instead of being switched off.
+//
+// STAGE 1 -- all or nothing. MPI_MIN over a 0/1 flag is 1 only if EVERY rank
+// hit. A rank that missed, or whose canonical key differed, or whose entry
+// failed sliced-mode re-resolution (PlanCache::get erases the entry and reports
+// a miss in that case) drags the whole communicator onto the search path. So
+// correctness does NOT depend on canonical keys agreeing across ranks:
+// disagreement costs a path search, never a hang and never a divergent plan.
+//
+// STAGE 2 -- the replayed plans must also BE the same plan. Stage 1 only proves
+// each rank found something under its own key. Compare a fingerprint of what
+// each rank actually replayed and discard on any difference. Under MPI a stored
+// plan came from find_path's MINLOC broadcast and is identical everywhere, so
+// this is expected to pass; it is here because a divergent plan is a silently
+// wrong answer rather than a crash, and "expected" is not a guarantee.
+//
+// Two collectives rather than one, because a miss leaves plan_ untouched
+// (PlanCache::get returns before assigning to out), so the fingerprint is
+// meaningless until stage 1 has established that every rank hit.
+template <typename data_t>
+bool TensorNetContractor_HipTensor<data_t>::agree_plan_cache_hit(
+    bool local_hit) {
+  int hit = local_hit ? 1 : 0;
+  int all_hit = 0;
+  MPI_Allreduce(&hit, &all_hit, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  if (!all_hit)
+    return false;
+
+  int64_t fp[4];
+  fp[0] = static_cast<int64_t>(plan_.steps.size());
+  fp[1] = static_cast<int64_t>(plan_.num_slices);
+  fp[2] = static_cast<int64_t>(plan_.sliced.size());
+  // Bit pattern, not value: MIN and MAX of the reinterpreted integers agree if
+  // and only if every rank's double is bit-identical, which is the question
+  // being asked. The ordering semantics of the reinterpretation do not matter.
+  double flops = plan_.total_flops;
+  std::memcpy(&fp[3], &flops, sizeof(double));
+
+  int64_t lo[4], hi[4];
+  MPI_Allreduce(fp, lo, 4, MPI_INT64_T, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(fp, hi, 4, MPI_INT64_T, MPI_MAX, MPI_COMM_WORLD);
+  for (int i = 0; i < 4; i++) {
+    if (lo[i] != hi[i]) {
+      if (tn_verbose() && myrank_ == 0)
+        fprintf(stderr,
+                "[AER_TN_PLAN_CACHE] cross-rank plan fingerprint mismatch at "
+                "field %d; discarding the replayed plan and searching "
+                "collectively instead\n",
+                i);
+      return false;
+    }
+  }
+  return true;
 }
 #endif
 
