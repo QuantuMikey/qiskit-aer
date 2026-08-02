@@ -229,6 +229,56 @@ static uint64_t tn_max_slices() {
   return cached;
 }
 
+// aer-0033: ceiling on the number of m6n6k6 sub-contractions ONE setup may
+// MATERIALISE. build_tiles_for_step stores a full PlanSpec::Tile per sub-block,
+// and each Tile carries its own copies of nine descriptor vectors plus three
+// parent-stride vectors. Measured with the struct replicated field for field:
+// 908 bytes at block rank 7 and 1328 bytes at rank 12, against 26 bytes of
+// actually-varying payload (off_a/off_b/off_c and two flags). So the list costs
+// roughly a kilobyte of HOST memory per sub-contraction.
+//
+// The count is 2^(excess M + excess N + excess K), where excess is the number of
+// extent>1 modes beyond six on an axis. That formula reproduces all 26 tiling
+// lines of job 20516615 exactly. It grows fast: a step whose per-slice peak
+// reached 2^30 elements would want about 1.3e8 sub-blocks and roughly 178 GB of
+// host memory for that step alone, against about 64 GB per rank on a LUMI-G node
+// shared eight ways.
+//
+// Without this ceiling the failure is std::vector::reserve throwing bad_alloc,
+// or the OOM killer under Linux overcommit once the loop touches pages. Neither
+// is contained: setup_pool_and_cache is not covered by agree_or_fail_together
+// (which wraps only contract_all and accumulate_across_gpus), and there is no
+// try/catch anywhere in tensor_net.hpp or tensor_net_state.hpp, so one rank
+// unwinding while its siblings enter the next collective is a HANG, not an
+// abort. Refusing here converts that into a clean error that names the step.
+//
+// The default of 2^22 sub-blocks is about 5 GB of host memory at the measured
+// per-Tile cost. Workloads on record use at most 8 sub-blocks in a single step
+// and a few dozen across a whole setup (job 20516615: 26 tiled steps over five
+// arms, largest 8), so this cannot fire on anything currently working.
+// AER_TN_MAX_TILES=0 disables the ceiling.
+static uint64_t tn_max_tiles() {
+  static bool checked = false;
+  static uint64_t cached = 4194304; // 2^22
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_MAX_TILES");
+    if (val != nullptr) {
+      char *end = nullptr;
+      long long parsed = std::strtoll(val, &end, 10);
+      if (end != val && parsed >= 0) {
+        cached = static_cast<uint64_t>(parsed);
+      } else {
+        fprintf(stderr,
+                "[AER_TN] warning: AER_TN_MAX_TILES='%s' is not a non-negative "
+                "integer; using default %llu.\n",
+                val, (unsigned long long)cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // WS-3 mode tiling decomposes an oversized per-step contraction (M>6, N>6, or
 // K>6) into a loop of kernel-sized (<=6 each) sub-contractions, so the step
 // produces correct results instead of the rank guard throwing. Whether tiling
@@ -734,6 +784,11 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // staged sub-block; 6 planes per device (re+im for A, B, C) laid out
   // contiguously. Zero-cost when no step needs staging (stays unallocated).
   uint64_t stage_scratch_elems_ = 0;
+  // aer-0033: sub-blocks materialised so far in the CURRENT
+  // setup_pool_and_cache pass. Reset at the top of that function, because
+  // each pass rebuilds step_plan_specs_ from scratch (including the extra
+  // per-device passes), so the count is per pass and not cumulative.
+  uint64_t tiles_built_ = 0;
   std::unordered_map<int, thrust::device_vector<data_t>> stage_scratch_;
 
   std::vector<std::vector<int32_t>> prev_modes_;
@@ -1467,6 +1522,9 @@ void TensorNetContractor_HipTensor<data_t>::build_sliced_specs() {
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                                                                  bool tiling_available) {
+  // aer-0033: this pass rebuilds every step's tile list, so the materialised
+  // sub-block count starts from zero here.
+  tiles_built_ = 0;
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
   hipSetDevice(dev.device_id());
 
@@ -2809,6 +2867,31 @@ TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
   // Total block count.
   uint64_t nblocks = 1;
   for (const auto &tm : tile_modes) nblocks *= static_cast<uint64_t>(tm.extent);
+
+  // aer-0033: refuse an unmaterialisable tile list HERE, where the step's shape
+  // and the knob can both be named, rather than as a bad_alloc inside reserve()
+  // on the next line or as an OOM kill while the loop below touches pages.
+  //
+  // This throw is not routed through agree_or_fail_together and does not need to
+  // be: the shape it tests comes from plan_, which under MPI is the
+  // MINLOC-broadcast plan and therefore identical on every rank, so every rank
+  // reaches the same verdict on the same step and they refuse together. That is
+  // the same argument the AER_TN_MAX_SLICES ceiling already relies on.
+  tiles_built_ += nblocks;
+  if (tn_max_tiles() > 0 && tiles_built_ > tn_max_tiles()) {
+    std::stringstream err;
+    err << "[AER_TN] mode tiling would materialise " << nblocks
+        << " m6n6k6 sub-contractions for this step (" << tiles_built_
+        << " so far in this setup), exceeding the AER_TN_MAX_TILES ceiling of "
+        << tn_max_tiles() << ". Each sub-block costs roughly one kilobyte of "
+           "HOST memory, so this list would need on the order of "
+        << (tiles_built_ / 1024)
+        << " MB. The count is 2^(excess M + excess N + excess K) over six modes "
+           "per axis, so it is driven by the per-slice peak intermediate: lower "
+           "AER_TN_SLICE_TARGET_BYTES to slice harder and shrink each step, or "
+           "raise AER_TN_MAX_TILES if the host memory is available.";
+    throw std::runtime_error(err.str());
+  }
 
   std::vector<Tile> tiles;
   tiles.reserve(nblocks);
