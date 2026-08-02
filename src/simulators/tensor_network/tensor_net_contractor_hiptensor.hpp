@@ -1913,7 +1913,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
               << "unsliced and sliced plans), ";
           err << "(2) tighten the per-slice budget so the slicer cuts this "
               << "step inside the envelope (lower AER_TN_SLICE_TARGET_BYTES, "
-              << "current default 65536), "
+              << "default 2097152 bytes, which is 2^17 elements at 16 "
+              << "bytes per complex element and is the value that actually "
+              << "binds -- the device-memory term never does), "
               << "(3) use method='statevector' (validated on LUMI to 44 "
               << "qubits at depth 30 on 1024 nodes, CSC April 2025), "
               << "(4) reduce circuit depth or qubit count, "
@@ -2201,17 +2203,20 @@ void TensorNetContractor_HipTensor<data_t>::agree_or_fail_together(
     return;
 
   // The rank that actually failed re-raises its own message so the true cause
-  // (HIP/CK fault, OOM, or a slicing-bookkeeping guard) is surfaced in its
-  // stderr. The ranks that succeeded fail together with a pointer to it, rather
-  // than blocking forever at the reduction below waiting on a rank that has
-  // already unwound (observed job 19214242).
+  // (HIP/CK fault, OOM, or a slicing-bookkeeping guard) reaches its RESULT
+  // MESSAGE -- not its stderr, which stays empty; the text travels through
+  // circuit_executor.hpp:726. The ranks that succeeded fail together with a
+  // pointer to it, rather than blocking forever at the reduction below waiting
+  // on a rank that has already unwound (observed job 19214242).
   if (local_failed)
     throw std::runtime_error(local_msg);
   throw std::runtime_error(
       "[AER_TN] contraction aborted: a sibling MPI rank threw during its "
       "assigned slice range, so this rank fails together rather than blocking "
-      "at the cross-rank reduction. See the failing rank's stderr for the "
-      "underlying error.");
+      "at the cross-rank reduction. The failing rank reports the underlying "
+      "cause through the same result message channel as this one -- it does "
+      "NOT print to stderr; the text reaches result.message via "
+      "circuit_executor.hpp:726.");
 }
 
 // aer-0032: turn a per-rank plan-cache verdict into a collective one, so the

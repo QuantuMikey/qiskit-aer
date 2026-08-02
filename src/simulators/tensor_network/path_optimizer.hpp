@@ -225,16 +225,21 @@ static std::string path_optlib() {
 }
 
 // Per-slice peak-intermediate budget in BYTES, from AER_TN_SLICE_TARGET_BYTES.
-// This is an OPTIONAL user knob to slice HARDER (smaller per-slice memory); the
-// authoritative default per-slice clamp is the CK-safe tiled-operand volume,
-// max_tiled_elements() (see below). The default here is therefore slack --
-// 2097152 bytes = 131072 elements at 16 bytes per logical complex element
-// (double, split-complex: two 8-byte real planes), above the 2^16 CK-safe
-// volume -- so this envelope does NOT bind unless the user sets it. The budget
+// It was written as an OPTIONAL user knob to slice HARDER (smaller per-slice
+// memory), sitting under an authoritative clamp -- the CK-safe tiled-operand
+// volume enforced by max_tiled_elements(). aer-0013 removed that clamp, WHICH
+// MADE THIS ENVELOPE THE ONLY BINDING CONSTRAINT, and the wording here said the
+// opposite until aer-0038 corrected it. 2097152 bytes = 131072 elements at 16 bytes per
+// logical complex element (double, split-complex: two 8-byte real planes) --
+// 2^17, which is roughly 32000x SMALLER than the device-memory term on an
+// MI250X GCD (measured: 65137.5 MB free, so about 2^32 elements). The min()
+// below therefore always picks this value and the memory budget never wins,
+// which is why aer-0013 is named "memory-govern the slicing target" and does
+// not. See CAPABILITY_MATRIX_v9 7.8. The budget
 // converts to a cotengra `target_size` in ELEMENTS using each optimizer's
 // element size, so a single value covers float and double. Lower it to slice
 // harder (e.g. to shrink per-slice memory); it can only slice harder, never
-// raise the per-slice peak past max_tiled_elements().
+// raise the per-slice peak.
 // aer-0026: how many worker processes cotengra may use for the path search.
 //
 // The fork never passed `parallel`, so cotengra applied its own default of
@@ -352,77 +357,29 @@ static uint64_t slice_target_bytes() {
 // Free-mode envelope of hipTensor's only kernel shape: m6n6k6 admits at most
 // 6 M-modes + 6 N-modes per contraction, so one kernel result holds at most
 // 2^12 = 4096 elements. This count is one single-kernel result: it grounds the
-// planner's oversized-output gate and the FLOOR of the tiling ceiling below (a
-// tiled operand can never be smaller than one kernel result), but no longer the
-// ceiling's DEFAULT, which is now the hardware-validated CK-safe volume.
+// planner's oversized-output gate and the FLOOR of the output tiling ceiling
+// below (a tiled operand can never be smaller than one kernel result). It is no
+// longer any ceiling's DEFAULT: the tiled-operand-volume clamp it once floored
+// was max_tiled_elements(), removed by aer-0013 and deleted by aer-0038.
 static constexpr size_t kMaxFreeModes = 12; // 6 M-modes + 6 N-modes (m6n6k6)
 
-// Hard ceiling, in ELEMENTS, on any tensor a TILED step may touch. Tiling
-// decomposes an oversized step into m6n6k6 sub-blocks whose descriptors are
-// strided VIEWS into the parent tensor; hipTensor/CK miscomputes and then
-// faults during plan creation once a tile descriptor's free-mode stride grows
-// too large, and that stride tracks the parent VOLUME (the top free mode sits
-// at stride ~= volume/2). Bounding every tiled operand's volume therefore
-// bounds its descriptor stride and keeps every block inside what CK can build.
-//
-// The DEFAULT is 2^16 = 65536 elements: the largest tiled-operand volume
-// empirically validated CK-safe on ROCm 6.4.2 / gfx90a. At this size a tile
-// descriptor's max free-mode stride is <= 2^15, which produces bit-exact
-// results vs statevector (4x4 periodic QAOA <Z0Z1>, |TN-SV| ~ 1e-16). A ceiling
-// sweep (job 19751464) found CK plan creation still succeeds at per-slice peak
-// 2^18 but FAULTS (GPU memory access fault, during prebuild descriptor/plan
-// creation) at 2^20; correctness above 2^15 stride is unvalidated, so the
-// default stays at the validated bound rather than the survives-prebuild bound.
-// The earlier kernel-derived default (2^kMaxFreeModes = 4096) was far below
-// this and forced a catastrophic slice-grind on any circuit whose natural peak
-// exceeded 4096 (e.g. the 4x4 grid above sliced to 2^15 slices). Raise
-// AER_TN_MAX_TILED_ELEMENTS above 2^16 only after validating that descriptors
-// at the larger size both build AND compute correctly on the target hipTensor
-// build; increment B (operand staging) removes this ceiling's correctness role
-// by routing oversized-stride steps through packed scratch. Raising it also
-// admits larger non-sliceable outputs (e.g. an 8-qubit reduced density matrix,
-// 4^8 = 65536, or full-statevector extraction above 12 qubits).
-static uint64_t max_tiled_elements() {
-  static bool checked = false;
-  static uint64_t cached = 65536; // 2^16, hardware-validated CK-safe (see above)
-  if (!checked) {
-    const char *val = std::getenv("AER_TN_MAX_TILED_ELEMENTS");
-    if (val != nullptr) {
-      char *end = nullptr;
-      unsigned long long parsed = std::strtoull(val, &end, 10);
-      if (end != val && parsed > 0) {
-        cached = static_cast<uint64_t>(parsed);
-        // The ceiling can never sit below one kernel's own capacity: a single
-        // (untiled) m6n6k6 result already holds 2^kMaxFreeModes elements, and
-        // a tile descriptor never exceeds the parent it views. Floor it so a
-        // mistaken low value can't reject legitimately small tiled steps.
-        const uint64_t floor_elems = static_cast<uint64_t>(1) << kMaxFreeModes;
-        if (cached < floor_elems) {
-          fprintf(stderr,
-                  "[AER_TN_PATH] warning: AER_TN_MAX_TILED_ELEMENTS=%llu is "
-                  "below one m6n6k6 result (%llu); using %llu.\n",
-                  (unsigned long long)cached, (unsigned long long)floor_elems,
-                  (unsigned long long)floor_elems);
-          cached = floor_elems;
-        }
-      } else {
-        fprintf(stderr,
-                "[AER_TN_PATH] warning: AER_TN_MAX_TILED_ELEMENTS='%s' is not a "
-                "positive integer; using kernel-derived default %llu.\n",
-                val, (unsigned long long)cached);
-      }
-    }
-    checked = true;
-  }
-  return cached;
-}
+// aer-0038: max_tiled_elements() and its AER_TN_MAX_TILED_ELEMENTS knob were
+// REMOVED here. aer-0013 deleted both call sites and nothing replaced them, so
+// the function had been dead code fronting a knob that looked live: a user or a
+// sweep setting AER_TN_MAX_TILED_ELEMENTS changed nothing, silently. The clamp
+// it used to apply -- 2^16 elements, the m6n6k6 tiled-operand volume -- is
+// referred to below as "the removed max_tiled_elements() clamp" where the
+// history matters. lumi_tests/run_ck_ceiling_sweep.sh and
+// lumi_tests/run_sliced_tiled_probe.sh still set the variable and are annotated
+// accordingly. See CAPABILITY_MATRIX_v9 7.5 defect 7.
 
 // Fixed CK-safe descriptor STRIDE ceiling that triggers operand staging in the
-// contractor. DECOUPLED from max_tiled_elements() (which clamps the slicing
+// contractor. DECOUPLED from the removed max_tiled_elements() clamp (which clamps the slicing
 // target): a tiled sub-block whose max free-mode stride reaches THIS value is
 // packed into contiguous scratch instead of handed to hipTensor, which faults
 // building a plan on strided views this large. Kept separate because raising the
-// per-slice peak target (AER_TN_MAX_TILED_ELEMENTS) to reduce slice count must
+// per-slice peak target (then AER_TN_MAX_TILED_ELEMENTS, since removed --
+// today AER_TN_SLICE_TARGET_BYTES) to reduce slice count must
 // NOT also raise the staging trigger -- otherwise the larger descriptors slip
 // UNDER the trigger and fault CK (observed: sweep 19756385, every over-ceiling
 // step went direct to CK because the trigger tracked the raised ceiling). The
@@ -451,10 +408,12 @@ static uint64_t ck_stage_stride_ceiling() {
 }
 
 // Hard ceiling, in ELEMENTS, on the (unsliceable) OUTPUT tensor the final
-// contraction step may produce. DECOUPLED from max_tiled_elements(): that knob
-// (AER_TN_MAX_TILED_ELEMENTS) now governs the per-operand volume of TILED
-// INTERMEDIATE steps for descriptor-stride safety, and is tuned to trade slice
-// count against per-slice peak. The maximum admissible OUTPUT rank is a
+// contraction step may produce. DECOUPLED from the per-slice peak target --
+// historically the max_tiled_elements() clamp (AER_TN_MAX_TILED_ELEMENTS),
+// removed by aer-0013 and deleted by aer-0038; today AER_TN_SLICE_TARGET_BYTES
+// alone -- which governs the per-operand volume of TILED INTERMEDIATE steps and
+// trades slice count against per-slice peak. The maximum admissible OUTPUT rank
+// is a
 // separate concern -- output (open) modes can never be sliced (allow_outer=
 // false), so the output tensor's own size is a hard lower bound on the
 // per-slice peak, and if the output cannot come from a single m6n6k6 result the
@@ -1133,13 +1092,13 @@ public:
     //       so it does not bind unless set.
     //
     // The per-slice peak is NO LONGER clamped to the m6n6k6 tiled-operand
-    // volume (max_tiled_elements()). Before operand staging (aer-0010/0011)
+    // volume (the removed max_tiled_elements() clamp). Before operand staging (aer-0010/0011)
     // that clamp was mandatory: it sliced the peak down until every tiled
     // step's strided-view descriptor stayed inside the stride hipTensor/CK
     // could build a plan on. Staging removed that requirement -- a tiled
     // sub-block whose free-mode stride reaches ck_stage_stride_ceiling() is
     // packed into contiguous scratch, contracted, and scattered back, so CK
-    // never sees the over-ceiling strided view. Clamping to max_tiled_elements
+    // never sees the over-ceiling strided view. Clamping to the removed max_tiled_elements clamp
     // here only forced a needlessly high slice count (the slice-grind): the
     // peak is now governed by memory, and any resulting over-ceiling tiled
     // descriptor is carried by tiling + staging. Under AUTO the first oversized
@@ -1150,8 +1109,8 @@ public:
     // hard circuit pick a low-slice plan automatically -- drop-in, no flags.
     //
     // The output-feasibility gate below uses output_tiling_ceiling() as the
-    // hard cap on the (unsliceable) OUTPUT tensor -- decoupled from
-    // max_tiled_elements() (the slicing knob) so tuning slice count does not
+    // hard cap on the (unsliceable) OUTPUT tensor -- decoupled from the
+    // per-slice peak target so tuning slice count does not
     // move the accepted output rank, and vice versa.
     uint64_t target_elements = memory_limit_bytes / element_size_bytes_;
     uint64_t envelope_elements =
@@ -1589,7 +1548,7 @@ public:
     // Same memory-governed budget as the cotengra path (aer-0013): device
     // memory and the optional AER_TN_SLICE_TARGET_BYTES envelope, in elements
     // (16 bytes per logical complex element). The per-slice peak is NOT clamped
-    // to max_tiled_elements() -- an over-ceiling tiled descriptor is carried by
+    // to the removed max_tiled_elements() clamp -- an over-ceiling tiled descriptor is carried by
     // tiling + operand staging (aer-0010/0011), and the m6n6k6 envelope is
     // enforced by tiling at execution, not by over-slicing here. Keeping this
     // in sync with the cotengra path avoids a latent slice-grind on the greedy
