@@ -587,6 +587,50 @@ static double path_max_time() {
 // small circuits depends on this: it exercises the full project/execute/
 // accumulate machinery on circuits cheap enough to validate element-wise
 // against a statevector or NumPy einsum reference.
+// aer-0035: floor on the slice count expressed PER RANK.
+//
+// The slice is the unit MPI divides -- slice_begin_ = myrank_ * num_slices /
+// nprocs_ in the contractor -- and nothing anywhere else in the slicing path
+// knows the rank count. target_elements is min(device memory, the
+// AER_TN_SLICE_TARGET_BYTES envelope) and carries no distribution term, so a
+// contraction whose natural peak already fits produces num_slices = 1 no matter
+// how many ranks are present. Integer division then gives every rank but one an
+// empty range: job 20580891 arm2 shows exactly that, slices=1 with
+// slices_local=0 on rank 0 and 1 on rank 1.
+//
+// That is why every distribution measurement in this project has measured
+// nothing. Not because the workloads were small, but because no code path ever
+// asks for slices on distribution grounds.
+//
+// AER_TN_MIN_SLICES_PER_RANK=k asks the planner for at least k * nprocs slices.
+// DEFAULT 0 = off, so every validated result stands unchanged and this is an
+// A/B with no rebuild. It is off by default because forcing slices is not free:
+// slicing replicates work across slices, so on a contraction small enough to
+// fit one device the split can cost more than it saves. It exists for the case
+// distribution is for -- a contraction too large for one device -- and for
+// measuring where the crossover lies.
+static uint64_t min_slices_per_rank() {
+  static bool checked = false;
+  static uint64_t cached = 0;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_MIN_SLICES_PER_RANK");
+    if (val != nullptr) {
+      char *end = nullptr;
+      long long parsed = std::strtoll(val, &end, 10);
+      if (end != val && parsed >= 0) {
+        cached = static_cast<uint64_t>(parsed);
+      } else {
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: AER_TN_MIN_SLICES_PER_RANK='%s' is not "
+                "a non-negative integer; using default %llu.\n",
+                val, (unsigned long long)cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 static bool force_slicing() {
   static bool checked = false;
   static bool enabled = false;
@@ -997,6 +1041,9 @@ class CotengPathOptimizer : public PathOptimizer {
   double max_time_;
   std::string preset_;
   size_t element_size_bytes_;
+  // aer-0035: distribution floor on the slice count, supplied by the
+  // contractor because only it knows nprocs_. 1 means no floor.
+  uint64_t min_slices_ = 1;
 
   // Mode label mapping: int32_t <-> UTF-8 string (built per find_path call).
   // Labels come from cotengra.get_symbol(i): 'a'-'z' for i<26, 'A'-'Z' for
@@ -1032,11 +1079,13 @@ public:
   CotengPathOptimizer(const std::string &minimize = "combo",
                       int max_repeats = -1, double max_time = -1.0,
                       const std::string &preset = "hyper",
-                      size_t element_size_bytes = 16)
+                      size_t element_size_bytes = 16,
+                      uint64_t min_slices = 1)
       : minimize_(minimize),
         max_repeats_(max_repeats > 0 ? max_repeats : path_max_repeats()),
         max_time_(max_time > 0.0 ? max_time : path_max_time()),
-        preset_(preset), element_size_bytes_(element_size_bytes) {}
+        preset_(preset), element_size_bytes_(element_size_bytes),
+        min_slices_(min_slices > 0 ? min_slices : 1) {}
 
   ContractionPlan find_path(const NetworkDescription &network,
                             uint64_t memory_limit_bytes,
@@ -1355,6 +1404,41 @@ public:
                 "%llu (%zu sliced modes)\n",
                 (long long)final_max, (unsigned long long)target_elements,
                 (size_t)py::len(tree.attr("sliced_inds")));
+      }
+    }
+
+    // aer-0035: raise the slice count to the distribution floor, AFTER the
+    // envelope block above. Order matters and only in this direction: extra
+    // slicing can only lower the peak, so the envelope stays satisfied, whereas
+    // doing it first would let the envelope pass re-slice against a target that
+    // ignores the rank count.
+    //
+    // target_slices is the same call form the AER_TN_FORCE_SLICING hook already
+    // uses above, so this relies on no cotengra API that is not already
+    // exercised. cotengra treats it as a floor and slices to the next reachable
+    // power of the sliced bonds' extents, so the result can exceed min_slices_;
+    // that is fine, the requirement is only that no rank is left empty.
+    //
+    // Every rank of the MPI ensemble applies the same floor, so every candidate
+    // the MINLOC(FLOPs) pick can choose from already meets it. Without that the
+    // pick would actively favour the rank that sliced least, which is the same
+    // failure mode the envelope block above documents.
+    if (min_slices_ > 1) {
+      const size_t before = py::len(tree.attr("sliced_inds"));
+      int64_t cur_slices = tree.attr("nslices").cast<int64_t>();
+      if (static_cast<uint64_t>(cur_slices) < min_slices_) {
+        tree.attr("slice")(py::arg("target_slices") = min_slices_,
+                           py::arg("allow_outer") = false,
+                           py::arg("seed") = seed,
+                           py::arg("inplace") = true);
+        if (path_verbose())
+          fprintf(stderr,
+                  "[AER_TN_PATH] distribution floor: %lld slices -> %lld "
+                  "(target %llu; sliced modes %zu -> %zu)\n",
+                  (long long)cur_slices,
+                  (long long)tree.attr("nslices").cast<int64_t>(),
+                  (unsigned long long)min_slices_, before,
+                  (size_t)py::len(tree.attr("sliced_inds")));
       }
     }
 

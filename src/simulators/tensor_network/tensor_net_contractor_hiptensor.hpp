@@ -2344,8 +2344,15 @@ TensorNetContractor_HipTensor<data_t>::create_optimizer() {
 #ifdef AER_HIPTENSOR
   try {
     size_t elem_bytes = 2 * sizeof(data_t);
+    // aer-0035: the planner cannot see the rank count, so hand it the
+    // distribution floor here -- this is the only place that knows both.
+    // AER_TN_MIN_SLICES_PER_RANK defaults to 0, which leaves min_slices at 1
+    // and the planner's behaviour exactly as before.
+    uint64_t min_slices = 1;
+    if (nprocs_ > 1 && min_slices_per_rank() > 0)
+      min_slices = min_slices_per_rank() * static_cast<uint64_t>(nprocs_);
     inner = std::unique_ptr<PathOptimizer>(new CotengPathOptimizer(
-        "combo", -1, -1.0, "hyper", elem_bytes));
+        "combo", -1, -1.0, "hyper", elem_bytes, min_slices));
   } catch (...) {
     if (tn_verbose())
       fprintf(stderr, "[AER_TN] cotengra unavailable, using greedy\n");
