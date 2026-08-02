@@ -2880,16 +2880,16 @@ TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
   tiles_built_ += nblocks;
   if (tn_max_tiles() > 0 && tiles_built_ > tn_max_tiles()) {
     std::stringstream err;
-    err << "[AER_TN] mode tiling would materialise " << nblocks
-        << " m6n6k6 sub-contractions for this step (" << tiles_built_
-        << " so far in this setup), exceeding the AER_TN_MAX_TILES ceiling of "
-        << tn_max_tiles() << ". Each sub-block costs roughly one kilobyte of "
-           "HOST memory, so this list would need on the order of "
-        << (tiles_built_ / 1024)
-        << " MB. The count is 2^(excess M + excess N + excess K) over six modes "
-           "per axis, so it is driven by the per-slice peak intermediate: lower "
-           "AER_TN_SLICE_TARGET_BYTES to slice harder and shrink each step, or "
-           "raise AER_TN_MAX_TILES if the host memory is available.";
+    err << "[AER_TN] mode tiling: this step needs " << nblocks
+        << " m6n6k6 sub-contractions, taking this setup to " << tiles_built_
+        << " sub-blocks in total, which is above the AER_TN_MAX_TILES ceiling "
+           "of " << tn_max_tiles()
+        << " for the whole setup. Each sub-block costs roughly one kilobyte of "
+           "HOST memory. The count is 2^(excess M + excess N + excess K) over "
+           "six modes per axis, so it is driven by the per-slice peak "
+           "intermediate: lower AER_TN_SLICE_TARGET_BYTES to slice harder and "
+           "shrink each step, or raise AER_TN_MAX_TILES if the host memory is "
+           "available.";
     throw std::runtime_error(err.str());
   }
 
