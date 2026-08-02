@@ -1425,20 +1425,39 @@ public:
     // failure mode the envelope block above documents.
     if (min_slices_ > 1) {
       const size_t before = py::len(tree.attr("sliced_inds"));
-      int64_t cur_slices = tree.attr("nslices").cast<int64_t>();
-      if (static_cast<uint64_t>(cur_slices) < min_slices_) {
-        tree.attr("slice")(py::arg("target_slices") = min_slices_,
-                           py::arg("allow_outer") = false,
-                           py::arg("seed") = seed,
-                           py::arg("inplace") = true);
-        if (path_verbose())
+      const uint64_t cur_slices = tree_num_slices(tree);
+      if (cur_slices < min_slices_) {
+        // A failure to REACH the floor must never fail the contraction. The
+        // floor is a distribution hint; a plan with fewer slices than ranks is
+        // merely under-parallel, and slicing is exact at any count, so whatever
+        // state the tree is left in is still a correct plan. Losing a whole
+        // job to an optimisation hint is not an acceptable trade.
+        bool sliced_ok = true;
+        try {
+          tree.attr("slice")(py::arg("target_slices") = min_slices_,
+                             py::arg("allow_outer") = false,
+                             py::arg("seed") = seed,
+                             py::arg("inplace") = true);
+        } catch (py::error_already_set &e) {
+          sliced_ok = false;
           fprintf(stderr,
-                  "[AER_TN_PATH] distribution floor: %lld slices -> %lld "
-                  "(target %llu; sliced modes %zu -> %zu)\n",
-                  (long long)cur_slices,
-                  (long long)tree.attr("nslices").cast<int64_t>(),
+                  "[AER_TN_PATH] warning: the distribution floor of %llu "
+                  "slices could not be applied; continuing with the plan as "
+                  "found (%llu slices). Underlying error: %s\n",
+                  (unsigned long long)min_slices_,
+                  (unsigned long long)cur_slices, e.what());
+        }
+        const uint64_t now = tree_num_slices(tree);
+        if (path_verbose() || (sliced_ok && now < min_slices_))
+          fprintf(stderr,
+                  "[AER_TN_PATH] distribution floor: %llu slices -> %llu "
+                  "(target %llu; sliced modes %zu -> %zu)%s\n",
+                  (unsigned long long)cur_slices, (unsigned long long)now,
                   (unsigned long long)min_slices_, before,
-                  (size_t)py::len(tree.attr("sliced_inds")));
+                  (size_t)py::len(tree.attr("sliced_inds")),
+                  (now < min_slices_)
+                      ? " -- FLOOR NOT REACHED: too few sliceable summed bonds"
+                      : "");
       }
     }
 
@@ -1447,6 +1466,22 @@ public:
   }
 
 private:
+  // aer-0036: the number of slices a tree currently carries, computed the SAME
+  // way extract_plan does it -- iterate sliced_inds and multiply each entry's
+  // .size. aer-0035 originally read tree.attr("nslices"), an attribute this
+  // fork uses nowhere else and which was therefore unverified against cotengra
+  // 0.7.5; a wrong name there raises py::error_already_set on every contraction
+  // with the floor engaged. sliced_inds and .size are exercised on every
+  // contraction this backend has ever run, so this introduces no new API
+  // surface at all.
+  static uint64_t tree_num_slices(py::object &tree) {
+    py::dict sliced_inds = tree.attr("sliced_inds");
+    uint64_t n = 1;
+    for (auto &item : sliced_inds)
+      n *= static_cast<uint64_t>(item.second.attr("size").cast<int64_t>());
+    return n;
+  }
+
   ContractionPlan extract_plan(py::object &tree,
                                const std::set<int32_t> &output_modes) {
     ContractionPlan plan;

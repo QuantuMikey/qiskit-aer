@@ -1276,12 +1276,16 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
         // not already present -- whether a rank takes this branch depends only
         // on the driver's call sequence, which is identical on every rank.
         if (nprocs_ > 1) {
-          unsigned long long local_budget =
-              static_cast<unsigned long long>(memory_budget);
-          unsigned long long agreed_budget = 0;
-          MPI_Allreduce(&local_budget, &agreed_budget, 1,
-                        MPI_UNSIGNED_LONG_LONG, MPI_MIN, MPI_COMM_WORLD);
-          memory_budget = static_cast<uint64_t>(agreed_budget);
+          // MPI_UINT64_T rather than MPI_UNSIGNED_LONG_LONG: memory_budget is
+          // uint64_t, so this is type-exact and needs no casts, and the C99
+          // fixed-width family is already proven present in this build --
+          // MPIParallelPathOptimizer broadcasts with MPI_INT64_T. The fork has
+          // never used MPI_UNSIGNED_LONG_LONG.
+          uint64_t local_budget = memory_budget;
+          uint64_t agreed_budget = 0;
+          MPI_Allreduce(&local_budget, &agreed_budget, 1, MPI_UINT64_T, MPI_MIN,
+                        MPI_COMM_WORLD);
+          memory_budget = agreed_budget;
         }
 #endif
 
