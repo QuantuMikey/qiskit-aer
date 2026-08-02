@@ -1090,7 +1090,14 @@ void TensorNetContractor_HipTensor<data_t>::set_output(
 }
 
 template <typename data_t>
-void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
+void TensorNetContractor_HipTensor<data_t>::setup_contraction(
+    bool use_autotune) {
+  // aer-0031: the flag used to be discarded here while the cuTensorNet path
+  // honoured it. Latch the hipTensor selector from it on first use, so
+  // config.use_cuTensorNet_autotuning=True reaches this backend instead of
+  // dead-ending. AER_TN_HIPTENSOR_ALGO overrides. See tn_hiptensor_algo() for
+  // why the choice is process-wide rather than per-call.
+  (void)tn_hiptensor_algo(use_autotune);
 #ifdef AER_MPI
   MPI_Comm_size(MPI_COMM_WORLD, &nprocs_);
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank_);
@@ -1116,6 +1123,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(bool) {
       uint64_t ph = 0, pm = 0;
       size_t pn = 0;
       gpu_mgr_.primary().plan_cache().stats(ph, pm, pn);
+      fprintf(stderr, "[AER_TN] hipTensor algorithm selector: %s\n",
+              tn_hiptensor_algo_name());
       fprintf(stderr,
               "[AER_TN_HTPLAN] shared hipTensor plan cache: hits=%llu "
               "misses=%llu entries=%zu\n",

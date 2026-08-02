@@ -13,6 +13,7 @@
 #define _gpu_resource_manager_hpp_
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -30,6 +31,82 @@
 #include <hip/hip_runtime.h>
 #include <hiptensor/hiptensor.hpp>
 
+
+// aer-0031: expose hipTensor's algorithm selector.
+//
+// WHY THIS IS A PARITY ITEM. tensor_net_state.hpp:434 reads
+// config.use_cuTensorNet_autotuning into a user-facing flag, tensor_net.hpp
+// passes it to setup_contraction() from nine call sites, and the cuTensorNet
+// contractor honours it by calling cutensornetContractionAutotune
+// (tensor_net_contractor_cuTensorNet.hpp:600). The hipTensor contractor takes
+// the same flag and discards it -- the parameter at
+// tensor_net_contractor_hiptensor.hpp:1093 is unnamed -- and hardcodes
+// HIPTENSOR_ALGO_DEFAULT at both plan-creation sites. A user who sets that
+// option gets autotuning on NVIDIA and silence on AMD.
+//
+// It was not vacuous. Job 20563826 read the shipped headers at
+// /opt/rocm-6.4.2/include/hiptensor/ and found THREE selectors:
+//   HIPTENSOR_ALGO_DEFAULT, HIPTENSOR_ALGO_DEFAULT_PATIENT,
+//   HIPTENSOR_ALGO_ACTOR_CRITIC
+// Two of them have never been used by this backend.
+//
+// WHY THIS MAY MATTER MORE THAN TUNING. OI11 is stated specifically against
+// "HIPTENSOR_ALGO_DEFAULT's brute-force dispatcher", which invokes an m6n6k6
+// kernel against an oversized descriptor and sums over the excess M-axes with
+// no error returned. Whether DEFAULT_PATIENT or ACTOR_CRITIC validate the
+// descriptor instead is unmeasured. If either does, that is a correctness
+// result, not a performance one, and it is reachable now without a rebuild.
+//
+// LATCHED PROCESS-WIDE, DELIBERATELY. The shared hipTensor plan cache is keyed
+// by tensor shape and not by algorithm, so a selector that could change during
+// a run would let a plan built under one be replayed under another. Latching on
+// first read makes that impossible without touching the cache key. The
+// consequence, stated rather than hidden: if the workspace probe below runs
+// before any setup_contraction(), the latch takes DEFAULT and a later
+// use_autotune request is ignored. That is the safe direction -- it can only
+// leave current behaviour in place.
+//
+// An unrecognised value throws instead of falling back, because a silent
+// fallback is how a measurement of "patient" ends up measuring "default".
+static hiptensorAlgo_t tn_hiptensor_algo(bool autotune_requested = false) {
+  static bool checked = false;
+  static hiptensorAlgo_t cached = HIPTENSOR_ALGO_DEFAULT;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_HIPTENSOR_ALGO");
+    if (val != nullptr) {
+      std::string want(val);
+      for (char &c : want)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (want == "default") {
+        cached = HIPTENSOR_ALGO_DEFAULT;
+      } else if (want == "patient" || want == "default_patient") {
+        cached = HIPTENSOR_ALGO_DEFAULT_PATIENT;
+      } else if (want == "actor_critic" || want == "actor-critic") {
+        cached = HIPTENSOR_ALGO_ACTOR_CRITIC;
+      } else {
+        std::stringstream err;
+        err << "[AER_TN] AER_TN_HIPTENSOR_ALGO='" << val
+            << "' is not recognised. Use default, patient, or actor_critic.";
+        throw std::runtime_error(err.str());
+      }
+    } else if (autotune_requested) {
+      cached = HIPTENSOR_ALGO_DEFAULT_PATIENT;
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+static const char *tn_hiptensor_algo_name() {
+  switch (tn_hiptensor_algo()) {
+  case HIPTENSOR_ALGO_DEFAULT_PATIENT:
+    return "DEFAULT_PATIENT";
+  case HIPTENSOR_ALGO_ACTOR_CRITIC:
+    return "ACTOR_CRITIC";
+  default:
+    return "DEFAULT";
+  }
+}
 #include "misc/wrap_thrust.hpp"
 #include "simulators/statevector/chunk/thrust_kernels.hpp"
 
@@ -429,7 +506,7 @@ public:
         "hiptensorInitContractionDescriptor", device_id_);
 
     check_hiptensor(hiptensorInitContractionFind(
-        handle_, &cp.find, HIPTENSOR_ALGO_DEFAULT),
+        handle_, &cp.find, tn_hiptensor_algo()),
         "hiptensorInitContractionFind", device_id_);
 
     cp.workspace_bytes = 0;
@@ -1301,7 +1378,7 @@ public:
       return 64 * 1024 * 1024;
     }
 
-    hiptensorInitContractionFind(primary.handle(), &find, HIPTENSOR_ALGO_DEFAULT);
+    hiptensorInitContractionFind(primary.handle(), &find, tn_hiptensor_algo());
     hiptensorContractionGetWorkspaceSize(
         primary.handle(), &desc, &find,
         HIPTENSOR_WORKSPACE_RECOMMENDED, &workspace);
