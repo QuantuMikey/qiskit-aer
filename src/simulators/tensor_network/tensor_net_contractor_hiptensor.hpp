@@ -3056,39 +3056,62 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     // cuTensorNet on NVIDIA does not exhibit this sensitivity. If AMD
     // fixes CK to handle the full int32 range, this remap becomes a
     // no-op and can be removed.
+    // aer-0043: decide the route BEFORE building a hipTensor plan. A routed
+    // step never calls hiptensorContraction, so the descriptors, the signature
+    // and the plan built for it were pure waste -- and plan creation is not
+    // free: it is what the process-wide plan cache exists to avoid (795x on
+    // warm setup with both caches on), and it is where the
+    // 0.89-percent-per-creation tiled-plan hard fault lives. Skipping it
+    // removes both. Under AER_TN_GEMM_VERIFY the plan IS still built, because
+    // the verification runs the hipTensor path to produce its reference.
+    bool will_route = false;
+#ifdef AER_HIPBLAS
+    will_route = tn_gemm_route() && ps.gemm_ok;
+    const bool need_plan = !will_route || tn_gemm_verify();
+#else
+    const bool need_plan = true;
+#endif
+
+    // Held as a POINTER, not the reference this used to be, only so it can be
+    // left unset when no plan is built. It is dereferenced on exactly the two
+    // paths that set it: the verification run below and the unrouted dispatch.
+    const CachedPlan<data_t> *plan = nullptr;
     std::vector<int32_t> modes_a_safe, modes_b_safe, modes_c_safe;
-    remap_modes_to_safe_range(ps.modes_a, ps.modes_b, ps.modes_c,
-                              modes_a_safe, modes_b_safe, modes_c_safe);
+    if (need_plan) {
+      remap_modes_to_safe_range(ps.modes_a, ps.modes_b, ps.modes_c,
+                                modes_a_safe, modes_b_safe, modes_c_safe);
 
-    // Cache signature uses the remapped IDs so identical remapped
-    // descriptors hit the cache; strides distinguish projected views from
-    // packed tensors of the same shape.
-    auto sig = build_signature(
-        modes_a_safe, ps.extents_a,
-        modes_b_safe, ps.extents_b,
-        modes_c_safe, ps.extents_c,
-        ps.strides_a, ps.strides_b);
+      // Cache signature uses the remapped IDs so identical remapped
+      // descriptors hit the cache; strides distinguish projected views from
+      // packed tensors of the same shape.
+      auto sig = build_signature(
+          modes_a_safe, ps.extents_a,
+          modes_b_safe, ps.extents_b,
+          modes_c_safe, ps.extents_c,
+          ps.strides_a, ps.strides_b);
 
-    const CachedPlan<data_t> &plan = dev.plan_cache().get_or_create(
-        sig,
-        modes_a_safe, ps.extents_a,
-        modes_b_safe, ps.extents_b,
-        modes_c_safe, ps.extents_c,
-        ps.strides_a, ps.strides_b);
-    // aer-0029: the pool's workspace reservation is sized from
-    // circuit_max_ws in setup_pool_and_cache, and hipTensor is handed that
-    // size with no check of its own. An under-reservation is therefore
-    // SILENT. Since aer-0028 made the plan cache process-wide, execution
-    // can legitimately hit a plan another circuit created, so this asserts
-    // the invariant the sizing depends on rather than trusting it.
-    if (ws_size < plan.workspace_bytes) {
-      std::stringstream werr;
-      werr << "[AER_TN] workspace under-reservation: pool reserved "
-           << ws_size << " bytes but untiled plan for step " << step
-           << " needs " << plan.workspace_bytes
-           << ". setup_pool_and_cache must accumulate every plan it will "
-              "execute (see circuit_max_ws).";
-      throw std::runtime_error(werr.str());
+      plan = &dev.plan_cache().get_or_create(
+          sig,
+          modes_a_safe, ps.extents_a,
+          modes_b_safe, ps.extents_b,
+          modes_c_safe, ps.extents_c,
+          ps.strides_a, ps.strides_b);
+      // aer-0029: the pool's workspace reservation is sized from
+      // circuit_max_ws in setup_pool_and_cache, and hipTensor is handed that
+      // size with no check of its own. An under-reservation is therefore
+      // SILENT. Since aer-0028 made the plan cache process-wide, execution
+      // can legitimately hit a plan another circuit created, so this asserts
+      // the invariant the sizing depends on rather than trusting it. It is
+      // skipped exactly when no plan is built, and a GEMM needs no workspace.
+      if (ws_size < plan->workspace_bytes) {
+        std::stringstream werr;
+        werr << "[AER_TN] workspace under-reservation: pool reserved "
+             << ws_size << " bytes but untiled plan for step " << step
+             << " needs " << plan->workspace_bytes
+             << ". setup_pool_and_cache must accumulate every plan it will "
+                "execute (see circuit_max_ws).";
+        throw std::runtime_error(werr.str());
+      }
     }
 
 
@@ -3133,7 +3156,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     // it replaces exactly.
     bool routed = false;
 #ifdef AER_HIPBLAS
-    if (tn_gemm_route() && ps.gemm_ok) {
+    if (will_route) {
       routed = true;
       std::vector<data_t> ref_re, ref_im;
       const int64_t c_elems = all_specs_[result_idx].num_elements();
@@ -3143,7 +3166,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         // both have run is the only way to catch a wrong lda or a wrong
         // transpose flag, which produce a plausible number rather than an
         // error.
-        dev.execute_contraction_planes(plan,
+        dev.execute_contraction_planes(*plan,
             all_planes[left].re, all_planes[left].im,
             all_planes[right].re, all_planes[right].im,
             all_planes[result_idx].re, all_planes[result_idx].im,
@@ -3223,7 +3246,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     if (!routed) {
       if (tn_profile())
         prof_ht_calls_++;
-      dev.execute_contraction_planes(plan,
+      dev.execute_contraction_planes(*plan,
           all_planes[left].re, all_planes[left].im,
           all_planes[right].re, all_planes[right].im,
           all_planes[result_idx].re, all_planes[result_idx].im,
