@@ -1089,6 +1089,31 @@ public:
       // profiling model stays valid.
       check_hipblas(hipblasSetStream(bl_handle_, stream_), "hipblasSetStream",
                     device_id_);
+      // aer-0041: ATOMICS OFF. The hipBLAS API reference states that some
+      // functions use atomic operations for performance, that this "may cause
+      // functions to not give bit-wise reproducible results", and that the
+      // rocBLAS backend ALLOWS atomics BY DEFAULT. Two things in this project
+      // depend on that not happening:
+      //
+      //   1. "Deterministic reduction at a fixed rank count" is a documented
+      //      user-visible capability of this fork -- repeated runs at the same
+      //      rank count give bit-identical answers, which matters because an
+      //      optimiser differentiating an expectation value follows a
+      //      different trajectory if the last bits move. A non-deterministic
+      //      gemm would break that silently, on the routed steps only.
+      //   2. AER_TN_GEMM_VERIFY compares the routed result against the
+      //      hiptensorContraction result with EXACT equality, deliberately:
+      //      a tolerance would hide a transposed operand whose error happens
+      //      to be small. That gate is only sound if the gemm is reproducible.
+      //
+      // The cost is whatever atomics were buying on these shapes, which is
+      // unmeasured. Determinism is a shipped capability and speed is the thing
+      // being evaluated, so the capability wins by default. If atomics turn
+      // out to be worth a lot, that is a separate, measured decision with its
+      // own knob -- not a silent default.
+      check_hipblas(
+          hipblasSetAtomicsMode(bl_handle_, HIPBLAS_ATOMICS_NOT_ALLOWED),
+          "hipblasSetAtomicsMode(NOT_ALLOWED)", device_id_);
     }
 #endif
 
