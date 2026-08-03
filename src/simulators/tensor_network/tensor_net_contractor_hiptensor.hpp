@@ -785,6 +785,9 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // on A than on B, which a single GEMM k index cannot express and a transpose
   // cannot repair.
   uint64_t gemm_steps_declined_korder_ = 0;
+  // aer-0046: plans NOT built in the setup prebuild because the route will take
+  // the step. This is the count that should track the setup saving.
+  uint64_t gemm_plans_skipped_ = 0;
   // aer-0042: per-phase attribution for the GEMM route. Without it the contract
   // phase lumps routed and declined steps together and a timing comparison
   // cannot say which produced the difference.
@@ -1827,6 +1830,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   gemm_steps_declined_layout_ = 0;
   gemm_steps_declined_corder_ = 0;
   gemm_steps_declined_korder_ = 0;
+  gemm_plans_skipped_ = 0;
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
   hipSetDevice(dev.device_id());
 
@@ -2317,29 +2321,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     }
   }
 
-  // aer-0040: the routing census. Printed whenever the route is enabled, not
-  // behind AER_TN_VERBOSE, because a run whose steps were all declined would
-  // otherwise look identical to one that routed everything.
-#ifdef AER_HIPBLAS
-  if (tn_gemm_route()) {
-    fprintf(stderr,
-            "[AER_TN_GEMM] steps=%zu routed=%llu declined: tiled=%llu "
-            "strided=%llu layout=%llu corder=%llu korder=%llu sum=%llu verify=%d\n",
-            num_steps, (unsigned long long)gemm_steps_routed_,
-            (unsigned long long)gemm_steps_declined_tiled_,
-            (unsigned long long)gemm_steps_declined_strided_,
-            (unsigned long long)gemm_steps_declined_layout_,
-            (unsigned long long)gemm_steps_declined_corder_,
-            (unsigned long long)gemm_steps_declined_korder_,
-            (unsigned long long)(gemm_steps_routed_ +
-                                 gemm_steps_declined_tiled_ +
-                                 gemm_steps_declined_strided_ +
-                                 gemm_steps_declined_layout_ +
-                                 gemm_steps_declined_corder_ +
-                                 gemm_steps_declined_korder_),
-            tn_gemm_verify() ? 1 : 0);
-  }
-#endif
 
   std::vector<int> last_used(num_total, -1);
   for (size_t step = 0; step < num_steps; step++) {
@@ -2388,6 +2369,39 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
       continue;
     }
 
+    // aer-0046: a step the GEMM route will take never calls
+    // hiptensorContraction, so building its plan HERE is the waste aer-0043
+    // aimed at and missed. aer-0043 guarded the call in contract_single_slice,
+    // where the cache is already warm and get_or_create is a lookup. THIS loop
+    // is where the construction happens, and ps.gemm_ok is already decided by
+    // the time it runs, so the same condition can be applied where it pays.
+    //
+    // WHAT IT IS WORTH, from job 20659936 at the shipped path budget. Route
+    // off, 16 qubits: t_setup_ms 9404.310, t_path_ms 6171.214, so 3233.096 ms
+    // is setup that is neither path search nor contraction, over 96 steps
+    // (census, job 20662067) = 33.7 ms per step. 25 qubits: 16133.620 minus
+    // 10872.088 = 5261.532 ms over 150 steps = 35.1 ms per step. A flat
+    // per-step cost on two different circuits, which is the shape a per-step
+    // get_or_create has, and it is 34 and 32 percent of wall. Contraction over
+    // the same two runs is 9.671 ms and 193.300 ms -- 0.10 and 1.18 percent.
+    // At the measured 69.7 percent routed this skip removes roughly 2.2 s of
+    // 9.4 s at 16 qubits.
+    //
+    // circuit_max_ws is accumulated from the plans built in this loop. A
+    // skipped step contributes nothing to it, which is correct: hipblas*gemm
+    // takes no workspace argument. Under AER_TN_GEMM_VERIFY the plan IS still
+    // built, because the verification runs the hipTensor path to produce its
+    // reference -- the same !will_route || tn_gemm_verify() condition
+    // contract_single_slice uses, so the two stay in step. If they ever
+    // diverge, execution would look up a signature this loop never inserted,
+    // and get_or_create would build it there instead: slower, never wrong.
+#ifdef AER_HIPBLAS
+    if (tn_gemm_route() && ps.gemm_ok && !tn_gemm_verify()) {
+      gemm_plans_skipped_++;
+      continue;
+    }
+#endif
+
     // Remap mode IDs to a safe range (see remap_modes_to_safe_range above).
     // Must use identical logic to contract_single_slice so cache
     // signatures match between pre-population here and execution later.
@@ -2409,6 +2423,33 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                            ps.strides_a, ps.strides_b)
             .workspace_bytes);
   }
+
+
+  // aer-0040: the routing census. Printed whenever the route is enabled, not
+  // behind AER_TN_VERBOSE, because a run whose steps were all declined would
+  // otherwise look identical to one that routed everything.
+#ifdef AER_HIPBLAS
+  if (tn_gemm_route()) {
+    fprintf(stderr,
+            "[AER_TN_GEMM] steps=%zu routed=%llu declined: tiled=%llu "
+            "strided=%llu layout=%llu corder=%llu korder=%llu sum=%llu "
+            "plans_skipped=%llu verify=%d\n",
+            num_steps, (unsigned long long)gemm_steps_routed_,
+            (unsigned long long)gemm_steps_declined_tiled_,
+            (unsigned long long)gemm_steps_declined_strided_,
+            (unsigned long long)gemm_steps_declined_layout_,
+            (unsigned long long)gemm_steps_declined_corder_,
+            (unsigned long long)gemm_steps_declined_korder_,
+            (unsigned long long)(gemm_steps_routed_ +
+                                 gemm_steps_declined_tiled_ +
+                                 gemm_steps_declined_strided_ +
+                                 gemm_steps_declined_layout_ +
+                                 gemm_steps_declined_corder_ +
+                                 gemm_steps_declined_korder_),
+            (unsigned long long)gemm_plans_skipped_,
+            tn_gemm_verify() ? 1 : 0);
+  }
+#endif
 
   // Each intermediate occupies a split-complex tensor slot: two planes
   // (real, imag), each padded to a 16-byte boundary.
