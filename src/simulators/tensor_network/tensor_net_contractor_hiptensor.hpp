@@ -776,7 +776,11 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   uint64_t gemm_steps_declined_tiled_ = 0;
   uint64_t gemm_steps_declined_strided_ = 0;
   uint64_t gemm_steps_declined_layout_ = 0;
-  uint64_t gemm_steps_declined_final_ = 0;
+  // aer-0044: declined because C's declared mode order is not
+  // [M modes in A's order][N modes in B's order]. Only the final step can trip
+  // this, since it is the only one that rewrites modes_c into modes_out_ order.
+  // Replaces aer-0040's blanket exclusion of the final step.
+  uint64_t gemm_steps_declined_corder_ = 0;
   // aer-0042: per-phase attribution for the GEMM route. Without it the contract
   // phase lumps routed and declined steps together and a timing comparison
   // cannot say which produced the difference.
@@ -1817,7 +1821,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   gemm_steps_declined_tiled_ = 0;
   gemm_steps_declined_strided_ = 0;
   gemm_steps_declined_layout_ = 0;
-  gemm_steps_declined_final_ = 0;
+  gemm_steps_declined_corder_ = 0;
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
   hipSetDevice(dev.device_id());
 
@@ -2187,18 +2191,45 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     if (tn_gemm_route()) {
       if (tile_this_step) {
         gemm_steps_declined_tiled_++;
-      } else if (step == num_steps - 1) {
-        gemm_steps_declined_final_++;
       } else if (!strides_a.empty() || !strides_b.empty()) {
         gemm_steps_declined_strided_++;
       } else {
+        const std::set<int32_t> sa(modes_a.begin(), modes_a.end());
+        const std::set<int32_t> sb(modes_b.begin(), modes_b.end());
         std::set<int32_t> shared_modes;
-        {
-          std::set<int32_t> sb(modes_b.begin(), modes_b.end());
-          for (int32_t m : modes_a)
-            if (sb.count(m))
-              shared_modes.insert(m);
-        }
+        for (int32_t m : modes_a)
+          if (sb.count(m))
+            shared_modes.insert(m);
+
+        // aer-0044: C must be laid out [M modes in A's order][N modes in B's
+        // order], because that is what the GEMM writes with ldc = M.
+        // compute_contraction_result produces exactly that, so on an ordinary
+        // step this check cannot fail -- there it makes a guarantee explicit
+        // rather than assumed. The FINAL step is what can break it: it rewrites
+        // modes_c into modes_out_ order plus appended dummies. aer-0040
+        // excluded the final step wholesale for that reason, which cost 12.7
+        // percent of all steps across jobs 20657149 and 20657243. Checking the
+        // actual post-rewrite modes_c instead recovers the ones still in the
+        // right order -- and for a SCALAR output that is all of them, because
+        // TensorNet::get_amplitudes calls set_output with EMPTY mode vectors,
+        // so the final C carries no real modes and there is nothing to order.
+        // On the amplitude path that recovers the final full contraction, which
+        // is the largest step in the plan.
+        //
+        // Extent-1 modes are ignored on both sides: pad_contraction_mnk appends
+        // them, they contribute a factor of one to every product and index zero
+        // to every offset, and counting them would reject a correctly ordered C.
+        std::vector<int32_t> want_c, have_c;
+        for (size_t i = 0; i < modes_a.size(); i++)
+          if (!sb.count(modes_a[i]) && extents_a[i] > 1)
+            want_c.push_back(modes_a[i]);
+        for (size_t i = 0; i < modes_b.size(); i++)
+          if (!sa.count(modes_b[i]) && extents_b[i] > 1)
+            want_c.push_back(modes_b[i]);
+        for (size_t i = 0; i < modes_c.size(); i++)
+          if (extents_c[i] > 1)
+            have_c.push_back(modes_c[i]);
+        const bool c_ok = (want_c == have_c);
         bool at = false, bt = false;
         int64_t m_ext = 1, ka_ext = 1, n_ext = 1, kb_ext = 1;
         const bool a_ok = gemm_operand_layout(modes_a, extents_a, shared_modes,
@@ -2214,7 +2245,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         // difference between a declined step and silent corruption.
         const int64_t c_elems_expected =
             all_specs_[result_idx].num_elements();
-        if (a_ok && b_ok && ka_ext == kb_ext &&
+        if (a_ok && b_ok && c_ok && ka_ext == kb_ext &&
             m_ext * n_ext == c_elems_expected) {
           step_plan_specs_[step].gemm_ok = true;
           // A is (M x K) when its order is [free][contracted] -- OP_N, lda = M
@@ -2230,6 +2261,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
           step_plan_specs_[step].gemm_n = n_ext;
           step_plan_specs_[step].gemm_k = ka_ext;
           gemm_steps_routed_++;
+        } else if (!c_ok) {
+          gemm_steps_declined_corder_++;
         } else {
           gemm_steps_declined_layout_++;
         }
@@ -2259,17 +2292,17 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   if (tn_gemm_route()) {
     fprintf(stderr,
             "[AER_TN_GEMM] steps=%zu routed=%llu declined: tiled=%llu "
-            "strided=%llu layout=%llu final=%llu sum=%llu verify=%d\n",
+            "strided=%llu layout=%llu corder=%llu sum=%llu verify=%d\n",
             num_steps, (unsigned long long)gemm_steps_routed_,
             (unsigned long long)gemm_steps_declined_tiled_,
             (unsigned long long)gemm_steps_declined_strided_,
             (unsigned long long)gemm_steps_declined_layout_,
-            (unsigned long long)gemm_steps_declined_final_,
+            (unsigned long long)gemm_steps_declined_corder_,
             (unsigned long long)(gemm_steps_routed_ +
                                  gemm_steps_declined_tiled_ +
                                  gemm_steps_declined_strided_ +
                                  gemm_steps_declined_layout_ +
-                                 gemm_steps_declined_final_),
+                                 gemm_steps_declined_corder_),
             tn_gemm_verify() ? 1 : 0);
   }
 #endif
