@@ -400,6 +400,54 @@ inline void compute_contraction_result(
 }
 
 //=============================================================================
+// aer-0040: is this step already a matrix product?
+//
+// A packed tensor's element index is sum_i idx_i * prod_{j<i} ext_j -- stride 1
+// on modes[0], multiplying forward (stride_map below). So a packed tensor whose
+// declared order is [free modes][contracted modes] IS a column-major matrix of
+// (prod free) rows by (prod contracted) columns with leading dimension equal to
+// the row count, and one whose order is [contracted][free] is that matrix
+// transposed. hipblas's HIPBLAS_OP_N / HIPBLAS_OP_T take either. Any other
+// order interleaves free and contracted axes and would need a physical permute,
+// which this route does not do: it declines the step instead.
+//
+// run_split() returns how many maximal runs of like-classified modes the order
+// contains, and the operand is admissible exactly when that is at most two.
+// It also reports which class comes first, which is what selects the transpose.
+//
+// Extent-1 modes are ignored. pad_contraction_mnk appends them only when a
+// category is empty, they contribute a factor of one to every product, and
+// counting them would reject an otherwise perfectly contiguous operand.
+inline bool gemm_operand_layout(const std::vector<int32_t> &modes,
+                                const std::vector<int64_t> &extents,
+                                const std::set<int32_t> &contracted,
+                                bool &transposed, int64_t &free_extent,
+                                int64_t &contracted_extent) {
+  free_extent = 1;
+  contracted_extent = 1;
+  int runs = 0;
+  int prev = -1;
+  bool first_is_contracted = false;
+  for (size_t i = 0; i < modes.size(); i++) {
+    if (extents[i] <= 1)
+      continue;
+    const int cur = contracted.count(modes[i]) ? 1 : 0;
+    if (cur)
+      contracted_extent *= extents[i];
+    else
+      free_extent *= extents[i];
+    if (cur != prev) {
+      if (runs == 0)
+        first_is_contracted = (cur == 1);
+      runs++;
+      prev = cur;
+    }
+  }
+  transposed = first_is_contracted;
+  return runs <= 2;
+}
+
+//=============================================================================
 // Helper: remap mode IDs to a safe range for hipTensor.
 //
 // hipTensor 1.5.0 on gfx90a silently produces zero output when contraction
@@ -720,6 +768,15 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   std::vector<TensorSpec> all_specs_;
   std::set<int32_t> sliced_mode_set_;
   bool pool_ready_;
+  // aer-0040: how the GEMM route classified every step of the last plan. Reset
+  // in setup_pool_and_cache, printed by prof_report and by the verbose setup
+  // line, and the reason no separate job is needed to count how often a step's
+  // operands are already matrix-shaped.
+  uint64_t gemm_steps_routed_ = 0;
+  uint64_t gemm_steps_declined_tiled_ = 0;
+  uint64_t gemm_steps_declined_strided_ = 0;
+  uint64_t gemm_steps_declined_layout_ = 0;
+  uint64_t gemm_steps_declined_final_ = 0;
 
   // Split-complex plane pointers for one tensor: re/im are independent
   // because slice projection advances both planes by the slice's element
@@ -750,6 +807,14 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
     std::vector<int32_t> modes_a, modes_b, modes_c;
     std::vector<int64_t> extents_a, extents_b, extents_c;
     std::vector<int64_t> strides_a, strides_b;
+
+    // aer-0040: the GEMM route. gemm_ok is set only when this step is a matrix
+    // product already -- see gemm_eligible() for the three conditions and why
+    // each is necessary. When it is false the step runs the unchanged
+    // hiptensorContraction path, so an ineligible step costs nothing.
+    bool gemm_ok = false;
+    bool gemm_a_trans = false, gemm_b_trans = false;
+    int64_t gemm_m = 0, gemm_n = 0, gemm_k = 0;
 
     // WS-3 mode tiling. Empty `tiles` => in-envelope step, executed exactly as
     // before via the descriptor above (zero behavior change). Non-empty =>
@@ -1707,6 +1772,11 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   // aer-0033: this pass rebuilds every step's tile list, so the materialised
   // sub-block count starts from zero here.
   tiles_built_ = 0;
+  gemm_steps_routed_ = 0;
+  gemm_steps_declined_tiled_ = 0;
+  gemm_steps_declined_strided_ = 0;
+  gemm_steps_declined_layout_ = 0;
+  gemm_steps_declined_final_ = 0;
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
   hipSetDevice(dev.device_id());
 
@@ -2051,6 +2121,81 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     step_plan_specs_[step].strides_a = strides_a;
     step_plan_specs_[step].strides_b = strides_b;
 
+    // aer-0040: decide the GEMM route for this step, here, where the finished
+    // descriptors already exist. Three conditions, each traced to the reason it
+    // is necessary:
+    //
+    //  (1) NOT TILED. A tiled step's sub-blocks are strided VIEWS into their
+    //      parents with their own offsets and per-block strides. Tiling exists
+    //      only to fit hipTensor's m6n6k6 envelope, which a GEMM does not have,
+    //      so an eligible step is by construction one that never needed it.
+    //  (2) BOTH OPERANDS PACKED. project_slice hands a sliced input the PARENT's
+    //      strides so projection stays pointer arithmetic (the OI9 note), and a
+    //      view with arbitrary parent strides is not expressible as one lda.
+    //      strides_a / strides_b are empty exactly when the operand is packed --
+    //      build_sliced_specs leaves them empty for tensors carrying no sliced
+    //      mode, and intermediates are always packed pool slots.
+    //  (3) FREE AND CONTRACTED MODES EACH CONTIGUOUS, per gemm_operand_layout.
+    //
+    // C needs no test: compute_contraction_result builds it as
+    // [A-only modes][B-only modes], which is [M][N], and it is always a packed
+    // pool slot. On the final step modes_c is re-ordered into modes_out_ order,
+    // which can break that, so the final step is excluded as well.
+    step_plan_specs_[step].gemm_ok = false;
+#ifdef AER_HIPBLAS
+    if (tn_gemm_route()) {
+      if (tile_this_step) {
+        gemm_steps_declined_tiled_++;
+      } else if (step == num_steps - 1) {
+        gemm_steps_declined_final_++;
+      } else if (!strides_a.empty() || !strides_b.empty()) {
+        gemm_steps_declined_strided_++;
+      } else {
+        std::set<int32_t> shared_modes;
+        {
+          std::set<int32_t> sb(modes_b.begin(), modes_b.end());
+          for (int32_t m : modes_a)
+            if (sb.count(m))
+              shared_modes.insert(m);
+        }
+        bool at = false, bt = false;
+        int64_t m_ext = 1, ka_ext = 1, n_ext = 1, kb_ext = 1;
+        const bool a_ok = gemm_operand_layout(modes_a, extents_a, shared_modes,
+                                              at, m_ext, ka_ext);
+        const bool b_ok = gemm_operand_layout(modes_b, extents_b, shared_modes,
+                                              bt, n_ext, kb_ext);
+        // K seen from A and from B must agree, and M*N must be exactly the C
+        // slot. The second is not redundant: compute_contraction_result drops
+        // EVERY shared mode from C, while build_tiles_for_step's classifier
+        // allows a mode present in A, B and C. Those two disagree for a batch
+        // mode, and if one ever appeared this route would write an M*N block
+        // into a slot of a different size. Refusing on the invariant is the
+        // difference between a declined step and silent corruption.
+        const int64_t c_elems_expected =
+            all_specs_[result_idx].num_elements();
+        if (a_ok && b_ok && ka_ext == kb_ext &&
+            m_ext * n_ext == c_elems_expected) {
+          step_plan_specs_[step].gemm_ok = true;
+          // A is (M x K) when its order is [free][contracted] -- OP_N, lda = M
+          // -- and (K x M) when it is [contracted][free], which is the
+          // transpose of what is wanted -- OP_T, lda = K. gemm_operand_layout
+          // reports which class comes first, so at is already the flag.
+          step_plan_specs_[step].gemm_a_trans = at;
+          // B is wanted as (K x N). Stored [contracted][free] it already is
+          // that -- OP_N -- and stored [free][contracted] it is (N x K) and
+          // must be transposed. So the flag is the NEGATION of B's report.
+          step_plan_specs_[step].gemm_b_trans = !bt;
+          step_plan_specs_[step].gemm_m = m_ext;
+          step_plan_specs_[step].gemm_n = n_ext;
+          step_plan_specs_[step].gemm_k = ka_ext;
+          gemm_steps_routed_++;
+        } else {
+          gemm_steps_declined_layout_++;
+        }
+      }
+    }
+#endif
+
     if (tn_debug()) {
       fprintf(stderr,
               "[AER_TN_DEBUG]   step %zu: T%ld x T%ld -> T%zu   "
@@ -2065,6 +2210,28 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
               (step == num_steps - 1) ? " (FINAL)" : "");
     }
   }
+
+  // aer-0040: the routing census. Printed whenever the route is enabled, not
+  // behind AER_TN_VERBOSE, because a run whose steps were all declined would
+  // otherwise look identical to one that routed everything.
+#ifdef AER_HIPBLAS
+  if (tn_gemm_route()) {
+    fprintf(stderr,
+            "[AER_TN_GEMM] steps=%zu routed=%llu declined: tiled=%llu "
+            "strided=%llu layout=%llu final=%llu sum=%llu verify=%d\n",
+            num_steps, (unsigned long long)gemm_steps_routed_,
+            (unsigned long long)gemm_steps_declined_tiled_,
+            (unsigned long long)gemm_steps_declined_strided_,
+            (unsigned long long)gemm_steps_declined_layout_,
+            (unsigned long long)gemm_steps_declined_final_,
+            (unsigned long long)(gemm_steps_routed_ +
+                                 gemm_steps_declined_tiled_ +
+                                 gemm_steps_declined_strided_ +
+                                 gemm_steps_declined_layout_ +
+                                 gemm_steps_declined_final_),
+            tn_gemm_verify() ? 1 : 0);
+  }
+#endif
 
   std::vector<int> last_used(num_total, -1);
   for (size_t step = 0; step < num_steps; step++) {
@@ -2910,11 +3077,97 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     // Split-complex decomposition with explicit plane pointers (OI9
     // resolution): each operand's planes were resolved above — by slice
     // projection for inputs and by slot layout for intermediates.
-    dev.execute_contraction_planes(plan,
-        all_planes[left].re, all_planes[left].im,
-        all_planes[right].re, all_planes[right].im,
-        all_planes[result_idx].re, all_planes[result_idx].im,
-        workspace, ws_size, false);
+    //
+    // aer-0040: when this step was found to be a matrix product already and
+    // AER_TN_GEMM=1, the same four alphas and betas go to hipblas*gemm instead.
+    // C was zeroed just above, so accumulate=false matches the hipTensor call
+    // it replaces exactly.
+    bool routed = false;
+#ifdef AER_HIPBLAS
+    if (tn_gemm_route() && ps.gemm_ok) {
+      routed = true;
+      std::vector<data_t> ref_re, ref_im;
+      const int64_t c_elems = all_specs_[result_idx].num_elements();
+      if (tn_gemm_verify()) {
+        // Run the hipTensor path FIRST, copy its result to the host, then zero
+        // C again and run the GEMM path into the same slot. Comparing after
+        // both have run is the only way to catch a wrong lda or a wrong
+        // transpose flag, which produce a plausible number rather than an
+        // error.
+        dev.execute_contraction_planes(plan,
+            all_planes[left].re, all_planes[left].im,
+            all_planes[right].re, all_planes[right].im,
+            all_planes[result_idx].re, all_planes[result_idx].im,
+            workspace, ws_size, false);
+        ref_re.resize(static_cast<size_t>(c_elems));
+        ref_im.resize(static_cast<size_t>(c_elems));
+        check_hip(hipMemcpyAsync(ref_re.data(), all_planes[result_idx].re,
+                                 sizeof(data_t) * ref_re.size(),
+                                 hipMemcpyDeviceToHost, dev.stream()),
+                  "hipMemcpyAsync(gemm verify re)", dev.device_id());
+        check_hip(hipMemcpyAsync(ref_im.data(), all_planes[result_idx].im,
+                                 sizeof(data_t) * ref_im.size(),
+                                 hipMemcpyDeviceToHost, dev.stream()),
+                  "hipMemcpyAsync(gemm verify im)", dev.device_id());
+        check_hip(hipStreamSynchronize(dev.stream()),
+                  "hipStreamSynchronize(gemm verify)", dev.device_id());
+        size_t c_bytes = tensor_slot_bytes(c_elems, sizeof(data_t));
+        check_hip(hipMemsetAsync(c_slot, 0, c_bytes, dev.stream()),
+                  "hipMemsetAsync(gemm verify re-zero)", dev.device_id());
+      }
+
+      dev.execute_contraction_gemm(
+          ps.gemm_m, ps.gemm_n, ps.gemm_k, ps.gemm_a_trans, ps.gemm_b_trans,
+          step,
+          all_planes[left].re, all_planes[left].im,
+          all_planes[right].re, all_planes[right].im,
+          all_planes[result_idx].re, all_planes[result_idx].im, false);
+
+      if (tn_gemm_verify()) {
+        std::vector<data_t> got_re(static_cast<size_t>(c_elems));
+        std::vector<data_t> got_im(static_cast<size_t>(c_elems));
+        check_hip(hipMemcpyAsync(got_re.data(), all_planes[result_idx].re,
+                                 sizeof(data_t) * got_re.size(),
+                                 hipMemcpyDeviceToHost, dev.stream()),
+                  "hipMemcpyAsync(gemm got re)", dev.device_id());
+        check_hip(hipMemcpyAsync(got_im.data(), all_planes[result_idx].im,
+                                 sizeof(data_t) * got_im.size(),
+                                 hipMemcpyDeviceToHost, dev.stream()),
+                  "hipMemcpyAsync(gemm got im)", dev.device_id());
+        check_hip(hipStreamSynchronize(dev.stream()),
+                  "hipStreamSynchronize(gemm got)", dev.device_id());
+        // Both paths sum the same products in the same K order over the same
+        // inputs, so agreement is expected to be EXACT and the gate is
+        // equality. A tolerance here would hide a transposed operand whose
+        // error happens to be small on this circuit.
+        for (size_t e = 0; e < got_re.size(); e++) {
+          if (got_re[e] != ref_re[e] || got_im[e] != ref_im[e]) {
+            std::stringstream verr;
+            verr << "[AER_TN] GEMM route disagrees with hiptensorContraction "
+                 << "at step " << step << ", element " << e << ": gemm ("
+                 << static_cast<double>(got_re[e]) << ", "
+                 << static_cast<double>(got_im[e]) << ") against hipTensor ("
+                 << static_cast<double>(ref_re[e]) << ", "
+                 << static_cast<double>(ref_im[e]) << "). M=" << ps.gemm_m
+                 << " N=" << ps.gemm_n << " K=" << ps.gemm_k
+                 << " transA=" << (ps.gemm_a_trans ? 'T' : 'N')
+                 << " transB=" << (ps.gemm_b_trans ? 'T' : 'N')
+                 << " modes_a=" << modes_to_str(ps.modes_a)
+                 << " modes_b=" << modes_to_str(ps.modes_b)
+                 << " modes_c=" << modes_to_str(ps.modes_c) << ".";
+            throw std::runtime_error(verr.str());
+          }
+        }
+      }
+    }
+#endif
+    if (!routed) {
+      dev.execute_contraction_planes(plan,
+          all_planes[left].re, all_planes[left].im,
+          all_planes[right].re, all_planes[right].im,
+          all_planes[result_idx].re, all_planes[result_idx].im,
+          workspace, ws_size, false);
+    }
 
     if (tn_debug()) {
       hipStreamSynchronize(dev.stream());

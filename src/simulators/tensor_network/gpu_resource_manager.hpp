@@ -30,6 +30,9 @@
 
 #include <hip/hip_runtime.h>
 #include <hiptensor/hiptensor.hpp>
+#ifdef AER_HIPBLAS
+#include <hipblas/hipblas.h>
+#endif
 
 
 // aer-0031: expose hipTensor's algorithm selector.
@@ -294,6 +297,40 @@ build_signature(const std::vector<int32_t> &modes_a,
   sig.data.push_back(static_cast<int32_t>(strides_c.size()));
   for (size_t i = 0; i < strides_c.size(); i++) sig.data.push_back(static_cast<int32_t>(strides_c[i]));
   return sig;
+}
+
+// aer-0040: AER_TN_GEMM=1 routes eligible contraction steps through
+// hipblas*gemm instead of hiptensorContraction. Default OFF, so an image built
+// with -DAER_HIPBLAS behaves byte-identically to one without it until the knob
+// is set. Read here rather than in the contractor because GPUDevice::init()
+// needs it to decide whether to create the hipBLAS handle at all.
+static bool tn_gemm_route() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_GEMM");
+    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
+}
+
+// aer-0040: AER_TN_GEMM_VERIFY=1 runs BOTH paths on every routed step and
+// compares the results bit for bit, reporting the first disagreement with the
+// step index and shape. Expensive by construction -- it doubles the work and
+// adds a device-to-host copy per step -- and off by default. It exists because
+// the failure mode a GEMM route introduces is a wrong lda or a wrong transpose
+// flag, which is exactly as silent as the hipTensor defect the rank guard was
+// written for, and no guard catches it.
+static bool tn_gemm_verify() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_GEMM_VERIFY");
+    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
 }
 
 template <typename data_t> struct CachedPlan {
@@ -886,6 +923,88 @@ template <typename data_t> struct AccumulatePlanarFunctor {
 // GPUDevice
 //=============================================================================
 
+#ifdef AER_HIPBLAS
+//=============================================================================
+// aer-0040: the GEMM contraction route.
+//
+// A contraction whose A and B are PACKED column-major and whose free and
+// contracted modes each occupy one contiguous run of the declared mode order
+// IS a matrix product already -- no permute, no copy, only a reinterpretation
+// of the same bytes. stride_map (tensor_net_contractor_hiptensor.hpp:3020)
+// gives stride 1 to modes[0] and multiplies forward, so a packed tensor whose
+// order is [free...][contracted...] is an (F x C) column-major matrix with
+// leading dimension F, and one whose order is [contracted...][free...] is its
+// transpose. HIPBLAS_OP_N / HIPBLAS_OP_T cover both, which is why no permute
+// layer is needed for the steps this route accepts.
+//
+// FOUR REAL GEMMs, NOT ONE COMPLEX GEMM. This backend stores complex values as
+// two separate real planes (see the OI7 note on hipTensor's complex path), and
+// execute_contraction_planes below takes six plane pointers. hipblasZgemm
+// requires interleaved complex, which this layout is not, and interleaving it
+// would mean changing the pool, the upload, project_slice's plane arithmetic
+// and accumulate_planar_to_output -- the machinery the OI9 comment identifies
+// as what makes slicing and split-complex compose. Job 20644277 measured both
+// forms on one GCD at 64^3: four hipblasDgemm at 25.692 us against the
+// memset-plus-four-hiptensorContraction path at 117.007 us, so the split form
+// alone is 4.55x with no layout change at all. hipblasZgemm's 6.923 us is a
+// separate decision about storage layout and is deliberately not taken here.
+//
+// The alphas and betas are the same four this backend already uses:
+//   Cr  = Ar*Br      beta = accumulate ? 1 : 0
+//   Cr -= Ai*Bi      beta = 1
+//   Ci  = Ar*Bi      beta = accumulate ? 1 : 0
+//   Ci += Ai*Br      beta = 1
+// so accumulation semantics are unchanged. beta=1 is already how per-tile
+// K-accumulation works today; this route moves nothing.
+//=============================================================================
+
+inline void check_hipblas(hipblasStatus_t st, const char *what, int device) {
+  if (st != HIPBLAS_STATUS_SUCCESS) {
+    std::stringstream err;
+    err << "[AER_TN] " << what << " failed on device " << device
+        << " with hipblasStatus_t " << static_cast<int>(st) << ".";
+    throw std::runtime_error(err.str());
+  }
+}
+
+// hipblas*gemm takes int for m/n/k/lda/ldb/ldc while this backend carries
+// int64_t extents throughout. The narrowing is explicit and loud.
+inline int hipblas_narrow(int64_t v, const char *what, size_t step) {
+  if (v <= 0 || v > static_cast<int64_t>(2147483647)) {
+    std::stringstream err;
+    err << "[AER_TN] GEMM route: " << what << " = " << v << " at step " << step
+        << " does not fit the int the hipblas*gemm interface takes. Unset "
+           "AER_TN_GEMM to run this circuit on the hiptensorContraction path.";
+    throw std::runtime_error(err.str());
+  }
+  return static_cast<int>(v);
+}
+
+template <typename data_t> struct HipblasGemm;
+
+template <> struct HipblasGemm<double> {
+  static hipblasStatus_t call(hipblasHandle_t h, hipblasOperation_t ta,
+                              hipblasOperation_t tb, int m, int n, int k,
+                              const double *alpha, const double *A, int lda,
+                              const double *B, int ldb, const double *beta,
+                              double *C, int ldc) {
+    return hipblasDgemm(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C,
+                        ldc);
+  }
+};
+
+template <> struct HipblasGemm<float> {
+  static hipblasStatus_t call(hipblasHandle_t h, hipblasOperation_t ta,
+                              hipblasOperation_t tb, int m, int n, int k,
+                              const float *alpha, const float *A, int lda,
+                              const float *B, int ldb, const float *beta,
+                              float *C, int ldc) {
+    return hipblasSgemm(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C,
+                        ldc);
+  }
+};
+#endif // AER_HIPBLAS
+
 template <typename data_t> class GPUDevice {
   int device_id_;
   std::string architecture_;
@@ -894,6 +1013,14 @@ template <typename data_t> class GPUDevice {
   hipStream_t stream_;
   hiptensorHandle_t *ht_handle_;
   bool handle_valid_;
+#ifdef AER_HIPBLAS
+  // aer-0040: created only when the GEMM route is enabled, destroyed in
+  // release() alongside the stream. Never shared through SharedPlanRegistry:
+  // that slot exists to keep hipTensor PLANS alive across contractors, and a
+  // hipBLAS handle owns no plans.
+  hipblasHandle_t bl_handle_;
+  bool bl_handle_valid_;
+#endif
 
   HipTensorPlanCache<data_t> plan_cache_;
   // aer-0028: when shared-plan-cache mode is on this points at the process-wide
@@ -915,6 +1042,9 @@ public:
   GPUDevice()
       : device_id_(-1), total_memory_(0), free_memory_(0), stream_(nullptr),
         ht_handle_(nullptr), handle_valid_(false),
+#ifdef AER_HIPBLAS
+        bl_handle_(nullptr), bl_handle_valid_(false),
+#endif
         tensor_data_ptr_(nullptr), tensor_data_size_(0) {}
   ~GPUDevice() { release(); }
   GPUDevice(const GPUDevice &) = delete;
@@ -949,6 +1079,18 @@ public:
       handle_valid_ = true;
       plan_cache_.init(ht_handle_, device_id_);
     }
+
+#ifdef AER_HIPBLAS
+    if (tn_gemm_route()) {
+      check_hipblas(hipblasCreate(&bl_handle_), "hipblasCreate", device_id_);
+      bl_handle_valid_ = true;
+      // Same stream as every hipTensor call on this device, so the GEMM route
+      // keeps the existing ordering and the existing one-sync-per-phase
+      // profiling model stays valid.
+      check_hipblas(hipblasSetStream(bl_handle_, stream_), "hipblasSetStream",
+                    device_id_);
+    }
+#endif
 
     peer_access_.resize(total_device_count, false);
     for (int other = 0; other < total_device_count; other++) {
@@ -1170,6 +1312,59 @@ public:
         "hiptensorContraction(Ci+=Ai*Br)", device_id_);
   }
 
+#ifdef AER_HIPBLAS
+  // aer-0040: the routed form of execute_contraction_planes. Same six plane
+  // pointers, same alphas, same betas, same stream; four hipblas*gemm calls
+  // instead of four hiptensorContraction calls. No workspace: GEMM needs none.
+  //
+  // a_trans / b_trans say which of the two admissible packed layouts each
+  // operand is in, decided in setup_pool_and_cache and carried on PlanSpec:
+  //   a_trans == false: A is [M-modes][K-modes], an (M x K) matrix, lda = M
+  //   a_trans == true : A is [K-modes][M-modes], so A^T is wanted, lda = K
+  //   b_trans == false: B is [K-modes][N-modes], a (K x N) matrix, ldb = K
+  //   b_trans == true : B is [N-modes][K-modes], so B^T is wanted, ldb = N
+  // C is always a packed pool slot in [M-modes][N-modes] order, which is what
+  // compute_contraction_result produces, so ldc = M with no transpose.
+  void execute_contraction_gemm(int64_t M64, int64_t N64, int64_t K64,
+                                bool a_trans, bool b_trans, size_t step,
+                                data_t *Ar, data_t *Ai,
+                                data_t *Br, data_t *Bi,
+                                data_t *Cr, data_t *Ci,
+                                bool accumulate) {
+    hipSetDevice(device_id_);
+    const int m = hipblas_narrow(M64, "M", step);
+    const int n = hipblas_narrow(N64, "N", step);
+    const int k = hipblas_narrow(K64, "K", step);
+    const int lda = a_trans ? k : m;
+    const int ldb = b_trans ? n : k;
+    const int ldc = m;
+    const hipblasOperation_t ta = a_trans ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+    const hipblasOperation_t tb = b_trans ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+
+    const data_t pos_one = static_cast<data_t>(1.0);
+    const data_t neg_one = static_cast<data_t>(-1.0);
+    const data_t zero = static_cast<data_t>(0.0);
+    const data_t initial_beta = accumulate ? pos_one : zero;
+
+    check_hipblas(HipblasGemm<data_t>::call(bl_handle_, ta, tb, m, n, k,
+                                            &pos_one, Ar, lda, Br, ldb,
+                                            &initial_beta, Cr, ldc),
+                  "hipblas gemm(Cr=Ar*Br)", device_id_);
+    check_hipblas(HipblasGemm<data_t>::call(bl_handle_, ta, tb, m, n, k,
+                                            &neg_one, Ai, lda, Bi, ldb,
+                                            &pos_one, Cr, ldc),
+                  "hipblas gemm(Cr-=Ai*Bi)", device_id_);
+    check_hipblas(HipblasGemm<data_t>::call(bl_handle_, ta, tb, m, n, k,
+                                            &pos_one, Ar, lda, Bi, ldb,
+                                            &initial_beta, Ci, ldc),
+                  "hipblas gemm(Ci=Ar*Bi)", device_id_);
+    check_hipblas(HipblasGemm<data_t>::call(bl_handle_, ta, tb, m, n, k,
+                                            &pos_one, Ai, lda, Br, ldb,
+                                            &pos_one, Ci, ldc),
+                  "hipblas gemm(Ci+=Ai*Br)", device_id_);
+  }
+#endif // AER_HIPBLAS
+
   // Accumulate a split-complex tensor (stored with real plane followed by
   // imag plane, each of num_elements data_t values) into the interleaved
   // thrust complex output buffer dev_out_. Used at the end of each slice
@@ -1249,6 +1444,9 @@ public:
     dev_out_.clear(); dev_out_.shrink_to_fit();
     deallocate_sampling_buffers();
     if (handle_valid_) { hiptensorDestroy(ht_handle_); ht_handle_ = nullptr; handle_valid_ = false; }
+#ifdef AER_HIPBLAS
+    if (bl_handle_valid_) { hipblasDestroy(bl_handle_); bl_handle_ = nullptr; bl_handle_valid_ = false; }
+#endif
     if (stream_) { hipStreamDestroy(stream_); stream_ = nullptr; }
   }
 
