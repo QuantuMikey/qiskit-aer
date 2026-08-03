@@ -543,6 +543,46 @@ if(AER_THRUST_SUPPORTED)
             message(FATAL_ERROR "hipTensor package found but library not locatable")
           endif()
         endif()
+
+        # hipBLAS, for the GEMM contraction route. Present in the image from
+        # stage 02's ROCm meta-package but never linked until now: a
+        # case-insensitive search of this tree for hipblas|rocblas|hipblaslt
+        # returned nothing before this commit.
+        #
+        # Linked inside the hipTensor block deliberately. The GEMM route
+        # replaces the four hiptensorContraction calls in
+        # execute_contraction_planes with four hipblas*gemm calls on the SAME
+        # split-complex planes, so it is an alternative dispatch for a path
+        # that only exists when AER_HIPTENSOR is defined. It is not a separate
+        # backend and must not be selectable without one.
+        #
+        # The target name varies by ROCm version exactly as hipTensor's does,
+        # so the same three-way fallback applies. A miss is a warning, not a
+        # fatal error: without AER_HIPBLAS the contractor keeps the
+        # hiptensorContraction path and every existing capability is unchanged.
+        find_package(hipblas QUIET)
+        if(TARGET roc::hipblas)
+          list(APPEND AER_LIBRARIES roc::hipblas)
+          list(APPEND ROCM_EXTRA_DEFS -DAER_HIPBLAS)
+          message(STATUS "hipBLAS found (roc::hipblas) - GEMM contraction route enabled")
+        elseif(TARGET hipblas)
+          list(APPEND AER_LIBRARIES hipblas)
+          list(APPEND ROCM_EXTRA_DEFS -DAER_HIPBLAS)
+          message(STATUS "hipBLAS found (hipblas) - GEMM contraction route enabled")
+        else()
+          find_library(HIPBLAS_LIB hipblas
+            HINTS ${ROCM_PATH}/lib ${ROCM_PATH}/hipblas/lib)
+          if(HIPBLAS_LIB)
+            list(APPEND AER_LIBRARIES ${HIPBLAS_LIB})
+            list(APPEND ROCM_EXTRA_DEFS -DAER_HIPBLAS)
+            include_directories(${ROCM_PATH}/include)
+            message(STATUS "hipBLAS found (${HIPBLAS_LIB}) - GEMM contraction route enabled")
+          else()
+            message(WARNING
+              "hipBLAS was not found. The GEMM contraction route will not be "
+              "compiled in and contraction stays on hiptensorContraction.")
+          endif()
+        endif()
       else()
         message(WARNING
           "AER_ENABLE_HIPTENSOR is set but hipTensor was not found. "
