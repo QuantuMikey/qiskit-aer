@@ -781,6 +781,10 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // this, since it is the only one that rewrites modes_c into modes_out_ order.
   // Replaces aer-0040's blanket exclusion of the final step.
   uint64_t gemm_steps_declined_corder_ = 0;
+  // aer-0045: declined because the contracted modes appear in a different order
+  // on A than on B, which a single GEMM k index cannot express and a transpose
+  // cannot repair.
+  uint64_t gemm_steps_declined_korder_ = 0;
   // aer-0042: per-phase attribution for the GEMM route. Without it the contract
   // phase lumps routed and declined steps together and a timing comparison
   // cannot say which produced the difference.
@@ -1822,6 +1826,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   gemm_steps_declined_strided_ = 0;
   gemm_steps_declined_layout_ = 0;
   gemm_steps_declined_corder_ = 0;
+  gemm_steps_declined_korder_ = 0;
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
   hipSetDevice(dev.device_id());
 
@@ -2230,6 +2235,31 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
           if (extents_c[i] > 1)
             have_c.push_back(modes_c[i]);
         const bool c_ok = (want_c == have_c);
+
+        // aer-0045: the contracted modes must appear in the SAME ORDER on A and
+        // on B. A GEMM has one k index; it walks A's K block and B's K block
+        // together, so the mode each position of k stands for has to match.
+        // aer-0040 never checked this. gemm_operand_layout inspects one operand
+        // at a time -- it counts runs and multiplies extents -- so A = [m,k1,k2]
+        // against B = [k2,k1,n] passes every guard: two contiguous runs each,
+        // K extents agree at 4, and C is [m][n] so aer-0044 accepts it too. The
+        // GEMM then pairs A's (k1,k2) with B's (k2,k1) and returns a plausible,
+        // wrong number with no error anywhere. Reproduced on paper against a
+        // reference contraction: all four elements of C wrong.
+        //
+        // This is a genuine decline, not something a transpose can repair.
+        // HIPBLAS_OP_T swaps an operand's two BLOCKS; it cannot reorder modes
+        // WITHIN a block. Only a physical permute could, and this route does
+        // not permute.
+        std::vector<int32_t> ka_seq, kb_seq;
+        for (size_t i = 0; i < modes_a.size(); i++)
+          if (sb.count(modes_a[i]) && extents_a[i] > 1)
+            ka_seq.push_back(modes_a[i]);
+        for (size_t i = 0; i < modes_b.size(); i++)
+          if (sa.count(modes_b[i]) && extents_b[i] > 1)
+            kb_seq.push_back(modes_b[i]);
+        const bool k_ok = (ka_seq == kb_seq);
+
         bool at = false, bt = false;
         int64_t m_ext = 1, ka_ext = 1, n_ext = 1, kb_ext = 1;
         const bool a_ok = gemm_operand_layout(modes_a, extents_a, shared_modes,
@@ -2245,7 +2275,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         // difference between a declined step and silent corruption.
         const int64_t c_elems_expected =
             all_specs_[result_idx].num_elements();
-        if (a_ok && b_ok && c_ok && ka_ext == kb_ext &&
+        if (a_ok && b_ok && c_ok && k_ok && ka_ext == kb_ext &&
             m_ext * n_ext == c_elems_expected) {
           step_plan_specs_[step].gemm_ok = true;
           // A is (M x K) when its order is [free][contracted] -- OP_N, lda = M
@@ -2261,6 +2291,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
           step_plan_specs_[step].gemm_n = n_ext;
           step_plan_specs_[step].gemm_k = ka_ext;
           gemm_steps_routed_++;
+        } else if (!k_ok) {
+          gemm_steps_declined_korder_++;
         } else if (!c_ok) {
           gemm_steps_declined_corder_++;
         } else {
@@ -2292,17 +2324,19 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   if (tn_gemm_route()) {
     fprintf(stderr,
             "[AER_TN_GEMM] steps=%zu routed=%llu declined: tiled=%llu "
-            "strided=%llu layout=%llu corder=%llu sum=%llu verify=%d\n",
+            "strided=%llu layout=%llu corder=%llu korder=%llu sum=%llu verify=%d\n",
             num_steps, (unsigned long long)gemm_steps_routed_,
             (unsigned long long)gemm_steps_declined_tiled_,
             (unsigned long long)gemm_steps_declined_strided_,
             (unsigned long long)gemm_steps_declined_layout_,
             (unsigned long long)gemm_steps_declined_corder_,
+            (unsigned long long)gemm_steps_declined_korder_,
             (unsigned long long)(gemm_steps_routed_ +
                                  gemm_steps_declined_tiled_ +
                                  gemm_steps_declined_strided_ +
                                  gemm_steps_declined_layout_ +
-                                 gemm_steps_declined_corder_),
+                                 gemm_steps_declined_corder_ +
+                                 gemm_steps_declined_korder_),
             tn_gemm_verify() ? 1 : 0);
   }
 #endif
@@ -3091,12 +3125,24 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     // no-op and can be removed.
     // aer-0043: decide the route BEFORE building a hipTensor plan. A routed
     // step never calls hiptensorContraction, so the descriptors, the signature
-    // and the plan built for it were pure waste -- and plan creation is not
-    // free: it is what the process-wide plan cache exists to avoid (795x on
-    // warm setup with both caches on), and it is where the
-    // 0.89-percent-per-creation tiled-plan hard fault lives. Skipping it
-    // removes both. Under AER_TN_GEMM_VERIFY the plan IS still built, because
-    // the verification runs the hipTensor path to produce its reference.
+    // and the plan built for it were pure waste.
+    //
+    // WHAT THIS SAVES, corrected in aer-0045 after reading setup_pool_and_cache.
+    // That function has a prebuild loop over every step which calls
+    // remap_modes_to_safe_range, build_signature and get_or_create for each and
+    // takes .workspace_bytes into circuit_max_ws. It knows nothing about
+    // routing, so EVERY plan is still constructed at setup and the cache is warm
+    // by the time this runs. What is skipped here is a mode remap, a signature
+    // build and a hash lookup PER ROUTED DISPATCH -- and dispatches are
+    // steps x slices_local, so the count is not small -- but NOT a plan
+    // construction. aer-0043's original claims that this buys the plan cache's
+    // 795x and retires the 0.89-percent-per-creation tiled-plan fault are both
+    // withdrawn: creation is in the prebuild, which this does not touch, and
+    // that fault is on TILED plan creation, whose steps aer-0040 declines
+    // outright, so routing could never have avoided it.
+    //
+    // Under AER_TN_GEMM_VERIFY the plan IS still built, because the
+    // verification runs the hipTensor path to produce its reference.
     bool will_route = false;
 #ifdef AER_HIPBLAS
     will_route = tn_gemm_route() && ps.gemm_ok;
