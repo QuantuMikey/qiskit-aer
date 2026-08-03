@@ -777,6 +777,44 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   uint64_t gemm_steps_declined_strided_ = 0;
   uint64_t gemm_steps_declined_layout_ = 0;
   uint64_t gemm_steps_declined_final_ = 0;
+  // aer-0042: per-phase attribution for the GEMM route. Without it the contract
+  // phase lumps routed and declined steps together and a timing comparison
+  // cannot say which produced the difference.
+  //
+  // WHAT prof_gemm_ms_ MEASURES, PRECISELY: HOST-SIDE ENQUEUE COST, not
+  // execution time. There is no synchronise at the call site. t_contract_ms is
+  // NOT accumulated the same way -- prof_sync_devices() runs a
+  // hipStreamSynchronize on every device stream at the end of the phase, so
+  // t_contract_ms includes kernel EXECUTION while t_gemm_ms does not. The two
+  // are therefore not the same kind of quantity, and t_gemm_ms / t_contract_ms
+  // is NOT the fraction of contraction time the route owns.
+  //
+  // Enqueue cost is nonetheless the quantity this pivot is about: job 20644277
+  // measured hipTensor at 77.3 us per call against hipblasZgemm's ~7.4 us
+  // dispatch floor, and dispatch is what dominates at the ~10^3 FLOP steps this
+  // backend produces. A synchronise here would make t_gemm_ms an execution
+  // time, but it would also serialise the routed path against a hipTensor path
+  // that is not serialised, and the comparison would be worthless.
+  //
+  // The measurement that includes execution is t_contract_ms with the route off
+  // against t_contract_ms with the route on, same workload, same plan. That is
+  // the number to read; t_gemm_ms says how much of the difference is dispatch.
+  //
+  // TWO THINGS THESE COUNTS ARE NOT.
+  //  (1) They are DISPATCHES, not steps. contract_single_slice runs once per
+  //      slice, so a plan with S slices reports steps x slices_local, which is
+  //      the same "call" unit the 77.3 us per-call regression uses. The census
+  //      line [AER_TN_GEMM] is the per-STEP count; these are not equal and are
+  //      not meant to be.
+  //  (2) Under AER_TN_GEMM_VERIFY the hiptensorContraction run that produces
+  //      the reference is NOT counted in ht_calls and its time is NOT in
+  //      t_gemm_ms, though it IS in t_contract_ms. So with verification on,
+  //      gemm_calls + ht_calls under-counts the dispatches actually issued and
+  //      t_gemm_ms understates the fraction of t_contract_ms the route owns.
+  //      Do not read a timing arm that has verification enabled.
+  double prof_gemm_ms_ = 0.0;
+  uint64_t prof_gemm_calls_ = 0;
+  uint64_t prof_ht_calls_ = 0;
 
   // Split-complex plane pointers for one tensor: re/im are independent
   // because slice projection advances both planes by the slice's element
@@ -1305,6 +1343,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_setup_ms_ = 0.0;
     prof_path_ms_ = 0.0;
     prof_contract_ms_ = 0.0;
+    prof_gemm_ms_ = 0.0;
+    prof_gemm_calls_ = 0;
+    prof_ht_calls_ = 0;
     prof_reduce_gpu_ms_ = 0.0;
     prof_reduce_mpi_ms_ = 0.0;
     prof_setup_t0 = std::chrono::steady_clock::now();
@@ -2523,12 +2564,20 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           "slices_local=%lu plan_flops=%.3e local_flops=%.3e "
           "t_setup_ms=%.3f t_path_ms=%.3f t_contract_ms=%.3f "
           "t_reduce_gpu_ms=%.3f t_reduce_mpi_ms=%.3f t_total_ms=%.3f "
-          "gflops_local=%.3f out_size=%lu\n",
+          "gflops_local=%.3f out_size=%lu "
+          "gemm_route=%d t_gemm_ms=%.3f gemm_calls=%lu ht_calls=%lu\n",
           entrypoint, myrank_, nprocs_, num_devices_used_,
           (unsigned long)plan_.num_slices, (unsigned long)slices_local,
           plan_.total_flops, local_flops, prof_setup_ms_, prof_path_ms_,
           prof_contract_ms_, prof_reduce_gpu_ms_, prof_reduce_mpi_ms_, t_total,
-          gflops, (unsigned long)out_size_);
+          gflops, (unsigned long)out_size_,
+#ifdef AER_HIPBLAS
+          tn_gemm_route() ? 1 : 0,
+#else
+          0,
+#endif
+          prof_gemm_ms_, (unsigned long)prof_gemm_calls_,
+          (unsigned long)prof_ht_calls_);
 }
 
 template <typename data_t>
@@ -3116,12 +3165,22 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
                   "hipMemsetAsync(gemm verify re-zero)", dev.device_id());
       }
 
+      std::chrono::steady_clock::time_point prof_g0;
+      if (tn_profile())
+        prof_g0 = std::chrono::steady_clock::now();
       dev.execute_contraction_gemm(
           ps.gemm_m, ps.gemm_n, ps.gemm_k, ps.gemm_a_trans, ps.gemm_b_trans,
           step,
           all_planes[left].re, all_planes[left].im,
           all_planes[right].re, all_planes[right].im,
           all_planes[result_idx].re, all_planes[result_idx].im, false);
+      if (tn_profile()) {
+        // Host-side enqueue cost. Deliberately NOT synchronised: see the note
+        // on prof_gemm_ms_ at its declaration for why this is not the same
+        // quantity as t_contract_ms and must not be read as a fraction of it.
+        prof_gemm_ms_ += tn_ms_since(prof_g0);
+        prof_gemm_calls_++;
+      }
 
       if (tn_gemm_verify()) {
         std::vector<data_t> got_re(static_cast<size_t>(c_elems));
@@ -3162,6 +3221,8 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     }
 #endif
     if (!routed) {
+      if (tn_profile())
+        prof_ht_calls_++;
       dev.execute_contraction_planes(plan,
           all_planes[left].re, all_planes[left].im,
           all_planes[right].re, all_planes[right].im,
