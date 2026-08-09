@@ -333,6 +333,45 @@ static bool tn_gemm_verify() {
   return cached;
 }
 
+// aer-0048: AER_TN_GEMM_ATOMICS=1 restores rocBLAS's DEFAULT atomic reductions
+// on the GEMM handle. Default OFF keeps HIPBLAS_ATOMICS_NOT_ALLOWED, which is
+// the aer-0041 setting that the deterministic-reduction capability and the
+// AER_TN_GEMM_VERIFY exact-equality gate both depend on. This knob exists only
+// to ATTRIBUTE the in-situ dispatch gap (job 20666446: ~19 ms per routed call
+// against the probe's 25.692 us for four gemms, and the probe ran with atomics
+// ALLOWED because it called hipblasCreate and nothing else). Flip it on a
+// timing arm; never on a correctness or verify arm, where a non-deterministic
+// gemm would break the exact comparison silently on the routed steps only.
+static bool tn_gemm_atomics() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_GEMM_ATOMICS");
+    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
+}
+
+// aer-0048: AER_TN_GEMM_WARMUP=1 issues one throwaway four-plane dispatch right
+// after the handle is created, so rocBLAS/Tensile library initialisation and
+// the first Tensile solution lookup are paid at setup rather than on the first
+// timed routed call. The other named candidate for the dispatch gap (per-shape
+// Tensile selection): if a single warm-up shape closes most of the 175x, the
+// cost was library-level lazy init; if it does not, it is per-shape and a
+// single warm-up cannot fix it. Default OFF so a build with the knob unset is
+// byte-identical to today.
+static bool tn_gemm_warmup() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_GEMM_WARMUP");
+    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
+}
+
 template <typename data_t> struct CachedPlan {
   hiptensorContractionDescriptor_t desc;
   hiptensorContractionFind_t find;
@@ -1111,9 +1150,16 @@ public:
       // being evaluated, so the capability wins by default. If atomics turn
       // out to be worth a lot, that is a separate, measured decision with its
       // own knob -- not a silent default.
+      // aer-0048: default NOT_ALLOWED, unchanged; AER_TN_GEMM_ATOMICS=1 flips it
+      // to ALLOWED for the dispatch-gap attribution arm only.
       check_hipblas(
-          hipblasSetAtomicsMode(bl_handle_, HIPBLAS_ATOMICS_NOT_ALLOWED),
-          "hipblasSetAtomicsMode(NOT_ALLOWED)", device_id_);
+          hipblasSetAtomicsMode(bl_handle_,
+                                tn_gemm_atomics() ? HIPBLAS_ATOMICS_ALLOWED
+                                                  : HIPBLAS_ATOMICS_NOT_ALLOWED),
+          "hipblasSetAtomicsMode", device_id_);
+      // aer-0048: pay rocBLAS/Tensile lazy init here, off the timed path.
+      if (tn_gemm_warmup())
+        gemm_warmup();
     }
 #endif
 
@@ -1338,6 +1384,52 @@ public:
   }
 
 #ifdef AER_HIPBLAS
+  // aer-0048: one throwaway routed-shape dispatch to pay rocBLAS/Tensile lazy
+  // initialisation at handle-creation time, off the timed path. Self-contained:
+  // allocates its own small scratch, runs the SAME four-gemm split-complex form
+  // execute_contraction_gemm uses, synchronises so the init actually completes,
+  // and frees. Shape 8x8x8 is inside the m6n6k6 routed envelope and large
+  // enough to select a non-trivial Tensile solution. Errors are swallowed: a
+  // warm-up that fails must not take down a run whose real dispatches would
+  // have succeeded. Only reached from init() when tn_gemm_route() &&
+  // tn_gemm_warmup(); default off leaves the handle exactly as before.
+  void gemm_warmup() {
+    hipSetDevice(device_id_);
+    const int wm = 8, wn = 8, wk = 8;
+    const size_t na = (size_t)wm * wk, nb = (size_t)wk * wn, nc = (size_t)wm * wn;
+    void *Ar = nullptr, *Ai = nullptr, *Br = nullptr, *Bi = nullptr,
+         *Cr = nullptr, *Ci = nullptr;
+    bool ok = (hipMalloc(&Ar, na * sizeof(data_t)) == hipSuccess) &&
+              (hipMalloc(&Ai, na * sizeof(data_t)) == hipSuccess) &&
+              (hipMalloc(&Br, nb * sizeof(data_t)) == hipSuccess) &&
+              (hipMalloc(&Bi, nb * sizeof(data_t)) == hipSuccess) &&
+              (hipMalloc(&Cr, nc * sizeof(data_t)) == hipSuccess) &&
+              (hipMalloc(&Ci, nc * sizeof(data_t)) == hipSuccess);
+    if (ok) {
+      hipMemsetAsync(Ar, 0, na * sizeof(data_t), stream_);
+      hipMemsetAsync(Ai, 0, na * sizeof(data_t), stream_);
+      hipMemsetAsync(Br, 0, nb * sizeof(data_t), stream_);
+      hipMemsetAsync(Bi, 0, nb * sizeof(data_t), stream_);
+      const data_t pos_one = static_cast<data_t>(1.0);
+      const data_t neg_one = static_cast<data_t>(-1.0);
+      const data_t zero = static_cast<data_t>(0.0);
+      data_t *ar = static_cast<data_t *>(Ar), *ai = static_cast<data_t *>(Ai);
+      data_t *br = static_cast<data_t *>(Br), *bi = static_cast<data_t *>(Bi);
+      data_t *cr = static_cast<data_t *>(Cr), *ci = static_cast<data_t *>(Ci);
+      HipblasGemm<data_t>::call(bl_handle_, HIPBLAS_OP_N, HIPBLAS_OP_N, wm, wn,
+                                wk, &pos_one, ar, wm, br, wk, &zero, cr, wm);
+      HipblasGemm<data_t>::call(bl_handle_, HIPBLAS_OP_N, HIPBLAS_OP_N, wm, wn,
+                                wk, &neg_one, ai, wm, bi, wk, &pos_one, cr, wm);
+      HipblasGemm<data_t>::call(bl_handle_, HIPBLAS_OP_N, HIPBLAS_OP_N, wm, wn,
+                                wk, &pos_one, ar, wm, bi, wk, &zero, ci, wm);
+      HipblasGemm<data_t>::call(bl_handle_, HIPBLAS_OP_N, HIPBLAS_OP_N, wm, wn,
+                                wk, &pos_one, ai, wm, br, wk, &pos_one, ci, wm);
+      hipStreamSynchronize(stream_);
+    }
+    hipFree(Ar); hipFree(Ai); hipFree(Br); hipFree(Bi);
+    hipFree(Cr); hipFree(Ci);
+  }
+
   // aer-0040: the routed form of execute_contraction_planes. Same six plane
   // pointers, same alphas, same betas, same stream; four hipblas*gemm calls
   // instead of four hiptensorContraction calls. No workspace: GEMM needs none.
