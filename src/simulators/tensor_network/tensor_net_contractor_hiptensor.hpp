@@ -744,6 +744,22 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   double prof_reduce_gpu_ms_ = 0.0;
   double prof_reduce_mpi_ms_ = 0.0;
 
+  // aer-0047: the (t_setup_ms - t_path_ms) remainder, itemised. It is 41-57
+  // percent of runtime at p=2 and had no counter of any kind. All three are
+  // charged INSIDE the same setup bracket as prof_setup_ms_ (setup_contraction
+  // opens it at prof_setup_t0 and closes it at the += below), so
+  //   prof_setup_ms_ - prof_path_ms_ - prof_specs_ms_ - prof_prebuild_ms_
+  //     - prof_pool_ms_
+  // is the residual (windows 1/2/3a, the per-device copy loop). Every one of
+  // these phases is host-side and synchronous -- hipTensor plan get_or_create
+  // builds descriptors and queries workspace with no kernel launch, and
+  // pool().allocate() is a blocking hipMalloc -- so they are timed with plain
+  // steady_clock and NOT prof_sync_devices(), exactly as prof_setup_ms_ is.
+  // Adding a sync here would charge unrelated in-flight work to setup.
+  double prof_specs_ms_ = 0.0;      // build_sliced_specs()
+  double prof_prebuild_ms_ = 0.0;   // per-step descriptor walk + plan get_or_create
+  double prof_pool_ms_ = 0.0;       // pool plan_layout + hipMalloc
+
   NetworkDescription network_desc_;
   std::vector<std::shared_ptr<Tensor<data_t>>> input_tensors_;
   bool add_sp_tensors_;
@@ -1359,6 +1375,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_ht_calls_ = 0;
     prof_reduce_gpu_ms_ = 0.0;
     prof_reduce_mpi_ms_ = 0.0;
+    prof_specs_ms_ = 0.0;
+    prof_prebuild_ms_ = 0.0;
+    prof_pool_ms_ = 0.0;
     prof_setup_t0 = std::chrono::steady_clock::now();
   }
 
@@ -1648,7 +1667,15 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
       // the planner gate.
       if (setup_status == 0) {
         try {
-          build_sliced_specs();
+          {
+            // aer-0047: descriptor/spec phase.
+            std::chrono::steady_clock::time_point prof_specs_t0;
+            if (tn_profile())
+              prof_specs_t0 = std::chrono::steady_clock::now();
+            build_sliced_specs();
+            if (tn_profile())
+              prof_specs_ms_ += tn_ms_since(prof_specs_t0);
+          }
 
           if (!pool_ready_) {
             setup_pool_and_cache(0, engaged);
@@ -1833,6 +1860,15 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   gemm_plans_skipped_ = 0;
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
   hipSetDevice(dev.device_id());
+
+  // aer-0047: everything from here to plan_layout is the plan-prebuild phase
+  // (the per-step descriptor walk and the hipTensor plan get_or_create loop,
+  // the 31.6 ms-per-plan term aer-0046 skips for routed steps); plan_layout and
+  // pool().allocate() are the pool phase. Both host-side/synchronous; += so a
+  // multi-device setup and an AUTO re-plan accumulate rather than overwrite.
+  std::chrono::steady_clock::time_point prof_prebuild_t0, prof_pool_t0;
+  if (tn_profile())
+    prof_prebuild_t0 = std::chrono::steady_clock::now();
 
   size_t num_inputs = sliced_input_specs_.size();
   size_t num_steps = plan_.steps.size();
@@ -2485,12 +2521,18 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     fprintf(stderr, "[AER_TN] workspace computed (max_ws=%lu); laying out pool\n",
             (unsigned long)max_ws);
 
+  if (tn_profile()) {
+    prof_prebuild_ms_ += tn_ms_since(prof_prebuild_t0);
+    prof_pool_t0 = std::chrono::steady_clock::now();
+  }
   dev.pool().plan_layout(intermediates, max_ws, static_cast<int>(num_steps));
 
   if (tn_verbose())
     fprintf(stderr, "[AER_TN] pool layout done; allocating\n");
 
   dev.pool().allocate(dev.device_id());
+  if (tn_profile())
+    prof_pool_ms_ += tn_ms_since(prof_pool_t0);
 
   if (tn_verbose())
     fprintf(stderr, "[AER_TN] pool: %zu bytes, %zu plans cached (device %d)\n",
@@ -2673,7 +2715,8 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           "t_setup_ms=%.3f t_path_ms=%.3f t_contract_ms=%.3f "
           "t_reduce_gpu_ms=%.3f t_reduce_mpi_ms=%.3f t_total_ms=%.3f "
           "gflops_local=%.3f out_size=%lu "
-          "gemm_route=%d t_gemm_ms=%.3f gemm_calls=%lu ht_calls=%lu\n",
+          "gemm_route=%d t_gemm_ms=%.3f gemm_calls=%lu ht_calls=%lu "
+          "t_specs_ms=%.3f t_prebuild_ms=%.3f t_pool_ms=%.3f\n",
           entrypoint, myrank_, nprocs_, num_devices_used_,
           (unsigned long)plan_.num_slices, (unsigned long)slices_local,
           plan_.total_flops, local_flops, prof_setup_ms_, prof_path_ms_,
@@ -2685,7 +2728,8 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           0,
 #endif
           prof_gemm_ms_, (unsigned long)prof_gemm_calls_,
-          (unsigned long)prof_ht_calls_);
+          (unsigned long)prof_ht_calls_,
+          prof_specs_ms_, prof_prebuild_ms_, prof_pool_ms_);
 }
 
 template <typename data_t>
