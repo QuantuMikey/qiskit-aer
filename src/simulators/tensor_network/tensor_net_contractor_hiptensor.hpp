@@ -3710,10 +3710,14 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       // strides reordered by the permutation). C never permutes; the target
       // orders write it straight into its declared slot. Reference planes for
       // the verify arm above are untouched: the pack READS the originals.
-      const data_t *g_a_re = all_planes[left].re;
-      const data_t *g_a_im = all_planes[left].im;
-      const data_t *g_b_re = all_planes[right].re;
-      const data_t *g_b_im = all_planes[right].im;
+      // Non-const: execute_contraction_gemm's signature takes data_t*
+      // (hipblas's own pointer types are non-const), and the scratch planes
+      // are writable by definition. The pack call below still cannot mutate
+      // its source -- stage_pack takes const src pointers.
+      data_t *g_a_re = all_planes[left].re;
+      data_t *g_a_im = all_planes[left].im;
+      data_t *g_b_re = all_planes[right].re;
+      data_t *g_b_im = all_planes[right].im;
       if (ps.gemm_perm_a || ps.gemm_perm_b) {
         thrust::device_vector<data_t> &pbuf =
             gemm_perm_scratch_[dev.device_id()];
