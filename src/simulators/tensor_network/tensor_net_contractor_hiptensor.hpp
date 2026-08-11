@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <complex>
@@ -906,6 +907,15 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
     // 111,941 randomised cases, zero mismatches).
     bool gemm_perm_a = false, gemm_perm_b = false;
     std::vector<int64_t> perm_ext_a, perm_str_a, perm_ext_b, perm_str_b;
+    // aer-0054: corder handling. When gemm_scatter_c is set the GEMM writes
+    // its natural [M in A's free order][N in B's free order] result into
+    // scratch, and stage_scatter places it into the DECLARED C slot:
+    // scat_ext is the natural-order extent list (extent>1 free modes) and
+    // scat_str the declared-C column-major strides reordered to that natural
+    // order. Audited in audit_aer0054_design.py CLAIM C, including every
+    // declared order of a 3-mode output exhaustively.
+    bool gemm_scatter_c = false;
+    std::vector<int64_t> scat_ext, scat_str;
 
     // WS-3 mode tiling. Empty `tiles` => in-envelope step, executed exactly as
     // before via the descriptor above (zero behavior change). Non-empty =>
@@ -2312,9 +2322,22 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     step_plan_specs_[step].gemm_ok = false;
 #ifdef AER_HIPBLAS
     if (tn_gemm_route()) {
-      if (tile_this_step) {
+      // aer-0054: with the permute layer on, tiled and strided steps proceed
+      // into the analysis and are rescued there -- the permute pack reads a
+      // strided view by reordering its PARENT strides (one gather, no
+      // composition step; CLAIM S), and a tiled-class step routes as a WHOLE
+      // step because tiling exists only for hipTensor's m6n6k6 envelope,
+      // which a GEMM does not have (CLAIM T). EXCEPTION: under
+      // AER_TN_GEMM_VERIFY a tiled step stays declined, because its
+      // per-element reference would need the untiled whole-step hipTensor
+      // plan, which violates the envelope -- exactly what tiling exists to
+      // avoid. Tiled-class correctness is instead certified end-to-end by
+      // the pinned route-on/route-off A/B, whose amplitudes are bit-level
+      // comparable on a replayed plan.
+      const bool rescue_on = tn_gemm_permute();
+      if (tile_this_step && (!rescue_on || tn_gemm_verify())) {
         gemm_steps_declined_tiled_++;
-      } else if (!strides_a.empty() || !strides_b.empty()) {
+      } else if ((!strides_a.empty() || !strides_b.empty()) && !rescue_on) {
         gemm_steps_declined_strided_++;
       } else {
         const std::set<int32_t> sa(modes_a.begin(), modes_a.end());
@@ -2393,7 +2416,11 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         // difference between a declined step and silent corruption.
         const int64_t c_elems_expected =
             all_specs_[result_idx].num_elements();
-        if (a_ok && b_ok && c_ok && k_ok && ka_ext == kb_ext &&
+        // The classic (no-copy) accept now states what the early declines
+        // used to imply: packed operands, untiled. A tiled or strided step
+        // reaching this point can only be rescued below.
+        if (!tile_this_step && strides_a.empty() && strides_b.empty() &&
+            a_ok && b_ok && c_ok && k_ok && ka_ext == kb_ext &&
             m_ext * n_ext == c_elems_expected) {
           step_plan_specs_[step].gemm_ok = true;
           // A is (M x K) when its order is [free][contracted] -- OP_N, lda = M
@@ -2409,10 +2436,11 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
           step_plan_specs_[step].gemm_n = n_ext;
           step_plan_specs_[step].gemm_k = ka_ext;
           gemm_steps_routed_++;
-        } else if (tn_gemm_permute() && c_ok && ka_ext == kb_ext &&
+        } else if (tn_gemm_permute() && ka_ext == kb_ext &&
                    m_ext * n_ext == c_elems_expected &&
                    modes_a.size() <= static_cast<size_t>(kStageMaxRank) &&
-                   modes_b.size() <= static_cast<size_t>(kStageMaxRank)) {
+                   modes_b.size() <= static_cast<size_t>(kStageMaxRank) &&
+                   modes_c.size() <= static_cast<size_t>(kStageMaxRank)) {
           // aer-0052: rescue a layout or korder decline by physically packing
           // both operands into scratch under the audited target orders
           //   A' = [A free modes, original relative order][K, canonical]
@@ -2433,6 +2461,21 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
           // Both operands are routed through the permute even if one is
           // already contiguous -- the audit covers exactly that uniform
           // shape, and one code path is one thing to trust.
+          // aer-0054 extends the rescue to STRIDED sources (perm_str is the
+          // view's parent strides reordered -- project_slice's base shift is
+          // already on the plane pointer, so the pack composes for free),
+          // TILED-class steps (routed whole; tiles cleared below), and
+          // CORDER (C scattered into the declared order; scatter-eligible
+          // means the declared extent>1 modes are the same SET as the
+          // natural ones -- the permute repairs order, never membership).
+          bool scatter_needed = !c_ok;
+          bool membership_ok = true;
+          if (scatter_needed) {
+            std::vector<int32_t> wsort = want_c, hsort = have_c;
+            std::sort(wsort.begin(), wsort.end());
+            std::sort(hsort.begin(), hsort.end());
+            membership_ok = (wsort == hsort);
+          }
           std::vector<size_t> permA, permB;
           std::vector<int32_t> kA;
           for (size_t i = 0; i < modes_a.size(); i++)
@@ -2457,7 +2500,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
             else
               permB.push_back(it->second);
           }
-          if (perm_ok) {
+          if (perm_ok && membership_ok) {
             for (size_t i = 0; i < modes_b.size(); i++)
               if (!sa.count(modes_b[i]) && extents_b[i] > 1)
                 permB.push_back(i);
@@ -2484,6 +2527,48 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
             };
             fill_perm(extents_a, permA, psr.perm_ext_a, psr.perm_str_a);
             fill_perm(extents_b, permB, psr.perm_ext_b, psr.perm_str_b);
+            // Strided source: replace the packed column-major strides the
+            // lambda derived with the view's PARENT strides, reordered by
+            // the same permutation (CLAIM S). Extents are unchanged.
+            if (!strides_a.empty())
+              for (size_t j = 0; j < permA.size(); j++)
+                psr.perm_str_a[j] = strides_a[permA[j]];
+            if (!strides_b.empty())
+              for (size_t j = 0; j < permB.size(); j++)
+                psr.perm_str_b[j] = strides_b[permB[j]];
+            // Corder: the GEMM's natural C is [want_c order]; scatter it
+            // into the declared slot with declared column-major strides
+            // reordered to natural order (CLAIM C).
+            psr.gemm_scatter_c = scatter_needed;
+            if (scatter_needed) {
+              std::vector<int64_t> cstr(extents_c.size());
+              int64_t cacc = 1;
+              for (size_t i = 0; i < extents_c.size(); i++) {
+                cstr[i] = cacc;
+                cacc *= (extents_c[i] > 0 ? extents_c[i] : 1);
+              }
+              std::map<int32_t, size_t> pos_c;
+              for (size_t i = 0; i < modes_c.size(); i++)
+                if (extents_c[i] > 1)
+                  pos_c[modes_c[i]] = i;
+              psr.scat_ext.clear();
+              psr.scat_str.clear();
+              const std::map<int32_t, size_t> *pa2 = nullptr;
+              (void)pa2;
+              for (size_t j = 0; j < want_c.size(); j++) {
+                const size_t ci = pos_c[want_c[j]];
+                psr.scat_ext.push_back(extents_c[ci]);
+                psr.scat_str.push_back(cstr[ci]);
+              }
+            }
+            // Tiled-class: the whole-step route replaces the sub-blocks.
+            // Clearing them sends prebuild and execution down the untiled
+            // path and releases their host memory. (Their construction cost
+            // was already paid this pass; hoisting the classifier above tile
+            // materialisation is deliberately left to the removal era, when
+            // the tiling machinery is deleted outright.)
+            if (tile_this_step)
+              psr.tiles.clear();
             psr.gemm_ok = true;
             psr.gemm_perm_a = true;
             psr.gemm_perm_b = true;
@@ -2500,7 +2585,15 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
             gemm_perm_scratch_elems_ = std::max<uint64_t>(
                 gemm_perm_scratch_elems_,
                 stage_block_elems(psr.perm_ext_b));
+            if (scatter_needed)
+              gemm_perm_scratch_elems_ = std::max<uint64_t>(
+                  gemm_perm_scratch_elems_,
+                  static_cast<uint64_t>(c_elems_expected));
             gemm_steps_permuted_++;
+          } else if (tile_this_step) {
+            gemm_steps_declined_tiled_++;
+          } else if (!strides_a.empty() || !strides_b.empty()) {
+            gemm_steps_declined_strided_++;
           } else if (!k_ok) {
             gemm_steps_declined_korder_++;
           } else if (!c_ok) {
@@ -2508,6 +2601,10 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
           } else {
             gemm_steps_declined_layout_++;
           }
+        } else if (tile_this_step) {
+          gemm_steps_declined_tiled_++;
+        } else if (!strides_a.empty() || !strides_b.empty()) {
+          gemm_steps_declined_strided_++;
         } else if (!k_ok) {
           gemm_steps_declined_korder_++;
         } else if (!c_ok) {
@@ -3718,12 +3815,17 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       data_t *g_a_im = all_planes[left].im;
       data_t *g_b_re = all_planes[right].re;
       data_t *g_b_im = all_planes[right].im;
-      if (ps.gemm_perm_a || ps.gemm_perm_b) {
+      // aer-0054: the scratch is 6 planes -- A re/im, B re/im, and C re/im
+      // for corder steps, whose GEMM result lands in scratch and is then
+      // scattered into the declared slot.
+      data_t *g_c_re = all_planes[result_idx].re;
+      data_t *g_c_im = all_planes[result_idx].im;
+      if (ps.gemm_perm_a || ps.gemm_perm_b || ps.gemm_scatter_c) {
         thrust::device_vector<data_t> &pbuf =
             gemm_perm_scratch_[dev.device_id()];
         const uint64_t pe = gemm_perm_scratch_elems_;
-        if (pbuf.size() < 4 * pe)
-          pbuf.resize(4 * pe);
+        if (pbuf.size() < 6 * pe)
+          pbuf.resize(6 * pe);
         data_t *pbase = thrust::raw_pointer_cast(pbuf.data());
         if (ps.gemm_perm_a) {
           stage_pack<data_t>(dev.stream(), g_a_re, g_a_im, pbase + 0 * pe,
@@ -3737,13 +3839,29 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
           g_b_re = pbase + 2 * pe;
           g_b_im = pbase + 3 * pe;
         }
+        if (ps.gemm_scatter_c) {
+          g_c_re = pbase + 4 * pe;
+          g_c_im = pbase + 5 * pe;
+        }
       }
       dev.execute_contraction_gemm(
           ps.gemm_m, ps.gemm_n, ps.gemm_k, ps.gemm_a_trans, ps.gemm_b_trans,
           step,
           g_a_re, g_a_im,
           g_b_re, g_b_im,
-          all_planes[result_idx].re, all_planes[result_idx].im, false);
+          g_c_re, g_c_im, false);
+      // Corder: place the natural-order result into the declared slot. The
+      // slot was pre-zeroed above; extent-1 declared modes contribute index
+      // zero, and the M*N == C-slot invariant makes the scatter a bijection
+      // onto the extent>1 lattice, so overwrite (accumulate=false) fills the
+      // slot exactly. Runs BEFORE the verify read-back, which compares the
+      // declared slot -- so corder steps verify like any other.
+      if (ps.gemm_scatter_c) {
+        stage_scatter<data_t>(dev.stream(), g_c_re, g_c_im,
+                              all_planes[result_idx].re,
+                              all_planes[result_idx].im,
+                              ps.scat_ext, ps.scat_str, false);
+      }
       if (tn_profile()) {
         // Host-side enqueue cost. Deliberately NOT synchronised: see the note
         // on prof_gemm_ms_ at its declaration for why this is not the same
