@@ -325,6 +325,28 @@ static bool tn_gemm_route() {
 // GEMM's gain. Default OFF; gate any default flip on the 8/16-GCD scaling
 // runs against a pinned plan, never on correctness alone (the correctness is
 // closed by construction and by the standalone audit -- see PlanSpec).
+// aer-0055: AER_TN_GEMM_COMPLEX=1 executes each routed or rescued step as ONE
+// native complex GEMM (hipblasZgemm / hipblasCgemm) on interleaved scratch
+// instead of the four real GEMMs of the split-complex decomposition. The pack
+// that already reads the operand (permuted or identity order) emits the
+// interleaved layout directly, so no storage migration happens -- planes in,
+// planes out. Complex correctness of hipblasZgemm on gfx90a was established
+// by job 20644277 (50/50 cases, worst difference exactly zero), and the
+// interleave -> one-GEMM -> deinterleave equivalence to both the four-GEMM
+// decomposition and a mode-label complex reference is CLAIM Z of
+// audit_aer0054_design.py (110,392 cases, zero mismatches). Default OFF; the
+// A/B against the four-GEMM path gates any default flip.
+static bool tn_gemm_complex() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_GEMM_COMPLEX");
+    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
+}
+
 static bool tn_gemm_permute() {
   static bool checked = false;
   static bool cached = false;
@@ -1074,6 +1096,36 @@ template <> struct HipblasGemm<float> {
                         ldc);
   }
 };
+
+// aer-0055: the native-complex dispatch. The pointers are INTERLEAVED
+// complex buffers (re, im, re, im, ...), which is exactly hipblas's
+// hipblasDoubleComplex / hipblasComplex memory layout, so the casts below
+// are layout-preserving reinterpretations, not conversions.
+template <typename data_t> struct HipblasGemmC;
+
+template <> struct HipblasGemmC<double> {
+  typedef hipblasDoubleComplex cplx;
+  static hipblasStatus_t call(hipblasHandle_t h, hipblasOperation_t ta,
+                              hipblasOperation_t tb, int m, int n, int k,
+                              const cplx *alpha, const cplx *A, int lda,
+                              const cplx *B, int ldb, const cplx *beta,
+                              cplx *C, int ldc) {
+    return hipblasZgemm(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C,
+                        ldc);
+  }
+};
+
+template <> struct HipblasGemmC<float> {
+  typedef hipblasComplex cplx;
+  static hipblasStatus_t call(hipblasHandle_t h, hipblasOperation_t ta,
+                              hipblasOperation_t tb, int m, int n, int k,
+                              const cplx *alpha, const cplx *A, int lda,
+                              const cplx *B, int ldb, const cplx *beta,
+                              cplx *C, int ldc) {
+    return hipblasCgemm(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C,
+                        ldc);
+  }
+};
 #endif // AER_HIPBLAS
 
 template <typename data_t> class GPUDevice {
@@ -1456,6 +1508,19 @@ public:
                                 wk, &pos_one, ar, wm, bi, wk, &zero, ci, wm);
       HipblasGemm<data_t>::call(bl_handle_, HIPBLAS_OP_N, HIPBLAS_OP_N, wm, wn,
                                 wk, &pos_one, ai, wm, br, wk, &pos_one, ci, wm);
+      // aer-0055: the complex GEMM has its own Tensile lazy-init; warm it too
+      // when the complex sub-path is enabled. 4x4x4 complex needs 16 complex
+      // = 32 data_t per operand, within the 64 data_t each buffer holds.
+      if (tn_gemm_complex()) {
+        typedef typename HipblasGemmC<data_t>::cplx cplx;
+        const cplx cone{pos_one, zero};
+        const cplx czero{zero, zero};
+        HipblasGemmC<data_t>::call(bl_handle_, HIPBLAS_OP_N, HIPBLAS_OP_N, 4,
+                                   4, 4, &cone,
+                                   reinterpret_cast<const cplx *>(ar), 4,
+                                   reinterpret_cast<const cplx *>(br), 4,
+                                   &czero, reinterpret_cast<cplx *>(cr), 4);
+      }
       hipStreamSynchronize(stream_);
     }
     hipFree(Ar); hipFree(Ai); hipFree(Br); hipFree(Bi);
@@ -1511,6 +1576,37 @@ public:
                                             &pos_one, Ai, lda, Br, ldb,
                                             &pos_one, Ci, ldc),
                   "hipblas gemm(Ci+=Ai*Br)", device_id_);
+  }
+
+  // aer-0055: one native complex GEMM on interleaved buffers, replacing the
+  // four real dispatches above. Aiv/Biv/Civ point at interleaved complex
+  // scratch (see the 6-plane GEMM scratch: A at 0, B at 2*pe, C at 4*pe,
+  // each region 2*pe data_t = pe complex elements).
+  void execute_contraction_gemm_complex(int64_t M64, int64_t N64, int64_t K64,
+                                        bool a_trans, bool b_trans,
+                                        size_t step,
+                                        const data_t *Aiv, const data_t *Biv,
+                                        data_t *Civ, bool accumulate) {
+    hipSetDevice(device_id_);
+    const int m = hipblas_narrow(M64, "M", step);
+    const int n = hipblas_narrow(N64, "N", step);
+    const int k = hipblas_narrow(K64, "K", step);
+    const int lda = a_trans ? k : m;
+    const int ldb = b_trans ? n : k;
+    const int ldc = m;
+    const hipblasOperation_t ta = a_trans ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+    const hipblasOperation_t tb = b_trans ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+    typedef typename HipblasGemmC<data_t>::cplx cplx;
+    const cplx one{static_cast<data_t>(1.0), static_cast<data_t>(0.0)};
+    const cplx beta{accumulate ? static_cast<data_t>(1.0)
+                               : static_cast<data_t>(0.0),
+                    static_cast<data_t>(0.0)};
+    check_hipblas(HipblasGemmC<data_t>::call(
+                      bl_handle_, ta, tb, m, n, k, &one,
+                      reinterpret_cast<const cplx *>(Aiv), lda,
+                      reinterpret_cast<const cplx *>(Biv), ldb, &beta,
+                      reinterpret_cast<cplx *>(Civ), ldc),
+                  "hipblas gemm complex(C=A*B)", device_id_);
   }
 #endif // AER_HIPBLAS
 

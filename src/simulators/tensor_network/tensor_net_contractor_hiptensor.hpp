@@ -654,6 +654,95 @@ static uint64_t stage_block_elems(const std::vector<int64_t> &ext) {
   return n;
 }
 
+// --- aer-0055: interleaved-complex staging for the native-ZGEMM sub-path ---
+// The gather below is stage_pack's index math with an interleaved destination:
+// element i of the (possibly permuted) source order lands at dst[2i] (real)
+// and dst[2i+1] (imag), which is exactly hipblasDoubleComplex/hipblasComplex
+// memory layout. One pass fuses the permute and the interleave.
+template <typename data_t> struct interleave_pack_func_hip {
+  const data_t *src_re;
+  const data_t *src_im;
+  data_t *dst; // interleaved complex scratch
+  int rank;
+  int64_t ext[kStageMaxRank];
+  int64_t str[kStageMaxRank];
+  __host__ __device__ void operator()(const uint_t &i) const {
+    uint_t rem = i;
+    int64_t off = 0;
+    for (int k = 0; k < rank; ++k) {
+      uint_t e = static_cast<uint_t>(ext[k]);
+      off += static_cast<int64_t>(rem % e) * str[k];
+      rem /= e;
+    }
+    dst[2 * i] = src_re[off];
+    dst[2 * i + 1] = src_im[off];
+  }
+};
+
+// The scatter twin: interleaved source element i goes to the strided offset
+// in each destination plane. With ext={n}, str={1} it is a plain
+// deinterleave; with the corder scat vectors it fuses the deinterleave and
+// the declared-order scatter into one pass.
+template <typename data_t> struct deinterleave_scatter_func_hip {
+  const data_t *src; // interleaved complex scratch
+  data_t *dst_re;
+  data_t *dst_im;
+  int rank;
+  int64_t ext[kStageMaxRank];
+  int64_t str[kStageMaxRank];
+  __host__ __device__ void operator()(const uint_t &i) const {
+    uint_t rem = i;
+    int64_t off = 0;
+    for (int k = 0; k < rank; ++k) {
+      uint_t e = static_cast<uint_t>(ext[k]);
+      off += static_cast<int64_t>(rem % e) * str[k];
+      rem /= e;
+    }
+    dst_re[off] = src[2 * i];
+    dst_im[off] = src[2 * i + 1];
+  }
+};
+
+template <typename data_t>
+static void interleave_pack(hipStream_t stream, const data_t *src_re,
+                            const data_t *src_im, data_t *dst,
+                            const std::vector<int64_t> &extents,
+                            const std::vector<int64_t> &strides) {
+  const uint64_t n = stage_block_elems(extents);
+  interleave_pack_func_hip<data_t> f;
+  const int rank = static_cast<int>(extents.size());
+  f.rank = rank < kStageMaxRank ? rank : kStageMaxRank;
+  for (int k = 0; k < f.rank; ++k) {
+    f.ext[k] = extents[k];
+    f.str[k] = strides[k];
+  }
+  f.src_re = src_re;
+  f.src_im = src_im;
+  f.dst = dst;
+  auto ci = thrust::counting_iterator<uint_t>(0);
+  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+}
+
+template <typename data_t>
+static void deinterleave_scatter(hipStream_t stream, const data_t *src,
+                                 data_t *dst_re, data_t *dst_im,
+                                 const std::vector<int64_t> &extents,
+                                 const std::vector<int64_t> &strides) {
+  const uint64_t n = stage_block_elems(extents);
+  deinterleave_scatter_func_hip<data_t> f;
+  const int rank = static_cast<int>(extents.size());
+  f.rank = rank < kStageMaxRank ? rank : kStageMaxRank;
+  for (int k = 0; k < f.rank; ++k) {
+    f.ext[k] = extents[k];
+    f.str[k] = strides[k];
+  }
+  f.src = src;
+  f.dst_re = dst_re;
+  f.dst_im = dst_im;
+  auto ci = thrust::counting_iterator<uint_t>(0);
+  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+}
+
 // If an operand's tile descriptor max free-mode stride reaches the CK-safe
 // ceiling, mark it for staging: stash the parent strides and REWRITE strides in
 // place to packed column-major, so every downstream consumer (plan-cache warm,
@@ -2435,6 +2524,21 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
           step_plan_specs_[step].gemm_m = m_ext;
           step_plan_specs_[step].gemm_n = n_ext;
           step_plan_specs_[step].gemm_k = ka_ext;
+          // aer-0055: a classic (no-copy) accept still needs interleaved
+          // scratch under the complex sub-path, so its operand and result
+          // sizes join the scratch maximum. Without this, a plan with no
+          // rescued step would size the scratch at zero.
+          if (tn_gemm_complex()) {
+            gemm_perm_scratch_elems_ = std::max<uint64_t>(
+                gemm_perm_scratch_elems_,
+                stage_block_elems(extents_a));
+            gemm_perm_scratch_elems_ = std::max<uint64_t>(
+                gemm_perm_scratch_elems_,
+                stage_block_elems(extents_b));
+            gemm_perm_scratch_elems_ = std::max<uint64_t>(
+                gemm_perm_scratch_elems_,
+                static_cast<uint64_t>(c_elems_expected));
+          }
           gemm_steps_routed_++;
         } else if (tn_gemm_permute() && ka_ext == kb_ext &&
                    m_ext * n_ext == c_elems_expected &&
@@ -2585,7 +2689,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
             gemm_perm_scratch_elems_ = std::max<uint64_t>(
                 gemm_perm_scratch_elems_,
                 stage_block_elems(psr.perm_ext_b));
-            if (scatter_needed)
+            if (scatter_needed || tn_gemm_complex())
               gemm_perm_scratch_elems_ = std::max<uint64_t>(
                   gemm_perm_scratch_elems_,
                   static_cast<uint64_t>(c_elems_expected));
@@ -2761,6 +2865,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                                  gemm_steps_declined_korder_),
             (unsigned long long)gemm_plans_skipped_,
             tn_gemm_verify() ? 1 : 0);
+    if (tn_gemm_complex())
+      fprintf(stderr, "[AER_TN_GEMM] complex sub-path active: one native "
+                      "complex GEMM per dispatch (interleaved scratch)\n");
   }
 #endif
 
@@ -3844,19 +3951,85 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
           g_c_im = pbase + 5 * pe;
         }
       }
+      if (tn_gemm_complex()) {
+        // aer-0055: one native complex GEMM on interleaved scratch. The pack
+        // reads the SAME (extents, strides) the real path would -- permuted
+        // vectors when the step was rescued, identity packed order when it
+        // was a classic accept -- and emits the interleaved layout in the
+        // same pass, so the permute costs nothing extra here. Regions of the
+        // 6-plane scratch: A at 0 (2*pe data_t = pe complex), B at 2*pe,
+        // C at 4*pe. The deinterleave-scatter places C into the declared
+        // slot: with the corder scat vectors when set, or as a plain linear
+        // deinterleave (ext={c_elems}, str={1}) otherwise -- one pass either
+        // way. Verify compares the declared slot afterwards, unchanged.
+        thrust::device_vector<data_t> &zbuf =
+            gemm_perm_scratch_[dev.device_id()];
+        const uint64_t pe = gemm_perm_scratch_elems_;
+        if (zbuf.size() < 6 * pe)
+          zbuf.resize(6 * pe);
+        data_t *zbase = thrust::raw_pointer_cast(zbuf.data());
+        std::vector<int64_t> id_ext, id_str;
+        auto pick = [&](const std::vector<int64_t> &pext,
+                        const std::vector<int64_t> &pstr,
+                        const std::vector<int64_t> &full_ext)
+            -> std::pair<const std::vector<int64_t> *,
+                         const std::vector<int64_t> *> {
+          if (!pext.empty())
+            return {&pext, &pstr};
+          id_ext = full_ext;
+          id_str.assign(full_ext.size(), 0);
+          int64_t acc = 1;
+          for (size_t q = 0; q < full_ext.size(); q++) {
+            id_str[q] = acc;
+            acc *= (full_ext[q] > 0 ? full_ext[q] : 1);
+          }
+          return {&id_ext, &id_str};
+        };
+        {
+          auto pr = pick(ps.perm_ext_a, ps.perm_str_a, ps.extents_a);
+          interleave_pack<data_t>(dev.stream(), all_planes[left].re,
+                                  all_planes[left].im, zbase + 0 * pe,
+                                  *pr.first, *pr.second);
+        }
+        {
+          auto pr = pick(ps.perm_ext_b, ps.perm_str_b, ps.extents_b);
+          interleave_pack<data_t>(dev.stream(), all_planes[right].re,
+                                  all_planes[right].im, zbase + 2 * pe,
+                                  *pr.first, *pr.second);
+        }
+        dev.execute_contraction_gemm_complex(
+            ps.gemm_m, ps.gemm_n, ps.gemm_k, ps.gemm_a_trans,
+            ps.gemm_b_trans, step, zbase + 0 * pe, zbase + 2 * pe,
+            zbase + 4 * pe, false);
+        const int64_t c_nat = ps.gemm_m * ps.gemm_n;
+        if (ps.gemm_scatter_c) {
+          deinterleave_scatter<data_t>(dev.stream(), zbase + 4 * pe,
+                                       all_planes[result_idx].re,
+                                       all_planes[result_idx].im,
+                                       ps.scat_ext, ps.scat_str);
+        } else {
+          const std::vector<int64_t> lin_ext(1, c_nat);
+          const std::vector<int64_t> lin_str(1, 1);
+          deinterleave_scatter<data_t>(dev.stream(), zbase + 4 * pe,
+                                       all_planes[result_idx].re,
+                                       all_planes[result_idx].im,
+                                       lin_ext, lin_str);
+        }
+      } else {
       dev.execute_contraction_gemm(
           ps.gemm_m, ps.gemm_n, ps.gemm_k, ps.gemm_a_trans, ps.gemm_b_trans,
           step,
           g_a_re, g_a_im,
           g_b_re, g_b_im,
           g_c_re, g_c_im, false);
+      }
       // Corder: place the natural-order result into the declared slot. The
       // slot was pre-zeroed above; extent-1 declared modes contribute index
       // zero, and the M*N == C-slot invariant makes the scatter a bijection
       // onto the extent>1 lattice, so overwrite (accumulate=false) fills the
       // slot exactly. Runs BEFORE the verify read-back, which compares the
       // declared slot -- so corder steps verify like any other.
-      if (ps.gemm_scatter_c) {
+      if (ps.gemm_scatter_c && !tn_gemm_complex()) {
         stage_scatter<data_t>(dev.stream(), g_c_re, g_c_im,
                               all_planes[result_idx].re,
                               all_planes[result_idx].im,
@@ -3895,7 +4068,11 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         // relative tolerance instead; non-permuted steps keep exactness, so
         // aer-0045's transposed-operand detection is undiminished where its
         // premise holds.
-        const bool permuted_step = ps.gemm_perm_a || ps.gemm_perm_b;
+        // aer-0055: the complex path's single fused reduction also differs
+        // from hipTensor's association order on EVERY routed step, so the
+        // epsilon gate applies whenever it is active.
+        const bool permuted_step =
+            ps.gemm_perm_a || ps.gemm_perm_b || tn_gemm_complex();
         const double vtol =
             permuted_step
                 ? 64.0 * std::numeric_limits<data_t>::epsilon()
