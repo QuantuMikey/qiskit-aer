@@ -359,14 +359,25 @@ static bool tn_gemm_atomics() {
 // timed routed call. The other named candidate for the dispatch gap (per-shape
 // Tensile selection): if a single warm-up shape closes most of the 175x, the
 // cost was library-level lazy init; if it does not, it is per-shape and a
-// single warm-up cannot fix it. Default OFF so a build with the knob unset is
-// byte-identical to today.
+// single warm-up cannot fix it.
+//
+// aer-0050: default flipped to ON. The pinned 4-arm census (job 21011485, all
+// arms replaying the identical 150-step/8-slice plan) attributed the gap:
+// warm-up alone collapsed t_gemm_ms 471.6 -> 53.0 ms (t_contract 653.3 ->
+// 231.6 ms, 2.82x), and atomics added NOTHING once warm (arm AW 238.4 /
+// 53.6 ms, within noise of arm W) -- so the warm-up belongs on the route
+// unconditionally and HIPBLAS_ATOMICS_NOT_ALLOWED (bitwise determinism) is
+// kept for free. The residual ~414 us/call against the isolated 7.4 us floor
+// is per-shape Tensile selection, which one warm-up cannot fix (measured, not
+// assumed). AER_TN_GEMM_WARMUP=0 restores the aer-0048 lazy behaviour for
+// A/B; any other value (including 1) leaves it on.
 static bool tn_gemm_warmup() {
   static bool checked = false;
-  static bool cached = false;
+  static bool cached = true;
   if (!checked) {
     const char *v = std::getenv("AER_TN_GEMM_WARMUP");
-    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    if (v != nullptr && v[0] == '0' && v[1] == '\0')
+      cached = false;
     checked = true;
   }
   return cached;
