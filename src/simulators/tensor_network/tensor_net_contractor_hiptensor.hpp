@@ -2779,6 +2779,20 @@ void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
     if (probe)
       return;
   }
+  // aer-0051: capture-quality gate. Checked against tiles_built_, the same
+  // counter the hard AER_TN_MAX_TILES ceiling reads, so the two verdicts
+  // cannot drift. Refusing to WRITE (not to run) makes re-submission a
+  // retry-until-quality loop with no wasted result: this run's answer stands.
+  if (tn_plan_file_max_tiles() > 0 && tiles_built_ > tn_plan_file_max_tiles()) {
+    fprintf(stderr,
+            "[AER_TN_PLAN_FILE] plan prebuilt %llu tiles, above the "
+            "AER_TN_PLAN_FILE_MAX_TILES capture target of %llu; plan NOT "
+            "captured to %s (the run itself completed -- re-submit capture to "
+            "draw a fresh search, or raise the target)\n",
+            (unsigned long long)tiles_built_,
+            (unsigned long long)tn_plan_file_max_tiles(), path.c_str());
+    return;
+  }
   const size_t elem_bytes = 2 * sizeof(data_t);
   const std::string key =
       plan_file_network_key(network_desc_, engaged, elem_bytes);

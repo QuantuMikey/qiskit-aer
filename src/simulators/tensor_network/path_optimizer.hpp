@@ -1020,6 +1020,38 @@ static std::string tn_plan_file() {
   return cached;
 }
 
+// aer-0051: optional capture-quality gate. The scattered search can land
+// anywhere in a config's runnable window (the 6x5 p=2 capture landed 64
+// slices / 152,390 tiles where the sizer's sweet-spot row was 2048 / 24,261
+// at the same budget), and a tile-heavy plan is a maxGEMM-poor,
+// throughput-modest one. When set > 0, a fully-successful setup whose
+// prebuild built MORE tiles than this refuses to persist the plan -- the run
+// still completes (the plan cleared the hard AER_TN_MAX_TILES ceiling), but
+// the file is not written, so re-submitting capture keeps drawing until a
+// plan at or under the target lands. 0 (default) = off: any
+// both-ceilings-clearing plan is captured, exactly the aer-0049 behaviour.
+static uint64_t tn_plan_file_max_tiles() {
+  static bool checked = false;
+  static uint64_t cached = 0;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_PLAN_FILE_MAX_TILES");
+    if (v != nullptr) {
+      char *end = nullptr;
+      long long parsed = std::strtoll(v, &end, 10);
+      if (end != v && parsed >= 0) {
+        cached = static_cast<uint64_t>(parsed);
+      } else {
+        fprintf(stderr,
+                "[AER_TN_PLAN_FILE] warning: AER_TN_PLAN_FILE_MAX_TILES='%s' "
+                "is not a non-negative integer; using default %llu.\n",
+                v, (unsigned long long)cached);
+      }
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // The file's network identity: canonical relabelled topology + output + tiling
 // engagement + element size, with target_elements and seed pinned to 0 so the
 // key does not move with the jittering VRAM budget or the path seed. Empty
