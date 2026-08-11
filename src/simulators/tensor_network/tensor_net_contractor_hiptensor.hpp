@@ -4068,15 +4068,19 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         // relative tolerance instead; non-permuted steps keep exactness, so
         // aer-0045's transposed-operand detection is undiminished where its
         // premise holds.
-        // aer-0055: the complex path's single fused reduction also differs
-        // from hipTensor's association order on EVERY routed step, so the
-        // epsilon gate applies whenever it is active.
+        // aer-0056: the epsilon gate is now UNCONDITIONAL. Job 21016919
+        // falsified the bitwise premise on a classic routed step: a fresh
+        // 5x5 plan produced a K=4 step whose GEMM and hipTensor results
+        // printed identically to six significant digits and differed in the
+        // last bits -- rocBLAS's FMA/association order is not CK's, and
+        // thousands of prior bit-exact dispatches were structure, not
+        // guarantee. aer-0045's protection is intact at 64 epsilon: the
+        // fault class it exists for (a transposed or mis-ordered operand)
+        // produces order-one relative errors, ten orders above this gate.
         const bool permuted_step =
             ps.gemm_perm_a || ps.gemm_perm_b || tn_gemm_complex();
-        const double vtol =
-            permuted_step
-                ? 64.0 * std::numeric_limits<data_t>::epsilon()
-                : 0.0;
+        (void)permuted_step;
+        const double vtol = 64.0 * std::numeric_limits<data_t>::epsilon();
         for (size_t e = 0; e < got_re.size(); e++) {
           const double dre = std::fabs(static_cast<double>(got_re[e]) -
                                        static_cast<double>(ref_re[e]));
@@ -4085,10 +4089,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
           const double scale =
               std::max(1.0, std::max(std::fabs(static_cast<double>(ref_re[e])),
                                      std::fabs(static_cast<double>(ref_im[e]))));
-          const bool bad = permuted_step
-                               ? (dre > vtol * scale || dim > vtol * scale)
-                               : (got_re[e] != ref_re[e] ||
-                                  got_im[e] != ref_im[e]);
+          const bool bad = (dre > vtol * scale || dim > vtol * scale);
           if (bad) {
             std::stringstream verr;
             verr << "[AER_TN] GEMM route disagrees with hiptensorContraction "
