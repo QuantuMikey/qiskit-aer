@@ -315,6 +315,27 @@ static bool tn_gemm_route() {
   return cached;
 }
 
+// aer-0052: AER_TN_GEMM_PERMUTE=1 rescues steps the GEMM route declines for
+// `layout` (free and contracted modes interleaved) or `korder` (contracted
+// modes ordered differently on A and B) by physically packing each operand
+// into scratch under a GEMM-compatible mode order before the dispatch. The
+// pinned census (job 21011485) counted layout=100 + korder=15 of 150 steps --
+// the route's largest untapped population -- but the permute costs one extra
+// read+write per operand PER SLICE, which on GEMM-poor steps can exceed the
+// GEMM's gain. Default OFF; gate any default flip on the 8/16-GCD scaling
+// runs against a pinned plan, never on correctness alone (the correctness is
+// closed by construction and by the standalone audit -- see PlanSpec).
+static bool tn_gemm_permute() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_GEMM_PERMUTE");
+    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
+}
+
 // aer-0040: AER_TN_GEMM_VERIFY=1 runs BOTH paths on every routed step and
 // compares the results bit for bit, reporting the first disagreement with the
 // step index and shape. Expensive by construction -- it doubles the work and

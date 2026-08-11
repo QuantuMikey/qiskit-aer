@@ -17,12 +17,14 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -803,6 +805,11 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // on A than on B, which a single GEMM k index cannot express and a transpose
   // cannot repair.
   uint64_t gemm_steps_declined_korder_ = 0;
+  // aer-0052: layout/korder declines rescued by the permute layer. Counted
+  // separately from gemm_steps_routed_ because a permuted dispatch pays an
+  // extra pack per operand per slice and the two populations must be
+  // distinguishable in any timing read.
+  uint64_t gemm_steps_permuted_ = 0;
   // aer-0046: plans NOT built in the setup prebuild because the route will take
   // the step. This is the count that should track the setup saving.
   uint64_t gemm_plans_skipped_ = 0;
@@ -883,6 +890,23 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
     bool gemm_a_trans = false, gemm_b_trans = false;
     int64_t gemm_m = 0, gemm_n = 0, gemm_k = 0;
 
+    // aer-0052: the permute layer. When gemm_perm_a/b is set, the operand is
+    // packed through stage_pack into GEMM scratch under the permuted mode
+    // order [free modes, ORIGINAL relative order][contracted modes, canonical
+    // order := A's contracted-mode appearance order] (extent-1 modes at the
+    // tail; they move no data). perm_ext_X is the destination-order extents
+    // and perm_str_X the SOURCE column-major strides reordered by the same
+    // permutation -- exactly the (extents, parent_strides) pair stage_pack
+    // consumes. Preserving the free modes' relative order is the load-bearing
+    // correctness decision: C is written [M in A's original free order][N in
+    // B's original free order], which is byte-identical to the slot
+    // compute_contraction_result declares, so the aer-0044/0045 wrong-slot
+    // class is closed by construction. Mapping audited standalone BEFORE this
+    // code was written (audit_aer0052_permute_design.py: 3,288 exhaustive +
+    // 111,941 randomised cases, zero mismatches).
+    bool gemm_perm_a = false, gemm_perm_b = false;
+    std::vector<int64_t> perm_ext_a, perm_str_a, perm_ext_b, perm_str_b;
+
     // WS-3 mode tiling. Empty `tiles` => in-envelope step, executed exactly as
     // before via the descriptor above (zero behavior change). Non-empty =>
     // this logical step is oversized (M>6, N>6, or K>6) and is executed as a
@@ -922,6 +946,13 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // per-device passes), so the count is per pass and not cumulative.
   uint64_t tiles_built_ = 0;
   std::unordered_map<int, thrust::device_vector<data_t>> stage_scratch_;
+
+  // aer-0052: GEMM permute scratch. Sized in the prebuild pass to the largest
+  // permuted operand; 4 planes per device (re+im for A and B; C never
+  // permutes -- the free-order-preserving target writes C straight into its
+  // declared slot). Zero-cost when no step permutes (stays unallocated).
+  uint64_t gemm_perm_scratch_elems_ = 0;
+  std::unordered_map<int, thrust::device_vector<data_t>> gemm_perm_scratch_;
 
   std::vector<std::vector<int32_t>> prev_modes_;
   std::vector<std::vector<int64_t>> prev_extents_;
@@ -1902,7 +1933,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   gemm_steps_declined_layout_ = 0;
   gemm_steps_declined_corder_ = 0;
   gemm_steps_declined_korder_ = 0;
+  gemm_steps_permuted_ = 0;
   gemm_plans_skipped_ = 0;
+  gemm_perm_scratch_elems_ = 0;
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
   hipSetDevice(dev.device_id());
 
@@ -2376,6 +2409,105 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
           step_plan_specs_[step].gemm_n = n_ext;
           step_plan_specs_[step].gemm_k = ka_ext;
           gemm_steps_routed_++;
+        } else if (tn_gemm_permute() && c_ok && ka_ext == kb_ext &&
+                   m_ext * n_ext == c_elems_expected &&
+                   modes_a.size() <= static_cast<size_t>(kStageMaxRank) &&
+                   modes_b.size() <= static_cast<size_t>(kStageMaxRank)) {
+          // aer-0052: rescue a layout or korder decline by physically packing
+          // both operands into scratch under the audited target orders
+          //   A' = [A free modes, original relative order][K, canonical]
+          //   B' = [K, canonical][B free modes, original relative order]
+          // canonical := A's contracted-mode appearance order (extent-1 modes
+          // at each tail; a mode's extent is a network-global fact, so an
+          // extent-1 contracted mode is extent-1 on BOTH operands and drops
+          // from K identically on each side). After the pack A' is (M x K)
+          // and B' is (K x N), both OP_N, and C is written [M in A's original
+          // free order][N in B's original free order] -- byte-identical to
+          // the slot compute_contraction_result declares, because the free
+          // relative order was never touched. Mapping audited standalone in
+          // audit_aer0052_permute_design.py (115,229 cases, 0 mismatches)
+          // BEFORE this code existed, per the aer-0045 method. c_ok, the K
+          // product agreement and the M*N == C-slot invariant are still
+          // REQUIRED: the permute repairs order, never membership.
+          //
+          // Both operands are routed through the permute even if one is
+          // already contiguous -- the audit covers exactly that uniform
+          // shape, and one code path is one thing to trust.
+          std::vector<size_t> permA, permB;
+          std::vector<int32_t> kA;
+          for (size_t i = 0; i < modes_a.size(); i++)
+            if (!sb.count(modes_a[i]) && extents_a[i] > 1)
+              permA.push_back(i);
+          for (size_t i = 0; i < modes_a.size(); i++)
+            if (sb.count(modes_a[i]) && extents_a[i] > 1) {
+              permA.push_back(i);
+              kA.push_back(modes_a[i]);
+            }
+          for (size_t i = 0; i < modes_a.size(); i++)
+            if (extents_a[i] <= 1)
+              permA.push_back(i);
+          std::map<int32_t, size_t> pos_b;
+          for (size_t i = 0; i < modes_b.size(); i++)
+            pos_b[modes_b[i]] = i;
+          bool perm_ok = true;
+          for (size_t j = 0; j < kA.size() && perm_ok; j++) {
+            std::map<int32_t, size_t>::iterator it = pos_b.find(kA[j]);
+            if (it == pos_b.end() || extents_b[it->second] <= 1)
+              perm_ok = false;
+            else
+              permB.push_back(it->second);
+          }
+          if (perm_ok) {
+            for (size_t i = 0; i < modes_b.size(); i++)
+              if (!sa.count(modes_b[i]) && extents_b[i] > 1)
+                permB.push_back(i);
+            for (size_t i = 0; i < modes_b.size(); i++)
+              if (extents_b[i] <= 1)
+                permB.push_back(i);
+            PlanSpec &psr = step_plan_specs_[step];
+            auto fill_perm = [](const std::vector<int64_t> &ext,
+                                const std::vector<size_t> &perm,
+                                std::vector<int64_t> &pe,
+                                std::vector<int64_t> &pstr) {
+              std::vector<int64_t> src(ext.size());
+              int64_t acc = 1;
+              for (size_t i = 0; i < ext.size(); i++) {
+                src[i] = acc;
+                acc *= (ext[i] > 0 ? ext[i] : 1);
+              }
+              pe.clear();
+              pstr.clear();
+              for (size_t j = 0; j < perm.size(); j++) {
+                pe.push_back(ext[perm[j]]);
+                pstr.push_back(src[perm[j]]);
+              }
+            };
+            fill_perm(extents_a, permA, psr.perm_ext_a, psr.perm_str_a);
+            fill_perm(extents_b, permB, psr.perm_ext_b, psr.perm_str_b);
+            psr.gemm_ok = true;
+            psr.gemm_perm_a = true;
+            psr.gemm_perm_b = true;
+            // After the pack A' is [free][contracted] and B' is
+            // [contracted][free]: OP_N on both, by construction.
+            psr.gemm_a_trans = false;
+            psr.gemm_b_trans = false;
+            psr.gemm_m = m_ext;
+            psr.gemm_n = n_ext;
+            psr.gemm_k = ka_ext;
+            gemm_perm_scratch_elems_ = std::max<uint64_t>(
+                gemm_perm_scratch_elems_,
+                stage_block_elems(psr.perm_ext_a));
+            gemm_perm_scratch_elems_ = std::max<uint64_t>(
+                gemm_perm_scratch_elems_,
+                stage_block_elems(psr.perm_ext_b));
+            gemm_steps_permuted_++;
+          } else if (!k_ok) {
+            gemm_steps_declined_korder_++;
+          } else if (!c_ok) {
+            gemm_steps_declined_corder_++;
+          } else {
+            gemm_steps_declined_layout_++;
+          }
         } else if (!k_ok) {
           gemm_steps_declined_korder_++;
         } else if (!c_ok) {
@@ -2512,16 +2644,19 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
 #ifdef AER_HIPBLAS
   if (tn_gemm_route()) {
     fprintf(stderr,
-            "[AER_TN_GEMM] steps=%zu routed=%llu declined: tiled=%llu "
+            "[AER_TN_GEMM] steps=%zu routed=%llu permuted=%llu declined: "
+            "tiled=%llu "
             "strided=%llu layout=%llu corder=%llu korder=%llu sum=%llu "
             "plans_skipped=%llu verify=%d\n",
             num_steps, (unsigned long long)gemm_steps_routed_,
+            (unsigned long long)gemm_steps_permuted_,
             (unsigned long long)gemm_steps_declined_tiled_,
             (unsigned long long)gemm_steps_declined_strided_,
             (unsigned long long)gemm_steps_declined_layout_,
             (unsigned long long)gemm_steps_declined_corder_,
             (unsigned long long)gemm_steps_declined_korder_,
             (unsigned long long)(gemm_steps_routed_ +
+                                 gemm_steps_permuted_ +
                                  gemm_steps_declined_tiled_ +
                                  gemm_steps_declined_strided_ +
                                  gemm_steps_declined_layout_ +
@@ -3569,11 +3704,41 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       std::chrono::steady_clock::time_point prof_g0;
       if (tn_profile())
         prof_g0 = std::chrono::steady_clock::now();
+      // aer-0052: a permuted step packs its operands into scratch first (the
+      // same stage_pack the WS-3 tile staging uses -- the permutation IS a
+      // strided view: destination-order extents with the source's column-major
+      // strides reordered by the permutation). C never permutes; the target
+      // orders write it straight into its declared slot. Reference planes for
+      // the verify arm above are untouched: the pack READS the originals.
+      const data_t *g_a_re = all_planes[left].re;
+      const data_t *g_a_im = all_planes[left].im;
+      const data_t *g_b_re = all_planes[right].re;
+      const data_t *g_b_im = all_planes[right].im;
+      if (ps.gemm_perm_a || ps.gemm_perm_b) {
+        thrust::device_vector<data_t> &pbuf =
+            gemm_perm_scratch_[dev.device_id()];
+        const uint64_t pe = gemm_perm_scratch_elems_;
+        if (pbuf.size() < 4 * pe)
+          pbuf.resize(4 * pe);
+        data_t *pbase = thrust::raw_pointer_cast(pbuf.data());
+        if (ps.gemm_perm_a) {
+          stage_pack<data_t>(dev.stream(), g_a_re, g_a_im, pbase + 0 * pe,
+                             pbase + 1 * pe, ps.perm_ext_a, ps.perm_str_a);
+          g_a_re = pbase + 0 * pe;
+          g_a_im = pbase + 1 * pe;
+        }
+        if (ps.gemm_perm_b) {
+          stage_pack<data_t>(dev.stream(), g_b_re, g_b_im, pbase + 2 * pe,
+                             pbase + 3 * pe, ps.perm_ext_b, ps.perm_str_b);
+          g_b_re = pbase + 2 * pe;
+          g_b_im = pbase + 3 * pe;
+        }
+      }
       dev.execute_contraction_gemm(
           ps.gemm_m, ps.gemm_n, ps.gemm_k, ps.gemm_a_trans, ps.gemm_b_trans,
           step,
-          all_planes[left].re, all_planes[left].im,
-          all_planes[right].re, all_planes[right].im,
+          g_a_re, g_a_im,
+          g_b_re, g_b_im,
           all_planes[result_idx].re, all_planes[result_idx].im, false);
       if (tn_profile()) {
         // Host-side enqueue cost. Deliberately NOT synchronised: see the note
@@ -3600,8 +3765,32 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         // inputs, so agreement is expected to be EXACT and the gate is
         // equality. A tolerance here would hide a transposed operand whose
         // error happens to be small on this circuit.
+        //
+        // aer-0052 EXCEPTION: a permuted step re-orders the K reduction (the
+        // canonical K order is not hipTensor's), so the two paths sum the
+        // same products in DIFFERENT association orders and bitwise equality
+        // is no longer the correct gate there. Permuted steps use a tight
+        // relative tolerance instead; non-permuted steps keep exactness, so
+        // aer-0045's transposed-operand detection is undiminished where its
+        // premise holds.
+        const bool permuted_step = ps.gemm_perm_a || ps.gemm_perm_b;
+        const double vtol =
+            permuted_step
+                ? 64.0 * std::numeric_limits<data_t>::epsilon()
+                : 0.0;
         for (size_t e = 0; e < got_re.size(); e++) {
-          if (got_re[e] != ref_re[e] || got_im[e] != ref_im[e]) {
+          const double dre = std::fabs(static_cast<double>(got_re[e]) -
+                                       static_cast<double>(ref_re[e]));
+          const double dim = std::fabs(static_cast<double>(got_im[e]) -
+                                       static_cast<double>(ref_im[e]));
+          const double scale =
+              std::max(1.0, std::max(std::fabs(static_cast<double>(ref_re[e])),
+                                     std::fabs(static_cast<double>(ref_im[e]))));
+          const bool bad = permuted_step
+                               ? (dre > vtol * scale || dim > vtol * scale)
+                               : (got_re[e] != ref_re[e] ||
+                                  got_im[e] != ref_im[e]);
+          if (bad) {
             std::stringstream verr;
             verr << "[AER_TN] GEMM route disagrees with hiptensorContraction "
                  << "at step " << step << ", element " << e << ": gemm ("
@@ -3614,7 +3803,8 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
                  << " transB=" << (ps.gemm_b_trans ? 'T' : 'N')
                  << " modes_a=" << modes_to_str(ps.modes_a)
                  << " modes_b=" << modes_to_str(ps.modes_b)
-                 << " modes_c=" << modes_to_str(ps.modes_c) << ".";
+                 << " modes_c=" << modes_to_str(ps.modes_c)
+                 << " permuted=" << (permuted_step ? 1 : 0) << ".";
             throw std::runtime_error(verr.str());
           }
         }
