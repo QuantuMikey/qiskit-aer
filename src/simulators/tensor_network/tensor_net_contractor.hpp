@@ -56,6 +56,13 @@ public:
   virtual void deallocate_sampling_buffers(void) = 0;
 
   virtual void set_target_gpus(reg_t &t) {}
+
+  // aer-0049: the aer-0025 terminal re-plan calls this on a freshly created
+  // contractor so the last-ditch recovery draws a genuinely new path instead
+  // of replaying the pinned AER_TN_PLAN_FILE plan (which, if the corruption
+  // were plan-attached, would be the very plan being escaped). Default no-op:
+  // only the hipTensor contractor implements the plan file.
+  virtual void set_plan_file_bypass(bool bypass) {}
 };
 
 template <typename data_t = double>

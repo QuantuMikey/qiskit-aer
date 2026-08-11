@@ -963,6 +963,173 @@ inline PlanCache &plan_cache_instance() {
 }
 
 //=============================================================================
+// aer-0049: AER_TN_PLAN_FILE — capture-and-replay of one contraction plan
+//=============================================================================
+//
+// WHY
+// The per-rank cotengra search is non-deterministic (CPU probes confirmed no
+// HyperOptimizer kwarg, including parallel=False with a fixed seed, makes it
+// reproducible), and under MPI the min-FLOP plan is kept — which is the
+// fewest-slice / most-tile one, steering plan selection toward the
+// AER_TN_MAX_TILES ceiling even at a budget whose runnable window is proven
+// (job 20995937: grid 6x5 p=2 clears both ceilings at 1 GiB per slice). Two
+// consequences: no two runs share a plan denominator, so no performance
+// comparison is valid; and a memory-bound distributed run is not RELIABLE at
+// all, because the search will not consistently land a both-ceilings plan.
+// Pinning the plan to a file fixes both.
+//
+// SEMANTICS
+//   AER_TN_PLAN_FILE=<path>, unset by default (feature entirely off).
+//   File absent  -> CAPTURE: the run searches normally; after the first fully
+//                   successful setup (slice ceiling, tile ceiling, prebuild all
+//                   passed) rank 0 writes the plan. Written only on success, so
+//                   a run that trips a ceiling leaves no file and the next
+//                   capture attempt draws a fresh (scattered) search.
+//   File present -> REPLAY: the plan is read instead of searched, on every
+//                   rank, bypassing both the search and the cross-rank MINLOC
+//                   selection. The file is keyed to ONE network topology; a
+//                   mismatched network is refused with a warning and searched
+//                   fresh (never silently replayed).
+//
+// FORMAT: plain text over ContractionPlan::serialize()'s int64 vector — the
+// MPI-broadcast-proven representation, no new layout. Sliced modes are stored
+// as structural (tensor, position) coordinates and re-resolved on load with
+// coords_to_sliced_modes(), exactly as PlanCache does, because raw mode IDs
+// are not guaranteed stable (see THE CORRECTNESS TRAP above). The key is the
+// canonical relabelled topology with target_elements=0 and seed=0: a pinned
+// plan is deliberately valid across budget jitter and seed — replaying a plan
+// whose peak exceeds the actual budget fails loudly at allocation, which is
+// the correct failure.
+//
+// MPI: rank 0 reads the file and broadcasts the raw bytes; every rank parses
+// identical bytes against its own (identical) network, so the verdict is
+// deterministic on all ranks and needs no extra agreement collective. The
+// load is called only under conditions that are uniform across ranks (env
+// value, the collectively-agreed cache verdict, the collectively-set bypass
+// flag), so the broadcast cannot desync.
+
+static std::string tn_plan_file() {
+  static bool checked = false;
+  static std::string cached;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_PLAN_FILE");
+    if (v != nullptr && v[0] != '\0')
+      cached = v;
+    checked = true;
+  }
+  return cached;
+}
+
+// The file's network identity: canonical relabelled topology + output + tiling
+// engagement + element size, with target_elements and seed pinned to 0 so the
+// key does not move with the jittering VRAM budget or the path seed. Empty
+// return means "not keyable" (same rule as the plan cache): refuse to capture
+// or replay rather than risk a wrong match.
+inline std::string plan_file_network_key(const NetworkDescription &net,
+                                         bool engaged,
+                                         size_t element_size_bytes) {
+  return canonical_network_key(net, engaged, /*target_elements=*/0,
+                               /*seed=*/0, element_size_bytes);
+}
+
+inline bool plan_file_encode(const NetworkDescription &net,
+                             const std::string &key,
+                             const ContractionPlan &plan, std::string &out) {
+  std::vector<std::pair<int64_t, int64_t>> coords;
+  if (!sliced_modes_to_coords(net, plan, coords))
+    return false;
+  const std::vector<int64_t> data = plan.serialize();
+  std::ostringstream os;
+  os << "AER_TN_PLAN_FILE v1\n";
+  os << "key " << key << "\n";
+  os << "coords " << coords.size() << "\n";
+  for (size_t i = 0; i < coords.size(); i++)
+    os << coords[i].first << " " << coords[i].second << "\n";
+  os << "plan " << data.size() << "\n";
+  for (size_t i = 0; i < data.size(); i++)
+    os << data[i] << "\n";
+  os << "end\n";
+  out = os.str();
+  return true;
+}
+
+// Parse + validate + resolve in one step. Never trusts lengths from the file:
+// the serialize() layout invariant (5 header values + 2 per step + 2 per
+// sliced mode) is checked BEFORE deserialize() indexes the vector, and the
+// coords count must match the plan's sliced count. On any failure `why` names
+// the reason and the caller falls back to a fresh search.
+inline bool plan_file_decode(const std::string &text,
+                             const NetworkDescription &net,
+                             const std::string &expected_key,
+                             ContractionPlan &out, std::string &why) {
+  std::istringstream is(text);
+  std::string tag, ver, kw, key;
+  if (!(is >> tag >> ver) || tag != "AER_TN_PLAN_FILE" || ver != "v1") {
+    why = "not an AER_TN_PLAN_FILE v1 file";
+    return false;
+  }
+  if (!(is >> kw >> key) || kw != "key") {
+    why = "missing key line";
+    return false;
+  }
+  if (key != expected_key) {
+    why = "network key mismatch (different circuit topology, output, tiling "
+          "engagement, or element size than the plan was captured for)";
+    return false;
+  }
+  size_t ncoords = 0;
+  if (!(is >> kw >> ncoords) || kw != "coords") {
+    why = "missing coords section";
+    return false;
+  }
+  std::vector<std::pair<int64_t, int64_t>> coords(ncoords);
+  for (size_t i = 0; i < ncoords; i++) {
+    if (!(is >> coords[i].first >> coords[i].second)) {
+      why = "truncated coords section";
+      return false;
+    }
+  }
+  size_t nvals = 0;
+  if (!(is >> kw >> nvals) || kw != "plan") {
+    why = "missing plan section";
+    return false;
+  }
+  std::vector<int64_t> data(nvals);
+  for (size_t i = 0; i < nvals; i++) {
+    if (!(is >> data[i])) {
+      why = "truncated plan section";
+      return false;
+    }
+  }
+  if (!(is >> kw) || kw != "end") {
+    why = "missing end marker";
+    return false;
+  }
+  if (data.size() < 5) {
+    why = "plan section shorter than the serialize() header";
+    return false;
+  }
+  const int64_t num_steps = data[0];
+  const int64_t num_sliced = data[1];
+  if (num_steps < 0 || num_sliced < 0 ||
+      data.size() != static_cast<size_t>(5 + 2 * num_steps + 2 * num_sliced)) {
+    why = "plan section length inconsistent with its step/sliced counts";
+    return false;
+  }
+  if (static_cast<size_t>(num_sliced) != coords.size()) {
+    why = "coords count does not match the plan's sliced count";
+    return false;
+  }
+  ContractionPlan plan = ContractionPlan::deserialize(data);
+  if (!coords_to_sliced_modes(net, coords, plan)) {
+    why = "sliced coordinates do not resolve on this network";
+    return false;
+  }
+  out = plan;
+  return true;
+}
+
+//=============================================================================
 // PathOptimizer interface
 //=============================================================================
 

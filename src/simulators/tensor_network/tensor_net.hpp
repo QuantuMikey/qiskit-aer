@@ -1946,6 +1946,16 @@ void TensorNet<data_t>::expval_pauli_batch(
       if (last_chance) {
         delete contractor;
         create_contractor(contractor);
+        // aer-0049: the terminal re-plan exists to draw a DIFFERENT path, for
+        // the case some corruption turns out to be plan-attached. With
+        // AER_TN_PLAN_FILE set, a fresh contractor would replay the pinned
+        // plan — the very plan being escaped — and this last attempt would
+        // degenerate into a fourth re-contract. Bypass the file (read AND
+        // write) on the recovery contractor so it searches fresh. Note the
+        // plan cache (AER_TN_PLAN_CACHE, off by default) would resurrect the
+        // plan the same way; that pre-existing degeneration is documented at
+        // aer-0025/aer-0026 and is unchanged here.
+        contractor->set_plan_file_bypass(true);
         contractor->set_network(tensors_);
         contractor->allocate_additional_tensors(size * 4);
       }

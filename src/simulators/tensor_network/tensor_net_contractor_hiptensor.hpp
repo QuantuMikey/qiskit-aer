@@ -18,9 +18,11 @@
 #include <chrono>
 #include <climits>
 #include <complex>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <set>
@@ -941,6 +943,14 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // tiling, forcing a wasteful re-plan and defeating the cache.
   bool prev_engaged_;
 
+  // aer-0049: when true, AER_TN_PLAN_FILE is neither read nor written by this
+  // contractor. Set through set_plan_file_bypass() by the aer-0025 terminal
+  // re-plan so the last-ditch recovery searches fresh instead of replaying
+  // the pinned plan. The expval guard's retry decision is collective (the
+  // guarded value is post-Allreduce), so under MPI this flag is set on every
+  // rank together and the load/skip decision stays uniform.
+  bool plan_file_bypass_;
+
 public:
   TensorNetContractor_HipTensor();
   ~TensorNetContractor_HipTensor();
@@ -964,6 +974,7 @@ public:
   void allocate_sampling_buffers(uint_t size = AER_TENSOR_NET_MAX_SAMPLING) override;
   void deallocate_sampling_buffers(void) override;
   void set_target_gpus(reg_t &t) override { target_gpus_ = t; }
+  void set_plan_file_bypass(bool bypass) override { plan_file_bypass_ = bypass; }
 
 private:
   void build_network_description();
@@ -1006,6 +1017,13 @@ private:
   // build without AER_MPI would fail to compile -- the definition would name a
   // non-member and the calls an undeclared function.
   int agree_setup_status(int local_status, const std::string &local_msg);
+  // aer-0049. Both declared outside any AER_MPI guard: single-rank they
+  // degenerate to a plain local file read/write, and try_load_plan_file's
+  // broadcast is itself guarded internally. try_load_plan_file must only be
+  // called under rank-uniform conditions (it runs an MPI_Bcast when
+  // nprocs_ > 1); maybe_write_plan_file is rank-0-only and collective-free.
+  bool try_load_plan_file(bool engaged);
+  void maybe_write_plan_file(bool engaged);
   void contract_all();
   double sample_measure_on_primary(reg_t &samples, std::vector<double> &rnds,
                                    uint_t num_qubits);
@@ -1038,7 +1056,8 @@ TensorNetContractor_HipTensor<data_t>::TensorNetContractor_HipTensor()
     : num_devices_used_(1), add_sp_tensors_(true), num_base_tensors_(0),
       num_additional_tensors_(0), out_size_(0), plan_valid_(false),
       slice_begin_(0), slice_end_(0), nprocs_(1), myrank_(0),
-      pool_ready_(false), prev_valid_(false), prev_engaged_(false) {}
+      pool_ready_(false), prev_valid_(false), prev_engaged_(false),
+      plan_file_bypass_(false) {}
 
 template <typename data_t>
 TensorNetContractor_HipTensor<data_t>::~TensorNetContractor_HipTensor() {}
@@ -1578,16 +1597,33 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
 #endif
         (void)agree_setup_status(w2_status, w2_msg);
 
+        // aer-0049: replay a pinned plan from AER_TN_PLAN_FILE, if configured
+        // and present, INSTEAD of searching. Placed after the two agreement
+        // collectives above so every condition it is gated on is uniform
+        // across ranks: plan_from_cache is the collectively-agreed verdict,
+        // the env value is identical on every rank, and plan_file_bypass_ is
+        // set collectively (see the member). find_path is then skipped on
+        // every rank together, so MPIParallelPathOptimizer's collectives are
+        // skipped in lockstep. A replayed plan still faces the slice ceiling
+        // below and the tile ceiling in the prebuild, so a stale file that
+        // violates a ceiling refuses loudly rather than grinding.
+        bool plan_from_file = false;
+        if (!plan_from_cache)
+          plan_from_file = try_load_plan_file(engaged);
+
         std::chrono::steady_clock::time_point prof_path_t0;
         if (tn_profile())
           prof_path_t0 = std::chrono::steady_clock::now();
-        if (!plan_from_cache) {
+        if (!plan_from_cache && !plan_from_file) {
           plan_ = optimizer->find_path(network_desc_, memory_budget,
                                        tn_path_seed(), engaged);
-          if (!plan_key.empty())
-            plan_cache_instance().put(plan_key, network_desc_, plan_,
-                                      tn_plan_cache_max());
         }
+        // The put also covers the file-replayed plan: later setups in this
+        // process then hit the cache with the identical pinned plan, keeping
+        // every contraction of the run on one denominator.
+        if (!plan_from_cache && !plan_key.empty())
+          plan_cache_instance().put(plan_key, network_desc_, plan_,
+                                    tn_plan_cache_max());
         // += so an AUTO re-plan (pass 2) adds to pass 1's search cost rather
         // than hiding it. A cache hit contributes ~0 here, which is the whole
         // point: t_path_ms collapsing is how a hit is visible in the profile.
@@ -1797,6 +1833,15 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
       pool_ready_ = false;
     }
   }
+
+  // aer-0049: capture point. Reached only after the whole setup succeeded —
+  // path search, slice ceiling (3a), specs, prebuild and the tile ceiling
+  // inside build_tiles_for_step, pool allocation — so a written plan is by
+  // construction one that clears BOTH ceilings and sets up on this device.
+  // A run that trips a ceiling throws before reaching here and leaves no
+  // file, so re-running capture retries with a fresh (scattered) search
+  // until an in-window plan lands. Rank-0-only and collective-free.
+  maybe_write_plan_file(engaged);
 
   if (tn_verbose() && myrank_ == 0)
     fprintf(stderr, "[AER_TN] setup: %zu steps, %lu slices, %.2e FLOPs, %d GPUs\n",
@@ -2633,6 +2678,161 @@ bool TensorNetContractor_HipTensor<data_t>::agree_plan_cache_hit(
   return true;
 }
 #endif
+
+// aer-0049: replay leg. Reads AER_TN_PLAN_FILE and, if it decodes and keys
+// onto the current network, installs it as plan_. Returns false (fresh search)
+// on any of: knob unset, bypass set, file absent, wrong key, malformed file,
+// unresolvable sliced coordinates. Every refusal except "knob unset / file
+// absent" prints its reason unconditionally — replaying a plan is a
+// deliberate, high-stakes act and a silent fall-through to a scattered search
+// would make the pinned run's numbers wrong without a trace.
+//
+// MPI: rank 0 reads the bytes and broadcasts them; every rank then parses the
+// SAME bytes against its own network (identical on every rank by
+// construction), so the verdict is deterministic and uniform with no further
+// agreement collective. Callers must invoke this only under rank-uniform
+// conditions — see the call site in setup_contraction.
+template <typename data_t>
+bool TensorNetContractor_HipTensor<data_t>::try_load_plan_file(bool engaged) {
+  const std::string path = tn_plan_file();
+  if (path.empty() || plan_file_bypass_)
+    return false;
+
+  std::string text;
+  bool have_text = false;
+#ifdef AER_MPI
+  if (nprocs_ > 1) {
+    int64_t len = -1;
+    if (myrank_ == 0) {
+      std::ifstream f(path.c_str());
+      if (f) {
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        text = ss.str();
+        len = static_cast<int64_t>(text.size());
+      }
+    }
+    MPI_Bcast(&len, 1, MPI_INT64_T, 0, MPI_COMM_WORLD);
+    if (len < 0)
+      return false;
+    text.resize(static_cast<size_t>(len));
+    if (len > 0)
+      MPI_Bcast(&text[0], static_cast<int>(len), MPI_CHAR, 0, MPI_COMM_WORLD);
+    have_text = true;
+  }
+#endif
+  if (!have_text) {
+    std::ifstream f(path.c_str());
+    if (!f)
+      return false;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    text = ss.str();
+  }
+
+  const size_t elem_bytes = 2 * sizeof(data_t);
+  const std::string key =
+      plan_file_network_key(network_desc_, engaged, elem_bytes);
+  if (key.empty()) {
+    if (myrank_ == 0)
+      fprintf(stderr,
+              "[AER_TN_PLAN_FILE] this network is not keyable; ignoring %s and "
+              "searching fresh\n",
+              path.c_str());
+    return false;
+  }
+  std::string why;
+  ContractionPlan replayed;
+  if (!plan_file_decode(text, network_desc_, key, replayed, why)) {
+    if (myrank_ == 0)
+      fprintf(stderr,
+              "[AER_TN_PLAN_FILE] %s does not replay onto this network: %s; "
+              "searching fresh instead\n",
+              path.c_str(), why.c_str());
+    return false;
+  }
+  plan_ = replayed;
+  if (myrank_ == 0)
+    fprintf(stderr,
+            "[AER_TN_PLAN_FILE] replayed plan from %s (steps=%zu slices=%llu "
+            "flops=%.3e)\n",
+            path.c_str(), plan_.steps.size(),
+            (unsigned long long)plan_.num_slices, plan_.total_flops);
+  return true;
+}
+
+// aer-0049: capture leg. Rank-0-only, collective-free, capture-once (an
+// existing file is never overwritten — delete the file to re-capture). Called
+// exclusively from the end of a fully successful setup_contraction, so the
+// written plan has already cleared the slice ceiling, the tile ceiling and
+// the prebuild on this device. Written via a temp file + rename so a job
+// killed mid-write cannot leave a truncated file that a later replay would
+// half-parse (rename within one directory is atomic on Lustre).
+template <typename data_t>
+void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
+    bool engaged) {
+  const std::string path = tn_plan_file();
+  if (path.empty() || plan_file_bypass_ || myrank_ != 0)
+    return;
+  {
+    std::ifstream probe(path.c_str());
+    if (probe)
+      return;
+  }
+  const size_t elem_bytes = 2 * sizeof(data_t);
+  const std::string key =
+      plan_file_network_key(network_desc_, engaged, elem_bytes);
+  if (key.empty()) {
+    fprintf(stderr,
+            "[AER_TN_PLAN_FILE] this network is not keyable; plan not "
+            "captured to %s\n",
+            path.c_str());
+    return;
+  }
+  std::string text;
+  if (!plan_file_encode(network_desc_, key, plan_, text)) {
+    fprintf(stderr,
+            "[AER_TN_PLAN_FILE] a sliced mode of this plan is not present in "
+            "the network (cannot store structural coordinates); plan not "
+            "captured to %s\n",
+            path.c_str());
+    return;
+  }
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream f(tmp.c_str(), std::ios::trunc);
+    if (!f) {
+      fprintf(stderr,
+              "[AER_TN_PLAN_FILE] cannot open %s for writing (missing "
+              "directory?); plan not captured\n",
+              tmp.c_str());
+      return;
+    }
+    f << text;
+    f.flush();
+    if (!f) {
+      fprintf(stderr,
+              "[AER_TN_PLAN_FILE] write to %s failed; plan not captured\n",
+              tmp.c_str());
+      f.close();
+      std::remove(tmp.c_str());
+      return;
+    }
+  }
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    fprintf(stderr,
+            "[AER_TN_PLAN_FILE] rename %s -> %s failed; plan not captured\n",
+            tmp.c_str(), path.c_str());
+    std::remove(tmp.c_str());
+    return;
+  }
+  fprintf(stderr,
+          "[AER_TN_PLAN_FILE] captured plan to %s (steps=%zu slices=%llu "
+          "tiles_prebuilt=%llu flops=%.3e)\n",
+          path.c_str(), plan_.steps.size(),
+          (unsigned long long)plan_.num_slices,
+          (unsigned long long)tiles_built_, plan_.total_flops);
+}
 
 // aer-0037: agree the outcome of a setup phase across ranks.
 //
