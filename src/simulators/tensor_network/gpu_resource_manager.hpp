@@ -1035,8 +1035,10 @@ inline int hipblas_narrow(int64_t v, const char *what, size_t step) {
   if (v <= 0 || v > static_cast<int64_t>(2147483647)) {
     std::stringstream err;
     err << "[AER_TN] GEMM route: " << what << " = " << v << " at step " << step
-        << " does not fit the int the hipblas*gemm interface takes. Unset "
-           "AER_TN_GEMM to run this circuit on the hiptensorContraction path.";
+        << " does not fit the int the hipblas*gemm interface takes. There "
+           "is no fallback engine (aer-0057); tighten the per-slice budget "
+           "(SS_SLICE_BYTES / AER_TN_SLICE_TARGET_BYTES) so the slicer cuts "
+           "this step smaller, or reduce circuit width/depth.";
     throw std::runtime_error(err.str());
   }
   return static_cast<int>(v);

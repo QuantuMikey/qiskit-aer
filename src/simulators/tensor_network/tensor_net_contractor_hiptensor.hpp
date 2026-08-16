@@ -12,6 +12,16 @@
 #ifndef _tensor_net_contractor_hiptensor_hpp_
 #define _tensor_net_contractor_hiptensor_hpp_
 
+// aer-0059: since aer-0057 removed the hipTensor dispatch, hipBLAS is not an
+// accelerator for this backend -- it IS the backend. A configure that finds
+// hipTensor but not hipBLAS would previously fall back to
+// hiptensorContraction; now it would compile cleanly and then refuse every
+// contraction step at runtime. Make the misconfiguration fail at build time,
+// where it is one CMake line to fix, not in a batch job.
+#if defined(AER_HIPTENSOR) && !defined(AER_HIPBLAS)
+#error "qiskit-aer tensor-network (ROCm): AER_HIPBLAS is required since the hipTensor dispatch was removed (aer-0057). hipBLAS was not found or not enabled -- fix the hipBLAS discovery in CMake; there is no fallback engine."
+#endif
+
 #ifdef AER_THRUST_ROCM
 
 #include <atomic>
