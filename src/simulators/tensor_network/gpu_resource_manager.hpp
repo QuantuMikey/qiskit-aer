@@ -304,16 +304,11 @@ build_signature(const std::vector<int32_t> &modes_a,
 // with -DAER_HIPBLAS behaves byte-identically to one without it until the knob
 // is set. Read here rather than in the contractor because GPUDevice::init()
 // needs it to decide whether to create the hipBLAS handle at all.
-static bool tn_gemm_route() {
-  static bool checked = false;
-  static bool cached = false;
-  if (!checked) {
-    const char *v = std::getenv("AER_TN_GEMM");
-    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
-    checked = true;
-  }
-  return cached;
-}
+// aer-0057: the GEMM route IS the contraction path -- clauses 1 and 2 of the
+// replacement are certified (CHECKPOINT_21018032) and the hipTensor dispatch
+// is retired. The readers are kept as constants so call sites need no churn;
+// aer-0058 deletes them together with the remaining hipTensor machinery.
+static bool tn_gemm_route() { return true; }
 
 // aer-0052: AER_TN_GEMM_PERMUTE=1 rescues steps the GEMM route declines for
 // `layout` (free and contracted modes interleaved) or `korder` (contracted
@@ -347,34 +342,8 @@ static bool tn_gemm_complex() {
   return cached;
 }
 
-static bool tn_gemm_permute() {
-  static bool checked = false;
-  static bool cached = false;
-  if (!checked) {
-    const char *v = std::getenv("AER_TN_GEMM_PERMUTE");
-    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
-    checked = true;
-  }
-  return cached;
-}
+static bool tn_gemm_permute() { return true; }
 
-// aer-0040: AER_TN_GEMM_VERIFY=1 runs BOTH paths on every routed step and
-// compares the results bit for bit, reporting the first disagreement with the
-// step index and shape. Expensive by construction -- it doubles the work and
-// adds a device-to-host copy per step -- and off by default. It exists because
-// the failure mode a GEMM route introduces is a wrong lda or a wrong transpose
-// flag, which is exactly as silent as the hipTensor defect the rank guard was
-// written for, and no guard catches it.
-static bool tn_gemm_verify() {
-  static bool checked = false;
-  static bool cached = false;
-  if (!checked) {
-    const char *v = std::getenv("AER_TN_GEMM_VERIFY");
-    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
-    checked = true;
-  }
-  return cached;
-}
 
 // aer-0048: AER_TN_GEMM_ATOMICS=1 restores rocBLAS's DEFAULT atomic reductions
 // on the GEMM handle. Default OFF keeps HIPBLAS_ATOMICS_NOT_ALLOWED, which is

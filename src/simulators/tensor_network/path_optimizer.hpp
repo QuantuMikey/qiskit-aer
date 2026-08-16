@@ -1060,7 +1060,18 @@ static uint64_t tn_plan_file_max_tiles() {
 inline std::string plan_file_network_key(const NetworkDescription &net,
                                          bool engaged,
                                          size_t element_size_bytes) {
-  return canonical_network_key(net, engaged, /*target_elements=*/0,
+  // aer-0057: the tiling-engagement bit is PINNED TRUE in the file key,
+  // regardless of the caller's `engaged`. Rationale: every plan file
+  // captured before the hipTensor removal was written under the AUTO
+  // tiling latch (engaged=true), and the removal makes engagement
+  // permanently false at runtime -- without this pin, every banked plan
+  // (grid6x5p2.plan, census_amp_5x5p2.plan, p4_maxcone.plan and any user's)
+  // would key-mismatch and silently fall back to a fresh search, destroying
+  // reproducibility. Tiling no longer affects execution in any way, so the
+  // bit carries no information; pinning it preserves byte-compatibility
+  // with every existing capture. New captures write the same pinned bit.
+  (void)engaged;
+  return canonical_network_key(net, /*engaged=*/true, /*target_elements=*/0,
                                /*seed=*/0, element_size_bytes);
 }
 
