@@ -3531,6 +3531,17 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
           "removed the tiling decision");
     }
 
+    // aer-0058: restore the routing flag that the aer-0057 excision of the
+    // tiled branch and plan-lookup block took with it (build 21195415:
+    // "use of undeclared identifier 'will_route'"). With the classifier
+    // throwing a named refusal for any unroutable step, gemm_ok is true for
+    // every step that reaches execution -- this flag now only feeds the
+    // internal-consistency guard below.
+    bool will_route = false;
+#ifdef AER_HIPBLAS
+    will_route = ps.gemm_ok;
+#endif
+
     {
       size_t c_bytes = tensor_slot_bytes(
           all_specs_[result_idx].num_elements(), sizeof(data_t));
