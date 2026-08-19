@@ -333,8 +333,18 @@ static int path_parallel_setting() {
 }
 
 static uint64_t slice_target_bytes() {
+  // aer-0062: default raised 2 MiB -> 8 GiB. The 2 MiB constant bound at
+  // 2^17 elements, ~32,000x below a GCD's memory, so a drop-in
+  // memory-bound run over-sliced into the slice-count ceiling and the
+  // first user experience was a refusal. 8 GiB is the smallest fence
+  // admitting the largest measured-safe executed peak: intermediates land
+  // on power-of-two peaks, the budget sweep (job 21310992) bracketed the
+  // boundary at 8 GiB peak ok (pool 17.2 GB) / 16 GiB peak OOM, and every
+  // fence in [8,16) admits exactly the same 8 GiB maximum peak -- so 8
+  // buys the full throughput of any larger sub-16 fence with a full
+  // power-of-two of headroom. min(budget, device memory) still applies.
   static bool checked = false;
-  static uint64_t cached = 2097152;
+  static uint64_t cached = 8589934592ULL;
   if (!checked) {
     const char *val = std::getenv("AER_TN_SLICE_TARGET_BYTES");
     if (val != nullptr) {
@@ -569,8 +579,15 @@ static double path_max_time() {
 // distribution is for -- a contraction too large for one device -- and for
 // measuring where the crossover lies.
 static uint64_t min_slices_per_rank() {
+  // aer-0062: default raised 0 -> 1, paired with the slice-target raise
+  // above. A big fence lets moderately hard circuits draw 4-16-slice
+  // plans; a drop-in MPI user could then land in slices < ranks, the
+  // filed idle-rank segfault's home. A floor of 1 guarantees every rank
+  // work, is vacuous at one rank, and by construction only ever ADDS
+  // slicing (applied after the peak constraint). Explicit
+  // AER_TN_MIN_SLICES_PER_RANK=0 restores the old behavior.
   static bool checked = false;
-  static uint64_t cached = 0;
+  static uint64_t cached = 1;
   if (!checked) {
     const char *val = std::getenv("AER_TN_MIN_SLICES_PER_RANK");
     if (val != nullptr) {
