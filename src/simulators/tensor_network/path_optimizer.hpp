@@ -507,6 +507,42 @@ static std::string path_minimize() {
 // for fast iteration; raise toward 128/60 for a hard high-treewidth network
 // where plan quality dominates. Read once and cached, so a process uses one
 // consistent budget.
+// aer-0065: MPI-cooperative path search. When ON (default) and nprocs > 1,
+// MPIParallelPathOptimizer divides the AER_TN_PATH_MAX_REPEATS trial budget
+// across ranks -- rank r runs ~budget/R trials on its own seed stream
+// (seed + r, the offset that already exists) and the MINLOC(total_flops)
+// collective picks the winner, so the SAME total trial count finishes in
+// ~1/R the wall. Measured stake (job 21381487, rand3 n=10000 p=4): 81
+// classes x ~15-38 s of search, every rank redundantly searching the full
+// budget -- 99.6% of a 40-minute stage, against 10 s of contraction.
+//
+// SEMANTICS CHANGE, stated plainly: under MPI, AER_TN_PATH_MAX_REPEATS now
+// means the TOTAL trial budget across ranks, where the legacy ensemble ran
+// budget x R total (full budget per rank, more diversity, no wall saving).
+// The legacy behaviour is exactly recovered two ways: AER_TN_PATH_MPI_SHARD=0,
+// or shard ON with MAX_REPEATS raised R-fold (identical diversity, same wall
+// as one legacy rank). AER_TN_PATH_MAX_TIME stays a PER-RANK cap -- it is a
+// ceiling, not a target; a time-bound search that used to hit the cap now
+// finishes its smaller shard early, which is the point.
+//
+// Determinism: the drawn plan is a deterministic function of (seed, R,
+// budget) -- reproducible at fixed rank count, DIFFERENT across rank counts
+// (as the legacy ensemble's MINLOC winner already was). Cross-width
+// reproducibility is plan capture's job (AER_TN_PLAN_FILE / AER_TN_PLAN_DIR),
+// unchanged: the captured plan is the MINLOC winner, so first contact pays
+// one sharded search and every later run at ANY width replays it.
+static int tn_path_mpi_shard() {
+  static bool checked = false;
+  static int cached = 1;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_PATH_MPI_SHARD");
+    if (v != nullptr && v[0] != '\0')
+      cached = (std::strcmp(v, "0") == 0) ? 0 : 1;
+    checked = true;
+  }
+  return cached;
+}
+
 static int path_max_repeats() {
   static bool checked = false;
   static int cached = 64;
@@ -1268,6 +1304,14 @@ inline bool plan_file_decode(const std::string &text,
 class PathOptimizer {
 public:
   virtual ~PathOptimizer() = default;
+  // aer-0065: trial-share hook. (shard, num_shards) divides the repeats
+  // budget; the default is the whole budget. A no-op base so optimizers that
+  // have no trial budget (or tests) need not care; MPIParallelPathOptimizer
+  // is the only caller. Idempotent -- set before every find_path delegation.
+  virtual void set_trial_share(int shard, int num_shards) {
+    (void)shard;
+    (void)num_shards;
+  }
   // tiling_available: when false, the planner's >12-free-mode gate throws
   // NeedsTilingException (AUTO) or a hard refusal (OFF, decided by the caller);
   // when true, oversized outputs are admitted because the contractor will tile
@@ -1299,6 +1343,9 @@ class CotengPathOptimizer : public PathOptimizer {
   double max_time_;
   std::string preset_;
   size_t element_size_bytes_;
+  // aer-0065: this instance's slice of the trial budget (set_trial_share).
+  int trial_shard_ = 0;
+  int trial_shards_ = 1;
   // aer-0035: distribution floor on the slice count, supplied by the
   // contractor because only it knows nprocs_. 1 means no floor.
   uint64_t min_slices_ = 1;
@@ -1344,6 +1391,22 @@ public:
         max_time_(max_time > 0.0 ? max_time : path_max_time()),
         preset_(preset), element_size_bytes_(element_size_bytes),
         min_slices_(min_slices > 0 ? min_slices : 1) {}
+
+  // aer-0065: ceil-split so every shard gets >= 1 trial and the shares sum
+  // exactly to max_repeats_ (the first budget%shards shards carry one extra).
+  void set_trial_share(int shard, int num_shards) override {
+    trial_shard_ = (shard >= 0) ? shard : 0;
+    trial_shards_ = (num_shards >= 1) ? num_shards : 1;
+  }
+
+  int effective_max_repeats() const {
+    if (trial_shards_ <= 1)
+      return max_repeats_;
+    int base = max_repeats_ / trial_shards_;
+    int extra = (trial_shard_ < (max_repeats_ % trial_shards_)) ? 1 : 0;
+    int n = base + extra;
+    return n >= 1 ? n : 1;
+  }
 
   ContractionPlan find_path(const NetworkDescription &network,
                             uint64_t memory_limit_bytes,
@@ -1496,7 +1559,7 @@ public:
     if (preset_ == "random-greedy") {
       // RandomGreedyOptimizer takes seed as a direct named kwarg — no routing.
       auto opt = ctg.attr("RandomGreedyOptimizer")(
-          py::arg("max_repeats") = max_repeats_,
+          py::arg("max_repeats") = effective_max_repeats(),
           py::arg("max_time") = max_time_,
           py::arg("seed") = seed,
           py::arg("progbar") = false);
@@ -1552,7 +1615,7 @@ public:
       // of extra kwargs merged in via py::kwargs.
       py::dict kwargs;
       kwargs["minimize"] = path_minimize();
-      kwargs["max_repeats"] = max_repeats_;
+      kwargs["max_repeats"] = effective_max_repeats();
       kwargs["max_time"] = max_time_;
       kwargs["optlib"] = optlib;
       kwargs["slicing_opts"] = slicing_opts;
@@ -2036,6 +2099,26 @@ public:
     int rank, size;
     MPI_Comm_rank(comm_, &rank);
     MPI_Comm_size(comm_, &size);
+
+    // aer-0065: cooperative search. Divide the trial budget across ranks and
+    // let the MINLOC below pick the winner -- same total trials, wall / R.
+    // The set is idempotent and explicit in BOTH branches so a process that
+    // flips nothing still states its intent every call, and the knob's OFF
+    // value exactly restores the legacy full-budget-per-rank ensemble.
+    if (tn_path_mpi_shard() && size > 1) {
+      inner_->set_trial_share(rank, size);
+      if (path_verbose() && rank == 0)
+        fprintf(stderr,
+                "[AER_TN_PATH] MPI cooperative search: %d total trials "
+                "sharded across %d ranks (~%d each), per-rank seeds %lu..%lu; "
+                "AER_TN_PATH_MPI_SHARD=0 restores the legacy full-budget "
+                "ensemble\n",
+                path_max_repeats(), size,
+                (path_max_repeats() + size - 1) / size, (unsigned long)seed,
+                (unsigned long)(seed + size - 1));
+    } else {
+      inner_->set_trial_share(0, 1);
+    }
 
     // Per-rank cotengra search uses a rank-dependent seed, so one rank can hit
     // the planner's free-mode gate while others succeed. NeedsTilingException
