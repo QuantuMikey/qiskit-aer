@@ -46,7 +46,6 @@
 #include <vector>
 
 #include <hip/hip_runtime.h>
-#include <hiptensor/hiptensor.hpp>
 
 #include "misc/wrap_thrust.hpp"
 #include "simulators/statevector/chunk/thrust_kernels.hpp"
@@ -155,36 +154,6 @@ static bool tn_mnk_padding_enabled() {
   return enabled;
 }
 
-// hipTensor 1.5.0 ships kernel instances only at NumDimM=NumDimN=NumDimK=6
-// (see contraction_solution_instances.cpp in the upstream library). When a
-// per-step contraction descriptor exceeds those bounds — M>6, N>6, or K>6 —
-// hipTensor's brute-force dispatcher (HIPTENSOR_ALGO_DEFAULT) silently
-// invokes an m6n6k6 kernel against the oversized input. The kernel
-// classifies any excess M-axes as K-axes (see contraction_solution_impl.hpp
-// where Base::mM and Base::mK are computed from the first MaxNumDimsM=6
-// entries vs the rest). The output is silently wrong: extra M-axes are
-// summed over instead of preserved as free output dimensions.
-//
-// This guard refuses to dispatch any step that would hit the m6n6k6
-// ceiling. It throws with a clear error message before any kernel runs.
-// Without it, users get silent wrong results. Documented as OI11 in the
-// design doc.
-//
-// Kill switch: AER_TN_DISABLE_RANK_GUARD=1 disables the check (for
-// bisection or to confirm the silent-wrong-result mode for upstream bug
-// reports). Default is enabled — a fast, loud failure beats a slow,
-// silent one.
-static bool tn_rank_guard_enabled() {
-  static bool checked = false;
-  static bool enabled = true;
-  if (!checked) {
-    const char *val = std::getenv("AER_TN_DISABLE_RANK_GUARD");
-    enabled = !(val != nullptr && std::string(val) == "1");
-    checked = true;
-  }
-  return enabled;
-}
-
 // Cotengra path-search seed, overridable for A/B steering and regression
 // probing. NOTE: the loky search pool's trial completion order is
 // nondeterministic, so a fixed seed does NOT make a parallel search
@@ -243,66 +212,6 @@ static uint64_t tn_max_slices() {
   }
   return cached;
 }
-
-// aer-0033: ceiling on the number of m6n6k6 sub-contractions ONE setup may
-// MATERIALISE. build_tiles_for_step stores a full PlanSpec::Tile per sub-block,
-// and each Tile carries its own copies of nine descriptor vectors plus three
-// parent-stride vectors. Measured with the struct replicated field for field:
-// 908 bytes at block rank 7 and 1328 bytes at rank 12, against 26 bytes of
-// actually-varying payload (off_a/off_b/off_c and two flags). So the list costs
-// roughly a kilobyte of HOST memory per sub-contraction.
-//
-// The count is 2^(excess M + excess N + excess K), where excess is the number of
-// extent>1 modes beyond six on an axis. That formula reproduces all 26 tiling
-// lines of job 20516615 exactly. It grows fast: a step whose per-slice peak
-// reached 2^30 elements would want about 1.3e8 sub-blocks and roughly 178 GB of
-// host memory for that step alone, against about 64 GB per rank on a LUMI-G node
-// shared eight ways.
-//
-// Without this ceiling the failure is std::vector::reserve throwing bad_alloc,
-// or the OOM killer under Linux overcommit once the loop touches pages. Neither
-// is contained: setup_pool_and_cache is not covered by agree_or_fail_together
-// (which wraps only contract_all and accumulate_across_gpus), and there is no
-// try/catch anywhere in tensor_net.hpp or tensor_net_state.hpp, so one rank
-// unwinding while its siblings enter the next collective is a HANG, not an
-// abort. Refusing here converts that into a clean error that names the step.
-//
-// The default of 2^22 sub-blocks is about 5 GB of host memory at the measured
-// per-Tile cost. Workloads on record use at most 8 sub-blocks in a single step
-// and a few dozen across a whole setup (job 20516615: 26 tiled steps over five
-// arms, largest 8), so this cannot fire on anything currently working.
-// AER_TN_MAX_TILES=0 disables the ceiling.
-static uint64_t tn_max_tiles() {
-  static bool checked = false;
-  static uint64_t cached = 4194304; // 2^22
-  if (!checked) {
-    const char *val = std::getenv("AER_TN_MAX_TILES");
-    if (val != nullptr) {
-      char *end = nullptr;
-      long long parsed = std::strtoll(val, &end, 10);
-      if (end != val && parsed >= 0) {
-        cached = static_cast<uint64_t>(parsed);
-      } else {
-        fprintf(stderr,
-                "[AER_TN] warning: AER_TN_MAX_TILES='%s' is not a non-negative "
-                "integer; using default %llu.\n",
-                val, (unsigned long long)cached);
-      }
-    }
-    checked = true;
-  }
-  return cached;
-}
-
-// WS-3 mode tiling decomposes an oversized per-step contraction (M>6, N>6, or
-// K>6) into a loop of kernel-sized (<=6 each) sub-contractions, so the step
-// produces correct results instead of the rank guard throwing. Whether tiling
-// is engaged for a given setup_pool_and_cache pass is decided by the driver
-// (setup_contraction) and threaded in as the tiling_available parameter, not
-// read from the environment at the gate. The enable policy itself lives in
-// tn_tiling_mode() (path_optimizer.hpp): OFF refuses, ON always tiles, and AUTO
-// (default) lets the driver detect the first oversized step and re-plan once
-// with tiling engaged.
 
 //=============================================================================
 // Diagnostic helpers
@@ -460,52 +369,6 @@ inline bool gemm_operand_layout(const std::vector<int32_t> &modes,
   }
   transposed = first_is_contracted;
   return runs <= 2;
-}
-
-//=============================================================================
-// Helper: remap mode IDs to a safe range for hipTensor.
-//
-// hipTensor 1.5.0 on gfx90a silently produces zero output when contraction
-// descriptors contain mode IDs in a large-negative range (observed with
-// cotengra-hashed IDs around -1.3e9). Small positive IDs always work. This
-// helper builds a deterministic remap for the combined A/B/C mode sets so
-// hipTensor sees only small positive integers. The mapping is derived from
-// the input order and is stable across calls that pass the same mode ID
-// sequence, so two identical calls produce identical remapped IDs (and
-// therefore identical plan cache signatures).
-//
-// Does not modify the inputs. Returns fresh remapped arrays in modes_a_out,
-// modes_b_out, modes_c_out. Extents are not remapped (they're unaffected).
-//
-// This is a workaround for a hipTensor/CK bug on AMD gfx90a. cuTensorNet on
-// NVIDIA does not exhibit the sensitivity.
-//=============================================================================
-
-inline void
-remap_modes_to_safe_range(const std::vector<int32_t> &modes_a,
-                          const std::vector<int32_t> &modes_b,
-                          const std::vector<int32_t> &modes_c,
-                          std::vector<int32_t> &modes_a_out,
-                          std::vector<int32_t> &modes_b_out,
-                          std::vector<int32_t> &modes_c_out) {
-  std::unordered_map<int32_t, int32_t> remap;
-  auto apply = [&](const std::vector<int32_t> &in, std::vector<int32_t> &out) {
-    out.clear();
-    out.reserve(in.size());
-    for (int32_t m : in) {
-      auto it = remap.find(m);
-      if (it == remap.end()) {
-        int32_t new_id = static_cast<int32_t>(remap.size()) + 1;
-        remap.emplace(m, new_id);
-        out.push_back(new_id);
-      } else {
-        out.push_back(it->second);
-      }
-    }
-  };
-  apply(modes_a, modes_a_out);
-  apply(modes_b, modes_b_out);
-  apply(modes_c, modes_c_out);
 }
 
 //=============================================================================
@@ -753,31 +616,6 @@ static void deinterleave_scatter(hipStream_t stream, const data_t *src,
   thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
 }
 
-// If an operand's tile descriptor max free-mode stride reaches the CK-safe
-// ceiling, mark it for staging: stash the parent strides and REWRITE strides in
-// place to packed column-major, so every downstream consumer (plan-cache warm,
-// signature, get_or_create) builds a contiguous plan hipTensor can create.
-static void stage_operand_if_needed(std::vector<int64_t> &strides,
-                                    const std::vector<int64_t> &extents,
-                                    uint64_t ceiling, bool &stage,
-                                    std::vector<int64_t> &parent_strides) {
-  int64_t max_stride = 0;
-  for (size_t k = 0; k < strides.size() && k < extents.size(); ++k)
-    if (extents[k] > 1)
-      max_stride = std::max<int64_t>(max_stride, strides[k]);
-  if (static_cast<uint64_t>(max_stride) < ceiling) {
-    stage = false;
-    return;
-  }
-  stage = true;
-  parent_strides = strides;
-  int64_t st = 1;
-  for (size_t k = 0; k < strides.size(); ++k) {
-    strides[k] = st;
-    st *= (extents[k] > 0 ? extents[k] : 1);
-  }
-}
-
 // Pack a strided parent operand (both split-complex planes) into packed
 // scratch, on the given stream. src planes are already base-shifted to the tile
 // origin; parent_strides index the parent's packed layout.
@@ -1023,25 +861,9 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
     // m6n6k6-grammar-compliant. K-block tiles set accumulate=true so their
     // partial products sum into the same C sub-region; M/N-block tiles write
     // disjoint C sub-regions (accumulate=false).
-    struct Tile {
-      std::vector<int32_t> modes_a, modes_b, modes_c;
-      std::vector<int64_t> extents_a, extents_b, extents_c;
-      std::vector<int64_t> strides_a, strides_b, strides_c;
-      // Element offsets (column-major, mode-0-fastest) into the FULL parent
-      // A/B/C tensors for this sub-block's origin. Applied as a base-pointer
-      // shift to both split-complex planes, mirroring project_slice().
-      int64_t off_a = 0, off_b = 0, off_c = 0;
-      bool accumulate = false;   // true for K-block partials (beta=1)
-      bool zero_c_first = false; // true on the first writer of each C region
-      // WS-3 operand staging (see strided_pack_func_hip). When stage_X is true,
-      // strides_X above hold PACKED column-major strides (the plan CK builds is
-      // contiguous), and parent_strides_X holds the original strided-parent
-      // strides used to pack the operand into scratch (inputs A/B) or scatter
-      // the packed result back into the parent (output C).
-      bool stage_a = false, stage_b = false, stage_c = false;
-      std::vector<int64_t> parent_strides_a, parent_strides_b, parent_strides_c;
-    };
     std::vector<Tile> tiles;
+    // aer-0060: the Tile machinery is deleted; every step runs whole on the
+    // GEMM route.
   };
   std::vector<PlanSpec> step_plan_specs_;
 
@@ -1123,17 +945,6 @@ private:
   bool topology_matches_previous() const;
   void cache_topology();
   void contract_single_slice(uint_t slice_index, int device_idx);
-  // WS-3: decompose one oversized contraction step (M>6, N>6, or K>6) into a
-  // grid of m6n6k6-compliant sub-block Tiles. Returns the tile list; throws if
-  // a block still cannot be made grammar-compliant. The caller stores the
-  // result in step_plan_specs_[step].tiles.
-  std::vector<typename TensorNetContractor_HipTensor<data_t>::PlanSpec::Tile>
-  build_tiles_for_step(
-      const std::vector<int32_t> &modes_a, const std::vector<int64_t> &extents_a,
-      const std::vector<int64_t> &strides_a,
-      const std::vector<int32_t> &modes_b, const std::vector<int64_t> &extents_b,
-      const std::vector<int64_t> &strides_b,
-      const std::vector<int32_t> &modes_c, const std::vector<int64_t> &extents_c);
   void project_slice(uint_t slice_index, int device_idx,
                      std::vector<PlanePtrs> &projected);
   void accumulate_across_gpus();
@@ -1450,13 +1261,9 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank_);
 #endif
 
-  // aer-0037 WINDOW 0: everything before the retry loop. tn_hiptensor_algo()
-  // THROWS on an unrecognised AER_TN_HIPTENSOR_ALGO, the shared-cache trim and
-  // the network_desc_ assignments allocate, and none of it was reachable by any
-  // agreement -- a throw here left the siblings blocked at window 1's collective
-  // below. tn_hiptensor_algo() moved BELOW MPI_Comm_size so nprocs_ is known
-  // before anything can throw; it reads only the environment and the flag, so
-  // the move is behaviour-neutral.
+  // aer-0037 WINDOW 0: everything before the retry loop. The network_desc_
+  // assignments allocate, and none of it was reachable by any agreement -- a
+  // throw here left the siblings blocked at window 1's collective below.
   //
   // The two network_desc_ assignments moved ABOVE the profiling reset so they
   // sit inside this guard. They are two vector copies of a handful of ints; the
@@ -1466,41 +1273,12 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     int w0_status = 0;
     std::string w0_msg;
     try {
-      // aer-0031: the flag used to be discarded here while the cuTensorNet path
-      // honoured it. Latch the hipTensor selector from it on first use, so
-      // config.use_cuTensorNet_autotuning=True reaches this backend instead of
-      // dead-ending. AER_TN_HIPTENSOR_ALGO overrides. See tn_hiptensor_algo()
-      // for why the choice is process-wide rather than per-call.
-      (void)tn_hiptensor_algo(use_autotune);
+      // aer-0060: the hipTensor algorithm selector is deleted with its
+      // engine; the autotune flag has nothing to latch. Accepted and ignored
+      // so the shared driver interface is unchanged.
+      (void)use_autotune;
       network_desc_.output_modes = modes_out_;
       network_desc_.output_extents = extents_out_;
-
-      // aer-0028: the ONLY safe point to evict from the shared hipTensor plan
-      // cache. hipTensor retains pointers into each CachedPlan's own storage,
-      // and contract_single_slice holds `const CachedPlan &` across its
-      // per-tile loop, so erasing an entry any later is a use-after-free whose
-      // symptom is silent zero-output rather than a fault. Here nothing holds a
-      // reference yet: the prebuild loop has not run and contraction is two
-      // phases away.
-      //
-      // Still ABOVE the profiling reset: trim and the stats read are
-      // bookkeeping, and charging them to t_setup_ms would contaminate the
-      // exact number used to measure aer-0028. myrank_ is set by the MPI block
-      // above.
-      if (tn_shared_plan_cache() && gpu_mgr_.num_devices() > 0) {
-        gpu_mgr_.primary().plan_cache().trim(tn_shared_plan_cache_max());
-        if (tn_verbose() && myrank_ == 0) {
-          uint64_t ph = 0, pm = 0;
-          size_t pn = 0;
-          gpu_mgr_.primary().plan_cache().stats(ph, pm, pn);
-          fprintf(stderr, "[AER_TN] hipTensor algorithm selector: %s\n",
-                  tn_hiptensor_algo_name());
-          fprintf(stderr,
-                  "[AER_TN_HTPLAN] shared hipTensor plan cache: hits=%llu "
-                  "misses=%llu entries=%zu\n",
-                  (unsigned long long)ph, (unsigned long long)pm, pn);
-        }
-      }
     } catch (const std::exception &e) {
       w0_status = 2;
       w0_msg = e.what();
@@ -1596,9 +1374,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
       } else {
         // aer-0037 WINDOW 1. Everything from here to the budget Allreduce is
         // local and hardware-dependent: refresh_free_memory() throws through
-        // check_hip(hipMemGetInfo), and query_workspace_for_size() builds
-        // hipTensor descriptors and can throw too. Both depend on THIS rank's
-        // device, so they are not uniform across ranks. A throw here escapes
+        // check_hip(hipMemGetInfo), which depends on THIS rank's device, so
+        // it is not uniform across ranks. A throw here escapes
         // setup_contraction -- there is no try/catch anywhere in
         // tensor_net.hpp or tensor_net_state.hpp, and agree_or_fail_together
         // wraps only contract_all/accumulate_across_gpus inside the contract
@@ -1613,11 +1390,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
             gpu_mgr_.primary().refresh_free_memory();
             free_bytes = gpu_mgr_.primary().free_memory();
 
-            int64_t max_possible_elements = 1;
-            for (size_t i = 0; i < extents_out_.size(); i++)
-              max_possible_elements *= extents_out_[i];
-            workspace_estimate =
-                gpu_mgr_.query_workspace_for_size(max_possible_elements);
           } catch (const std::exception &e) {
             w1_status = 2;
             w1_msg = e.what();
@@ -1975,8 +1747,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
   }
 
   // aer-0049: capture point. Reached only after the whole setup succeeded —
-  // path search, slice ceiling (3a), specs, prebuild and the tile ceiling
-  // inside build_tiles_for_step, pool allocation — so a written plan is by
+  // path search, slice ceiling (3a), specs, prebuild, pool allocation — so
+  // a written plan is by
   // construction one that clears BOTH ceilings and sets up on this device.
   // A run that trips a ceiling throws before reaching here and leaves no
   // file, so re-running capture retries with a fresh (scattered) search
@@ -2141,10 +1913,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     uint64_t right = plan_.steps[step].right;
     size_t result_idx = num_inputs + step;
 
-    // WS-3: set in the rank guard when this oversized step is to be tiled.
-    // The actual build_tiles_for_step runs after the final-step C-reorder
-    // below so tiles encode modes_c in its FINAL physical order.
-    bool tile_this_step = false;
 
     // Natural (unpadded) A and B modes come from all_specs_ (which for inputs
     // reflects sliced_input_specs_, and for earlier intermediates reflects
@@ -2194,20 +1962,13 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         strides_b.resize(modes_b.size(), 1);
     }
 
-    // OI11 rank guard: refuse to dispatch any step whose padded descriptor
-    // exceeds hipTensor 1.5.0's m6n6k6 kernel coverage. Without this guard,
-    // contractions where M, N, or K exceed 6 produce silent wrong results
-    // because the brute-force dispatcher invokes an m6n6k6 kernel and the
-    // kernel sums excess M-axes into the contracted-K dimension. See
-    // tn_rank_guard_enabled() above for full rationale and kill switch.
     // aer-0057: the m6n6k6 envelope guard and the tiling decision are gone
     // with the engine that needed them. A GEMM has no shape envelope; the
     // permute layer generalises every step (aer-0052/0054), and the only
     // per-step shape limits are the ones the route enforces loudly itself:
     // int32 GEMM dimensions (hipblas_narrow) and kStageMaxRank modes per
-    // operand (a named refusal in the classifier below). tile_this_step
-    // stays false; no tiles are ever built; aer-0058 deletes the tile
-    // construction and Tile machinery textually.
+    // operand (a named refusal in the classifier below). aer-0060 executed
+    // the textual deletion of the tile construction and Tile machinery.
 
     if (step == num_steps - 1) {
       // Final step: the C we produce must match modes_out_ (plus any
@@ -2258,19 +2019,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
       all_specs_[result_idx].extents = extents_c;
     }
 
-    // WS-3: now that modes_c/extents_c are in their FINAL physical order
-    // (after any final-step reorder above), build the sub-block tiles. They
-    // encode column-major offsets and strides over this exact C order, which
-    // is the order downstream steps and output extraction read C in, so the
-    // tiled writes and the reads agree. The recorded full modes_c/extents_c
-    // below still describe the untiled output for pool layout; the untiled
-    // whole-step plan is never executed for a tiled step.
-    // aer-0057: tile construction removed with the tiling decision --
-    // tile_this_step is permanently false; this comment marks the site for
-    // aer-0058's textual deletion of build_tiles_for_step and the Tile
-    // machinery.
-    (void)tile_this_step;
-
     // Record the exact per-plan descriptor shape for contract_single_slice.
     step_plan_specs_[step].modes_a = modes_a;
     step_plan_specs_[step].extents_a = extents_a;
@@ -2303,7 +2051,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     // which can break that, so the final step is excluded as well.
     step_plan_specs_[step].gemm_ok = false;
 #ifdef AER_HIPBLAS
-    if (tn_gemm_route()) {
+    {
       // aer-0054: with the permute layer on, tiled and strided steps proceed
       // into the analysis and are rescued there -- the permute pack reads a
       // strided view by reordering its PARENT strides (one gather, no
@@ -2386,9 +2134,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                                               bt, n_ext, kb_ext);
         // K seen from A and from B must agree, and M*N must be exactly the C
         // slot. The second is not redundant: compute_contraction_result drops
-        // EVERY shared mode from C, while build_tiles_for_step's classifier
-        // allows a mode present in A, B and C. Those two disagree for a batch
-        // mode, and if one ever appeared this route would write an M*N block
+        // EVERY shared mode from C, while a batch-mode layout keeps one
+        // present in A, B and C. Those two disagree for a batch mode, and if one ever appeared this route would write an M*N block
         // into a slot of a different size. Refusing on the invariant is the
         // difference between a declined step and silent corruption.
         const int64_t c_elems_expected =
@@ -2396,7 +2143,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         // The classic (no-copy) accept now states what the early declines
         // used to imply: packed operands, untiled. A tiled or strided step
         // reaching this point can only be rescued below.
-        if (!tile_this_step && strides_a.empty() && strides_b.empty() &&
+        if (strides_a.empty() && strides_b.empty() &&
             a_ok && b_ok && c_ok && k_ok && ka_ext == kb_ext &&
             m_ext * n_ext == c_elems_expected) {
           step_plan_specs_[step].gemm_ok = true;
@@ -2428,7 +2175,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                 static_cast<uint64_t>(c_elems_expected));
           }
           gemm_steps_routed_++;
-        } else if (tn_gemm_permute() && ka_ext == kb_ext &&
+        } else if (ka_ext == kb_ext &&
                    m_ext * n_ext == c_elems_expected &&
                    modes_a.size() <= static_cast<size_t>(kStageMaxRank) &&
                    modes_b.size() <= static_cast<size_t>(kStageMaxRank) &&
@@ -2559,8 +2306,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
             // was already paid this pass; hoisting the classifier above tile
             // materialisation is deliberately left to the removal era, when
             // the tiling machinery is deleted outright.)
-            if (tile_this_step)
-              psr.tiles.clear();
             psr.gemm_ok = true;
             psr.gemm_perm_a = true;
             psr.gemm_perm_b = true;
@@ -2658,44 +2403,13 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   if (num_steps > 0)
     last_used[num_inputs + num_steps - 1] = static_cast<int>(num_steps - 1);
 
-  // aer-0028: per-CIRCUIT workspace maximum. It must NOT come from
-  // plan_cache().max_workspace_bytes(), which now spans every circuit in the
-  // shared cache; a small circuit after a large one would reserve the large
-  // one's workspace. Accumulated from BOTH get_or_create sites below so a
-  // tiled step cannot under-reserve.
-  uint64_t circuit_max_ws = 0;
-
   for (size_t step = 0; step < num_steps; step++) {
     // Use the padded per-step descriptor shape, not the raw all_specs_
     // (which for inputs may differ from what this specific plan needs).
     const PlanSpec &ps = step_plan_specs_[step];
 
     if (tn_verbose())
-      fprintf(stderr, "[AER_TN] prebuild step %zu (%s, %zu tiles)\n",
-              step, ps.tiles.empty() ? "untiled" : "tiled", ps.tiles.size());
-
-    if (!ps.tiles.empty()) {
-      // WS-3 tiled step: pre-build each sub-block plan so its workspace is
-      // counted into circuit_max_ws below (max_workspace_bytes() would now span
-      // the whole shared cache). The untiled whole-step plan is
-      // never executed for a tiled step, so we do NOT build it here.
-      for (const auto &t : ps.tiles) {
-        std::vector<int32_t> ma_safe, mb_safe, mc_safe;
-        remap_modes_to_safe_range(t.modes_a, t.modes_b, t.modes_c,
-                                  ma_safe, mb_safe, mc_safe);
-        auto tsig = build_signature(ma_safe, t.extents_a, mb_safe, t.extents_b,
-                                    mc_safe, t.extents_c, t.strides_a, t.strides_b,
-                                    t.strides_c);
-        circuit_max_ws = std::max(
-            circuit_max_ws,
-            dev.plan_cache()
-                .get_or_create(tsig, ma_safe, t.extents_a, mb_safe,
-                               t.extents_b, mc_safe, t.extents_c, t.strides_a,
-                               t.strides_b, t.strides_c)
-                .workspace_bytes);
-      }
-      continue;
-    }
+      fprintf(stderr, "[AER_TN] prebuild step %zu\n", step);
 
     // aer-0046: a step the GEMM route will take never calls
     // hiptensorContraction, so building its plan HERE is the waste aer-0043
@@ -2715,36 +2429,12 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     // At the measured 69.7 percent routed this skip removes roughly 2.2 s of
     // 9.4 s at 16 qubits.
     //
-    // circuit_max_ws is accumulated from the plans built in this loop. A
-    // skipped step contributes nothing to it, which is correct: hipblas*gemm
-    // takes no workspace argument. (aer-0057: the verify arm is
-    // retired with its reference engine; nothing below this line executes.)
     // aer-0057: every step routes; no hipTensor plan is ever built. A step
     // that could not route threw a named refusal in the classifier above,
     // so reaching here with gemm_ok unset is impossible by construction.
     gemm_plans_skipped_++;
     continue;
 
-    // Remap mode IDs to a safe range (see remap_modes_to_safe_range above).
-    // Must use identical logic to contract_single_slice so cache
-    // signatures match between pre-population here and execution later.
-    std::vector<int32_t> modes_a_safe, modes_b_safe, modes_c_safe;
-    remap_modes_to_safe_range(ps.modes_a, ps.modes_b, ps.modes_c,
-                              modes_a_safe, modes_b_safe, modes_c_safe);
-
-    auto sig = build_signature(
-        modes_a_safe, ps.extents_a,
-        modes_b_safe, ps.extents_b,
-        modes_c_safe, ps.extents_c,
-        ps.strides_a, ps.strides_b);
-
-    circuit_max_ws = std::max(
-        circuit_max_ws,
-        dev.plan_cache()
-            .get_or_create(sig, modes_a_safe, ps.extents_a, modes_b_safe,
-                           ps.extents_b, modes_c_safe, ps.extents_c,
-                           ps.strides_a, ps.strides_b)
-            .workspace_bytes);
   }
 
 
@@ -2752,7 +2442,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   // behind AER_TN_VERBOSE, because a run whose steps were all declined would
   // otherwise look identical to one that routed everything.
 #ifdef AER_HIPBLAS
-  if (tn_gemm_route()) {
+  {
     fprintf(stderr,
             "[AER_TN_GEMM] steps=%zu routed=%llu permuted=%llu declined: "
             "tiled=%llu "
@@ -2796,28 +2486,13 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   }
 
   if (tn_verbose())
-    fprintf(stderr, "[AER_TN] prebuild loop done; computing workspace\n");
-
-  // aer-0028 FIX: the workspace must be sized from THIS circuit's plans.
-  // plan_cache().max_workspace_bytes() is the max over the WHOLE cache, which
-  // before aer-0028 was per-contractor and therefore per-circuit by
-  // construction. With the cache shared it spans every circuit ever run on this
-  // device, so a small circuit following a large one would reserve the large
-  // one's workspace -- not a wrong answer, but a VRAM over-reservation that
-  // grows without bound and makes the memory budget fed to cotengra
-  // inconsistent with what is actually allocated. Accumulated from the prebuild
-  // loop above instead, which is exact in both shared and private mode.
-  uint64_t max_ws = circuit_max_ws;
-
-  if (tn_verbose())
-    fprintf(stderr, "[AER_TN] workspace computed (max_ws=%lu); laying out pool\n",
-            (unsigned long)max_ws);
+    fprintf(stderr, "[AER_TN] prebuild loop done; laying out pool\n");
 
   if (tn_profile()) {
     prof_prebuild_ms_ += tn_ms_since(prof_prebuild_t0);
     prof_pool_t0 = std::chrono::steady_clock::now();
   }
-  dev.pool().plan_layout(intermediates, max_ws, static_cast<int>(num_steps));
+  dev.pool().plan_layout(intermediates, static_cast<int>(num_steps));
 
   if (tn_verbose())
     fprintf(stderr, "[AER_TN] pool layout done; allocating\n");
@@ -2827,8 +2502,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     prof_pool_ms_ += tn_ms_since(prof_pool_t0);
 
   if (tn_verbose())
-    fprintf(stderr, "[AER_TN] pool: %zu bytes, %zu plans cached (device %d)\n",
-            dev.pool().total_size(), dev.plan_cache().size(), dev.device_id());
+    fprintf(stderr, "[AER_TN] pool: %zu bytes (device %d)\n",
+            dev.pool().total_size(), dev.device_id());
 }
 
 #ifdef AER_MPI
@@ -3027,7 +2702,7 @@ void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
       return;
   }
   // aer-0051: capture-quality gate. Checked against tiles_built_, the same
-  // counter the hard AER_TN_MAX_TILES ceiling reads, so the two verdicts
+  // counter the (now-deleted) hard tile ceiling read, so the two verdicts
   // cannot drift. Refusing to WRITE (not to run) makes re-submission a
   // retry-until-quality loop with no wasted result: this run's answer stands.
   if (tn_plan_file_max_tiles() > 0 && tiles_built_ > tn_plan_file_max_tiles()) {
@@ -3184,7 +2859,7 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           prof_contract_ms_, prof_reduce_gpu_ms_, prof_reduce_mpi_ms_, t_total,
           gflops, (unsigned long)out_size_,
 #ifdef AER_HIPBLAS
-          tn_gemm_route() ? 1 : 0,
+          1,
 #else
           0,
 #endif
@@ -3498,9 +3173,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
                                     PlanePtrs{nullptr, nullptr});
   project_slice(slice_index, device_idx, all_planes);
 
-  void *workspace = dev.pool().get_workspace_ptr();
-  uint64_t ws_size = dev.pool().get_workspace_size();
-
   if (tn_debug()) {
     for (size_t i = 0; i < num_inputs; i++) {
       char label[64];
@@ -3531,15 +3203,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     all_planes[result_idx].re = reinterpret_cast<data_t *>(c_slot);
     all_planes[result_idx].im =
         reinterpret_cast<data_t *>(static_cast<char *>(c_slot) + c_plane);
-
-    if (!ps.tiles.empty()) {
-      // aer-0057: tiles are never built (the tiling decision was removed
-      // with the envelope guard), so a populated tile list here is an
-      // internal inconsistency, not a dispatch path.
-      throw std::runtime_error(
-          "[AER_TN] internal error: step carries tiles after aer-0057 "
-          "removed the tiling decision");
-    }
 
     // aer-0058: restore the routing flag that the aer-0057 excision of the
     // tiled branch and plan-lookup block took with it (build 21195415:
@@ -3785,243 +3448,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       fprintf(stderr, " (%.3f,%.3fi)", host[i].real(), host[i].imag());
     fprintf(stderr, "\n");
   }
-}
-
-// WS-3 mode tiling: decompose one oversized contraction (M>6, N>6, or K>6)
-// into a grid of m6n6k6-compliant sub-contractions. Verified bit-equal to
-// einsum (M-tiling exact; K-tiling to fp roundoff) before implementation.
-//
-// Model (mirrors project_slice's column-major offset arithmetic): for each
-// axis that exceeds 6 modes, take the EXCESS modes as "tile modes" and iterate
-// every mixed-radix combination of their values. For a fixed combination:
-//   * M tile-modes select a disjoint sub-region of C and the matching rows of
-//     A  -> the block writes its own C region (accumulate=false).
-//   * N tile-modes  -> disjoint C region and matching rows of B
-//     (accumulate=false).
-//   * K tile-modes select matching slabs of A AND B and the partial product
-//     must be SUMMED into the same C region -> accumulate=true.
-// Each block's remaining (free) modes number <=6 on every axis, so it is a
-// legal m6n6k6 call. Offsets are element offsets in the FULL parent tensor's
-// column-major (mode-0-fastest) layout; contract_single_slice applies them as
-// base-pointer shifts to both split-complex planes.
-template <typename data_t>
-std::vector<typename TensorNetContractor_HipTensor<data_t>::PlanSpec::Tile>
-TensorNetContractor_HipTensor<data_t>::build_tiles_for_step(
-    const std::vector<int32_t> &modes_a, const std::vector<int64_t> &extents_a,
-    const std::vector<int64_t> &strides_a,
-    const std::vector<int32_t> &modes_b, const std::vector<int64_t> &extents_b,
-    const std::vector<int64_t> &strides_b,
-    const std::vector<int32_t> &modes_c, const std::vector<int64_t> &extents_c) {
-  using Tile = typename PlanSpec::Tile;
-
-  // strides_a/strides_b are the parent input strides: non-empty (and
-  // slice-independent) for a slice-projected leaf input, empty for a packed
-  // input (intermediate, or unsliced leaf). They feed sa/sb below so a block is
-  // a correct strided view into either a projected or a packed parent. This is
-  // what lets tiling compose with slicing.
-
-  std::set<int32_t> set_a(modes_a.begin(), modes_a.end());
-  std::set<int32_t> set_b(modes_b.begin(), modes_b.end());
-  std::set<int32_t> set_c(modes_c.begin(), modes_c.end());
-
-  // Classify modes. M = in A & C not B; N = in B & C not A; K = in A & B not C.
-  std::vector<int32_t> M, N, K;
-  for (int32_t m : modes_a) {
-    if (set_b.count(m)) { if (!set_c.count(m)) K.push_back(m); }
-    else if (set_c.count(m)) M.push_back(m);
-  }
-  for (int32_t m : modes_b) {
-    if (!set_a.count(m) && set_c.count(m)) N.push_back(m);
-  }
-
-  // Column-major element stride of each mode within its parent tensor (mode 0
-  // fastest), so an offset for fixing mode == value is value * stride.
-  auto stride_map = [](const std::vector<int32_t> &modes,
-                       const std::vector<int64_t> &extents) {
-    std::map<int32_t, int64_t> s;
-    int64_t st = 1;
-    for (size_t i = 0; i < modes.size(); i++) { s[modes[i]] = st; st *= extents[i]; }
-    return s;
-  };
-  // sa/sb are the parent column-major element strides used both for a block's
-  // base-pointer offsets and for its surviving free-mode descriptor strides.
-  // When an input is a SLICE-PROJECTED view, its parent strides arrive in
-  // strides_a/strides_b (non-empty) and are slice-INDEPENDENT — project_slice
-  // fixes only the per-slice base offset, never the strides — so the tiles
-  // built here from them are a correct strided view into the projected parent
-  // for every slice. When the input is packed (an intermediate, or an unsliced
-  // leaf) the stride list is empty and we derive packed column-major strides
-  // from extents, exactly as the unsliced increment did. C is always a packed
-  // intermediate slot (never projected), so sc stays packed.
-  auto strides_to_map = [](const std::vector<int32_t> &modes,
-                           const std::vector<int64_t> &strides) {
-    std::map<int32_t, int64_t> s;
-    for (size_t i = 0; i < modes.size() && i < strides.size(); i++)
-      s[modes[i]] = strides[i];
-    return s;
-  };
-  std::map<int32_t, int64_t> sa = strides_a.empty()
-      ? stride_map(modes_a, extents_a) : strides_to_map(modes_a, strides_a);
-  std::map<int32_t, int64_t> sb = strides_b.empty()
-      ? stride_map(modes_b, extents_b) : strides_to_map(modes_b, strides_b);
-  std::map<int32_t, int64_t> sc = stride_map(modes_c, extents_c);
-  std::map<int32_t, int64_t> ext;
-  for (size_t i = 0; i < modes_a.size(); i++) ext[modes_a[i]] = extents_a[i];
-  for (size_t i = 0; i < modes_b.size(); i++) ext[modes_b[i]] = extents_b[i];
-  for (size_t i = 0; i < modes_c.size(); i++) ext[modes_c[i]] = extents_c[i];
-
-  // Tile modes = the excess beyond 6 on each oversized axis. Free modes stay.
-  // Only EXTENT>1 modes are eligible to be tiled: extent-1 dummies (added by
-  // pad_contraction_mnk upstream) carry no data, so keeping them free and
-  // tiling only real modes guarantees each block's free axis holds <=6 real
-  // modes irrespective of where padding placed the dummies.
-  auto excess = [&ext](const std::vector<int32_t> &axis) {
-    std::vector<int32_t> real;
-    for (int32_t m : axis) if (ext[m] > 1) real.push_back(m);
-    return (real.size() > 6)
-               ? std::vector<int32_t>(real.begin() + 6, real.end())
-               : std::vector<int32_t>{};
-  };
-  std::vector<int32_t> tM = excess(M), tN = excess(N), tK = excess(K);
-  std::set<int32_t> tile_set;
-  for (int32_t m : tM) tile_set.insert(m);
-  for (int32_t m : tN) tile_set.insert(m);
-  for (int32_t m : tK) tile_set.insert(m);
-
-  // Ordered list of all tile modes, with which operands each one offsets and
-  // whether it is a (summed) K mode. Mixed-radix iteration order is fixed and
-  // deterministic (P4).
-  struct TileMode { int32_t mode; bool in_a, in_b, in_c; bool is_k; int64_t extent; };
-  std::vector<TileMode> tile_modes;
-  for (int32_t m : tM) tile_modes.push_back({m, true, false, true, false, ext[m]});
-  for (int32_t m : tN) tile_modes.push_back({m, false, true, true, false, ext[m]});
-  for (int32_t m : tK) tile_modes.push_back({m, true, true, false, true, ext[m]});
-
-  bool any_k_tiled = !tK.empty();
-
-  // The per-block (free) descriptor: drop tile modes from A/B/C mode lists.
-  // The surviving free modes keep their PARENT column-major strides (sa/sb/sc
-  // computed above), NOT re-packed strides. This is what makes a block a
-  // correct strided VIEW into its parent: when a non-trailing axis is tiled
-  // away, the kept axes are no longer contiguous in the parent buffer, so a
-  // packed descriptor would mis-address every element past the gap (the bug
-  // this fixes — packed-contiguous writes were only correct for N-only and
-  // K-only tiling). sa/sb are the parent's true strides whether the parent is
-  // packed (unsliced/intermediate) or slice-projected; sc is always packed (C
-  // is an intermediate slot). Identical for every block; offsets differ.
-  auto drop_tiles = [&tile_set](const std::vector<int32_t> &modes,
-                                const std::vector<int64_t> &extents,
-                                const std::map<int32_t, int64_t> &pstride,
-                                std::vector<int32_t> &om,
-                                std::vector<int64_t> &oe,
-                                std::vector<int64_t> &os) {
-    for (size_t i = 0; i < modes.size(); i++) {
-      if (tile_set.count(modes[i])) continue;
-      om.push_back(modes[i]);
-      oe.push_back(extents[i]);
-      os.push_back(pstride.at(modes[i]));
-    }
-  };
-  std::vector<int32_t> bma, bmb, bmc;
-  std::vector<int64_t> bea, beb, bec, bsa, bsb, bsc;
-  drop_tiles(modes_a, extents_a, sa, bma, bea, bsa);
-  drop_tiles(modes_b, extents_b, sb, bmb, beb, bsb);
-  drop_tiles(modes_c, extents_c, sc, bmc, bec, bsc);
-
-  // Total block count.
-  uint64_t nblocks = 1;
-  for (const auto &tm : tile_modes) nblocks *= static_cast<uint64_t>(tm.extent);
-
-  // aer-0033: refuse an unmaterialisable tile list HERE, where the step's shape
-  // and the knob can both be named, rather than as a bad_alloc inside reserve()
-  // on the next line or as an OOM kill while the loop below touches pages.
-  //
-  // This throw is not routed through agree_or_fail_together and does not need to
-  // be: the shape it tests comes from plan_, which under MPI is the
-  // MINLOC-broadcast plan and therefore identical on every rank, so every rank
-  // reaches the same verdict on the same step and they refuse together. That is
-  // the same argument the AER_TN_MAX_SLICES ceiling already relies on.
-  tiles_built_ += nblocks;
-  if (tn_max_tiles() > 0 && tiles_built_ > tn_max_tiles()) {
-    std::stringstream err;
-    err << "[AER_TN] mode tiling: this step needs " << nblocks
-        << " m6n6k6 sub-contractions, taking this setup to " << tiles_built_
-        << " sub-blocks in total, which is above the AER_TN_MAX_TILES ceiling "
-           "of " << tn_max_tiles()
-        << " for the whole setup. Each sub-block costs roughly one kilobyte of "
-           "HOST memory. The count is 2^(excess M + excess N + excess K) over "
-           "six modes per axis, so it is driven by the per-slice peak "
-           "intermediate: lower AER_TN_SLICE_TARGET_BYTES to slice harder and "
-           "shrink each step, or raise AER_TN_MAX_TILES if the host memory is "
-           "available.";
-    throw std::runtime_error(err.str());
-  }
-
-  std::vector<Tile> tiles;
-  tiles.reserve(nblocks);
-
-  for (uint64_t idx = 0; idx < nblocks; idx++) {
-    // Decompose idx into per-tile-mode values, first tile mode fastest (fixed,
-    // deterministic order).
-    uint64_t rem = idx;
-    int64_t off_a = 0, off_b = 0, off_c = 0;
-    for (const auto &tm : tile_modes) {
-      int64_t v = static_cast<int64_t>(rem % static_cast<uint64_t>(tm.extent));
-      rem /= static_cast<uint64_t>(tm.extent);
-      if (tm.in_a) off_a += v * sa[tm.mode];
-      if (tm.in_b) off_b += v * sb[tm.mode];
-      if (tm.in_c) off_c += v * sc[tm.mode];
-    }
-
-    Tile t;
-    t.modes_a = bma; t.extents_a = bea; t.strides_a = bsa;
-    t.modes_b = bmb; t.extents_b = beb; t.strides_b = bsb;
-    t.modes_c = bmc; t.extents_c = bec; t.strides_c = bsc;
-    t.off_a = off_a; t.off_b = off_b; t.off_c = off_c;
-
-    // Pad each block to satisfy the m6n6k6 grammar exactly as a normal step
-    // does (extent-1 dummies). Done per block so each descriptor is itself
-    // grammar-compliant (R1: never hand a block a known-bad shape).
-    if (tn_mnk_padding_enabled()) {
-      pad_contraction_mnk(t.modes_a, t.extents_a, t.modes_b, t.extents_b,
-                          t.modes_c, t.extents_c);
-      // Dummies are appended at the end of each mode list and are extent-1, so
-      // their stride is never dereferenced; pad all three stride lists to the
-      // new rank with value 1 (hipTensor's packed default for an extent-1
-      // axis). All three are now non-empty (real strided views), so unlike the
-      // old packed path these resizes always run.
-      t.strides_a.resize(t.modes_a.size(), 1);
-      t.strides_b.resize(t.modes_b.size(), 1);
-      t.strides_c.resize(t.modes_c.size(), 1);
-    }
-
-    // K-tiled blocks accumulate into the shared C region. When K is tiled,
-    // multiple blocks target the SAME off_c, so only the first writer zeroes
-    // it; the rest add (beta=1). When K is not tiled, every block has a unique
-    // off_c (disjoint M/N region) and writes fresh.
-    if (any_k_tiled) {
-      // off_c repeats every (#K-combinations) blocks. With tile_modes ordered
-      // M,N,K and idx mixed-radix first-fastest, the K values are the highest-
-      // order digits, so blocks sharing an off_c are NOT contiguous. Instead
-      // detect the first writer by whether ALL K tile-mode values are zero.
-      uint64_t r = idx;
-      bool first_k = true;
-      for (const auto &tm : tile_modes) {
-        int64_t v = static_cast<int64_t>(r % static_cast<uint64_t>(tm.extent));
-        r /= static_cast<uint64_t>(tm.extent);
-        if (tm.is_k && v != 0) { first_k = false; break; }
-      }
-      t.accumulate = !first_k;       // beta=1 for all but the first K writer
-      t.zero_c_first = first_k;      // first K writer zeroes its C region
-    } else {
-      t.accumulate = false;
-      t.zero_c_first = true;         // every block writes a fresh disjoint region
-    }
-
-    tiles.push_back(std::move(t));
-  }
-
-  return tiles;
 }
 
 template <typename data_t>

@@ -29,87 +29,11 @@
 #include <vector>
 
 #include <hip/hip_runtime.h>
-#include <hiptensor/hiptensor.hpp>
 #ifdef AER_HIPBLAS
 #include <hipblas/hipblas.h>
 #endif
 
 
-// aer-0031: expose hipTensor's algorithm selector.
-//
-// WHY THIS IS A PARITY ITEM. tensor_net_state.hpp:434 reads
-// config.use_cuTensorNet_autotuning into a user-facing flag, tensor_net.hpp
-// passes it to setup_contraction() from nine call sites, and the cuTensorNet
-// contractor honours it by calling cutensornetContractionAutotune
-// (tensor_net_contractor_cuTensorNet.hpp:600). The hipTensor contractor takes
-// the same flag and discards it -- the parameter at
-// tensor_net_contractor_hiptensor.hpp:1093 is unnamed -- and hardcodes
-// HIPTENSOR_ALGO_DEFAULT at both plan-creation sites. A user who sets that
-// option gets autotuning on NVIDIA and silence on AMD.
-//
-// It was not vacuous. Job 20563826 read the shipped headers at
-// /opt/rocm-6.4.2/include/hiptensor/ and found THREE selectors:
-//   HIPTENSOR_ALGO_DEFAULT, HIPTENSOR_ALGO_DEFAULT_PATIENT,
-//   HIPTENSOR_ALGO_ACTOR_CRITIC
-// Two of them have never been used by this backend.
-//
-// WHY THIS MAY MATTER MORE THAN TUNING. OI11 is stated specifically against
-// "HIPTENSOR_ALGO_DEFAULT's brute-force dispatcher", which invokes an m6n6k6
-// kernel against an oversized descriptor and sums over the excess M-axes with
-// no error returned. Whether DEFAULT_PATIENT or ACTOR_CRITIC validate the
-// descriptor instead is unmeasured. If either does, that is a correctness
-// result, not a performance one, and it is reachable now without a rebuild.
-//
-// LATCHED PROCESS-WIDE, DELIBERATELY. The shared hipTensor plan cache is keyed
-// by tensor shape and not by algorithm, so a selector that could change during
-// a run would let a plan built under one be replayed under another. Latching on
-// first read makes that impossible without touching the cache key. The
-// consequence, stated rather than hidden: if the workspace probe below runs
-// before any setup_contraction(), the latch takes DEFAULT and a later
-// use_autotune request is ignored. That is the safe direction -- it can only
-// leave current behaviour in place.
-//
-// An unrecognised value throws instead of falling back, because a silent
-// fallback is how a measurement of "patient" ends up measuring "default".
-static hiptensorAlgo_t tn_hiptensor_algo(bool autotune_requested = false) {
-  static bool checked = false;
-  static hiptensorAlgo_t cached = HIPTENSOR_ALGO_DEFAULT;
-  if (!checked) {
-    const char *val = std::getenv("AER_TN_HIPTENSOR_ALGO");
-    if (val != nullptr) {
-      std::string want(val);
-      for (char &c : want)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      if (want == "default") {
-        cached = HIPTENSOR_ALGO_DEFAULT;
-      } else if (want == "patient" || want == "default_patient") {
-        cached = HIPTENSOR_ALGO_DEFAULT_PATIENT;
-      } else if (want == "actor_critic" || want == "actor-critic") {
-        cached = HIPTENSOR_ALGO_ACTOR_CRITIC;
-      } else {
-        std::stringstream err;
-        err << "[AER_TN] AER_TN_HIPTENSOR_ALGO='" << val
-            << "' is not recognised. Use default, patient, or actor_critic.";
-        throw std::runtime_error(err.str());
-      }
-    } else if (autotune_requested) {
-      cached = HIPTENSOR_ALGO_DEFAULT_PATIENT;
-    }
-    checked = true;
-  }
-  return cached;
-}
-
-static const char *tn_hiptensor_algo_name() {
-  switch (tn_hiptensor_algo()) {
-  case HIPTENSOR_ALGO_DEFAULT_PATIENT:
-    return "DEFAULT_PATIENT";
-  case HIPTENSOR_ALGO_ACTOR_CRITIC:
-    return "ACTOR_CRITIC";
-  default:
-    return "DEFAULT";
-  }
-}
 #include "misc/wrap_thrust.hpp"
 #include "simulators/statevector/chunk/thrust_kernels.hpp"
 
@@ -212,16 +136,6 @@ inline void check_hip(hipError_t err, const char *func, int device_id = -1) {
   }
 }
 
-inline void check_hiptensor(hiptensorStatus_t err, const char *func,
-                            int device_id = -1) {
-  if (err != HIPTENSOR_STATUS_SUCCESS) {
-    std::stringstream ss;
-    ss << "hipTensor error in " << func << ": " << hiptensorGetErrorString(err);
-    if (device_id >= 0) ss << " (device " << device_id << ")";
-    throw std::runtime_error(ss.str());
-  }
-}
-
 //=============================================================================
 // No-throw GPU capability probe (Piece 0 — CPU-node operability)
 //=============================================================================
@@ -242,7 +156,7 @@ inline int tn_gpu_device_count() noexcept {
 inline bool tn_gpu_available() noexcept { return tn_gpu_device_count() > 0; }
 
 //=============================================================================
-// ContractionSignature and HipTensorPlanCache
+// ContractionSignature
 //=============================================================================
 
 struct ContractionSignature {
@@ -299,17 +213,6 @@ build_signature(const std::vector<int32_t> &modes_a,
   return sig;
 }
 
-// aer-0040: AER_TN_GEMM=1 routes eligible contraction steps through
-// hipblas*gemm instead of hiptensorContraction. Default OFF, so an image built
-// with -DAER_HIPBLAS behaves byte-identically to one without it until the knob
-// is set. Read here rather than in the contractor because GPUDevice::init()
-// needs it to decide whether to create the hipBLAS handle at all.
-// aer-0057: the GEMM route IS the contraction path -- clauses 1 and 2 of the
-// replacement are certified (CHECKPOINT_21018032) and the hipTensor dispatch
-// is retired. The readers are kept as constants so call sites need no churn;
-// aer-0058 deletes them together with the remaining hipTensor machinery.
-static bool tn_gemm_route() { return true; }
-
 // aer-0052: AER_TN_GEMM_PERMUTE=1 rescues steps the GEMM route declines for
 // `layout` (free and contracted modes interleaved) or `korder` (contracted
 // modes ordered differently on A and B) by physically packing each operand
@@ -341,9 +244,6 @@ static bool tn_gemm_complex() {
   }
   return cached;
 }
-
-static bool tn_gemm_permute() { return true; }
-
 
 // aer-0048: AER_TN_GEMM_ATOMICS=1 restores rocBLAS's DEFAULT atomic reductions
 // on the GEMM handle. Default OFF keeps HIPBLAS_ATOMICS_NOT_ALLOWED, which is
@@ -395,424 +295,6 @@ static bool tn_gemm_warmup() {
   return cached;
 }
 
-template <typename data_t> struct CachedPlan {
-  hiptensorContractionDescriptor_t desc;
-  hiptensorContractionFind_t find;
-  hiptensorContractionPlan_t plan;
-  uint64_t workspace_bytes;
-  hiptensorTensorDescriptor_t desc_a;
-  hiptensorTensorDescriptor_t desc_b;
-  hiptensorTensorDescriptor_t desc_c;
-
-  // Persistent copies of the mode and extent arrays we hand to hipTensor.
-  // hiptensorInitContractionDescriptor and hiptensorInitTensorDescriptor
-  // retain the caller-provided pointers (modes_a.data(), extents_a.data(),
-  // etc.) rather than copying. If we pass pointers to caller-local vectors
-  // those become dangling the moment the caller's stack frame unwinds, and
-  // any later use of this plan reads freed memory - observed as silent
-  // zero-output. Owning the arrays here keeps them alive for the plan's
-  // lifetime.
-  std::vector<int32_t> modes_a_storage;
-  std::vector<int32_t> modes_b_storage;
-  std::vector<int32_t> modes_c_storage;
-  std::vector<int64_t> extents_a_storage;
-  std::vector<int64_t> extents_b_storage;
-  std::vector<int64_t> extents_c_storage;
-  // Explicit strides for sliced-input views (empty = packed, descriptor
-  // built with nullptr strides). Same lifetime rule as the mode/extent
-  // arrays: hipTensor retains the pointer, so the plan must own the data.
-  std::vector<int64_t> strides_a_storage;
-  std::vector<int64_t> strides_b_storage;
-  // Explicit C strides. Packed pool-slot C steps leave this empty (nullptr
-  // descriptor, as before). WS-3 tiled sub-blocks set it: a block is a
-  // strided VIEW into the packed parent C, so when a non-trailing C axis is
-  // tiled away the surviving axes are no longer contiguous and C must carry
-  // explicit strides — same mechanism as the A/B sliced-view strides above.
-  std::vector<int64_t> strides_c_storage;
-
-  // aer-0028: LRU stamp. A plain integer, so adding it cannot move the storage
-  // vectors above -- hipTensor retains pointers INTO those, and relocating them
-  // is the documented silent-zero-output failure.
-  uint64_t last_used = 0;
-};
-
-template <typename data_t> class HipTensorPlanCache {
-  std::unordered_map<ContractionSignature, CachedPlan<data_t>,
-                     ContractionSignatureHash> cache_;
-  // Storage slot used only when AER_TN_DISABLE_PLAN_CACHE=1. Initialized
-  // fresh on every get_or_create call so the returned reference is valid
-  // until the next call. Not thread-safe, but neither is the cache itself.
-  CachedPlan<data_t> overwritten_slot_;
-  hiptensorHandle_t *handle_;
-  int device_id_;
-  // aer-0028: guards cache_ so a process-wide instance can be reached from
-  // concurrent contractors. Uncontended and negligible for the per-contractor
-  // instance. NOT recursive: get_or_create must not call trim.
-  // mutable: max_workspace_bytes() and size() are const readers that iterate
-  // cache_, and under a process-wide instance a concurrent insert from another
-  // contractor makes that iteration a data race. aer-0028 introduced the
-  // sharing, so aer-0028 owns guarding them.
-  mutable std::mutex mu_;
-  uint64_t tick_ = 0;
-  uint64_t hits_ = 0;
-  uint64_t misses_ = 0;
-
-public:
-  HipTensorPlanCache() : handle_(nullptr), device_id_(0) {}
-
-  void init(hiptensorHandle_t *handle, int device_id) {
-    handle_ = handle;
-    device_id_ = device_id;
-  }
-
-  const CachedPlan<data_t> &
-  get_or_create(const ContractionSignature &sig,
-                const std::vector<int32_t> &modes_a,
-                const std::vector<int64_t> &extents_a,
-                const std::vector<int32_t> &modes_b,
-                const std::vector<int64_t> &extents_b,
-                const std::vector<int32_t> &modes_c,
-                const std::vector<int64_t> &extents_c,
-                const std::vector<int64_t> &strides_a = {},
-                const std::vector<int64_t> &strides_b = {},
-                const std::vector<int64_t> &strides_c = {}) {
-    // Diagnostic kill switch: forces a fresh plan build on every call via
-    // an always-rebuilt slot outside the cache map. Useful when suspecting
-    // cache-relocation hazards; AER_TN_DISABLE_PLAN_CACHE=1 activates it.
-    const char *disable_cache_env = std::getenv("AER_TN_DISABLE_PLAN_CACHE");
-    bool cache_disabled =
-        (disable_cache_env != nullptr && std::string(disable_cache_env) == "1");
-
-    // aer-0028: the lock covers only the map operations. The returned
-    // reference is used by the caller outside it, which is sound because
-    // nothing erases from cache_ except trim(), and trim() is called only from
-    // setup_contraction() before any reference exists. Insert may rehash;
-    // unordered_map preserves references to elements across rehash.
-    std::lock_guard<std::mutex> cache_lock(mu_);
-    if (!cache_disabled) {
-      auto it = cache_.find(sig);
-      if (it != cache_.end()) {
-        it->second.last_used = ++tick_;
-        hits_++;
-        return it->second;
-      }
-      misses_++;
-    }
-
-    if (gpu_verbose()) {
-      fprintf(stderr,
-              "[AER_TN_GPU] plan %s — A(%zu) x B(%zu) -> C(%zu) (dev %d)\n",
-              cache_disabled ? "rebuild (cache disabled)" : "cache miss",
-              modes_a.size(), modes_b.size(), modes_c.size(), device_id_);
-    }
-
-    // CRITICAL LIFETIME RULE:
-    // hiptensorInitContractionDescriptor may store &desc_a / &desc_b / &desc_c
-    // inside the returned desc, and hiptensorInitContractionPlan may likewise
-    // store pointers into the descriptor members. If we initialize these
-    // objects on the stack and then copy them into the cache map, the map's
-    // copy ends up with internal pointers to the discarded stack frame —
-    // manifesting as silent zero-output on subsequent contractions because the
-    // plan internally dereferences freed / overwritten memory.
-    //
-    // Fix: insert an empty CachedPlan into the map FIRST, take a reference
-    // to the stored object, and initialize descriptors and plan directly on
-    // that stored object. All hipTensor-internal pointers then refer to the
-    // map entry's permanent heap address, which remains valid for the
-    // lifetime of the cache.
-    //
-    // For the diagnostic cache-disabled path we still need a stable storage
-    // slot. Use a persistent member (overwritten_slot_) so the returned
-    // reference is valid until the next call to get_or_create.
-    CachedPlan<data_t> *slot = nullptr;
-    if (cache_disabled) {
-      slot = &overwritten_slot_;
-    } else {
-      auto result = cache_.emplace(sig, CachedPlan<data_t>{});
-      slot = &result.first->second;
-    }
-    CachedPlan<data_t> &cp = *slot;
-
-    // Copy the mode and extent arrays into persistent storage owned by the
-    // CachedPlan. hipTensor retains the pointers we pass to
-    // hiptensorInitTensorDescriptor and hiptensorInitContractionDescriptor
-    // rather than deep-copying; if we hand it pointers into caller-local
-    // vectors, those pointers dangle the moment the caller returns. Copying
-    // into cp's own storage and handing hipTensor cp's pointers keeps them
-    // valid for the plan's full lifetime.
-    cp.modes_a_storage = modes_a;
-    cp.modes_b_storage = modes_b;
-    cp.modes_c_storage = modes_c;
-    cp.extents_a_storage = extents_a;
-    cp.extents_b_storage = extents_b;
-    cp.extents_c_storage = extents_c;
-    cp.strides_a_storage = strides_a;
-    cp.strides_b_storage = strides_b;
-    cp.strides_c_storage = strides_c;
-
-    hipSetDevice(device_id_);
-
-    // Split-complex contractions: descriptors see REAL tensors. hipTensor
-    // 1.5.0's complex path is broken on gfx90a; we decompose each complex
-    // contraction into four real contractions in execute_contraction. One
-    // plan (one shape, one compute type) serves all four calls.
-    hipDataType hip_dtype;
-    hiptensorComputeType_t compute_type;
-    if (sizeof(data_t) == 8) {
-      hip_dtype = HIP_R_64F;
-      compute_type = HIPTENSOR_COMPUTE_64F;
-    } else {
-      hip_dtype = HIP_R_32F;
-      compute_type = HIPTENSOR_COMPUTE_32F;
-    }
-
-    uint32_t align = TENSOR_POINTER_ALIGN;
-    // A and B may be strided views into a larger parent tensor (slice
-    // projection keeps device data in place and presents the unsliced
-    // remainder through parent strides). nullptr = hipTensor's packed
-    // column-major default, identical to an explicit packed stride list.
-    // C is packed for ordinary pool-slot steps (strides_c empty → nullptr),
-    // but a WS-3 tiled sub-block is a strided VIEW into the packed parent C
-    // and supplies explicit C strides (see strides_c_storage).
-    const int64_t *sa = cp.strides_a_storage.empty()
-                            ? nullptr : cp.strides_a_storage.data();
-    const int64_t *sb = cp.strides_b_storage.empty()
-                            ? nullptr : cp.strides_b_storage.data();
-    const int64_t *sc = cp.strides_c_storage.empty()
-                            ? nullptr : cp.strides_c_storage.data();
-    check_hiptensor(hiptensorInitTensorDescriptor(
-        handle_, &cp.desc_a, static_cast<uint32_t>(cp.modes_a_storage.size()),
-        cp.extents_a_storage.data(), sa, hip_dtype, HIPTENSOR_OP_IDENTITY),
-        "hiptensorInitTensorDescriptor(A)", device_id_);
-
-    check_hiptensor(hiptensorInitTensorDescriptor(
-        handle_, &cp.desc_b, static_cast<uint32_t>(cp.modes_b_storage.size()),
-        cp.extents_b_storage.data(), sb, hip_dtype, HIPTENSOR_OP_IDENTITY),
-        "hiptensorInitTensorDescriptor(B)", device_id_);
-
-    check_hiptensor(hiptensorInitTensorDescriptor(
-        handle_, &cp.desc_c, static_cast<uint32_t>(cp.modes_c_storage.size()),
-        cp.extents_c_storage.data(), sc, hip_dtype, HIPTENSOR_OP_IDENTITY),
-        "hiptensorInitTensorDescriptor(C)", device_id_);
-
-    check_hiptensor(hiptensorInitContractionDescriptor(
-        handle_, &cp.desc,
-        &cp.desc_a, cp.modes_a_storage.data(), align,
-        &cp.desc_b, cp.modes_b_storage.data(), align,
-        &cp.desc_c, cp.modes_c_storage.data(), align,
-        &cp.desc_c, cp.modes_c_storage.data(), align,
-        compute_type),
-        "hiptensorInitContractionDescriptor", device_id_);
-
-    check_hiptensor(hiptensorInitContractionFind(
-        handle_, &cp.find, tn_hiptensor_algo()),
-        "hiptensorInitContractionFind", device_id_);
-
-    cp.workspace_bytes = 0;
-    check_hiptensor(hiptensorContractionGetWorkspaceSize(
-        handle_, &cp.desc, &cp.find,
-        HIPTENSOR_WORKSPACE_RECOMMENDED, &cp.workspace_bytes),
-        "hiptensorContractionGetWorkspaceSize", device_id_);
-
-    check_hiptensor(hiptensorInitContractionPlan(
-        handle_, &cp.plan, &cp.desc, &cp.find, cp.workspace_bytes),
-        "hiptensorInitContractionPlan", device_id_);
-
-    // cp is already stored in its final location (either the cache map
-    // entry or overwritten_slot_), so hipTensor's internal pointers into
-    // &cp.desc_a / &cp.desc_b / &cp.desc_c / &cp.desc / &cp.find are
-    // stable for the lifetime of that storage. No further copy needed.
-    return cp;
-  }
-
-  // WARNING: this is the max over EVERY plan in the cache. With the aer-0028
-  // process-wide cache that spans every circuit ever run on this device, not
-  // the circuit being set up, so sizing a pool from it over-reserves by
-  // whatever the largest plan ever seen needed. setup_pool_and_cache()
-  // therefore accumulates its own per-circuit maximum from the prebuild loop
-  // and does not call this. Kept for diagnostics only.
-  uint64_t max_workspace_bytes() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    uint64_t max_ws = 0;
-    for (auto it = cache_.begin(); it != cache_.end(); ++it)
-      max_ws = std::max(max_ws, it->second.workspace_bytes);
-    return max_ws;
-  }
-
-  size_t size() const {
-    std::lock_guard<std::mutex> lock(mu_);
-    return cache_.size();
-  }
-  void clear() {
-    std::lock_guard<std::mutex> lock(mu_);
-    cache_.clear();
-  }
-
-  // aer-0028: evict down to max_entries, least-recently-used first.
-  //
-  // MUST NOT be called while any CachedPlan reference is live: hipTensor holds
-  // pointers into the entry's own storage, so erasing one under a live
-  // reference is a use-after-free that shows up as silent zero-output rather
-  // than a fault. The only call site is the top of setup_contraction(), before
-  // the prebuild loop and long before contract_single_slice takes a reference.
-  void trim(size_t max_entries) {
-    std::lock_guard<std::mutex> lock(mu_);
-    while (cache_.size() > max_entries) {
-      auto victim = cache_.end();
-      uint64_t best = UINT64_MAX;
-      for (auto it = cache_.begin(); it != cache_.end(); ++it) {
-        if (it->second.last_used < best) {
-          best = it->second.last_used;
-          victim = it;
-        }
-      }
-      if (victim == cache_.end())
-        break;
-      cache_.erase(victim);
-    }
-  }
-
-  void stats(uint64_t &h, uint64_t &m, size_t &n) {
-    std::lock_guard<std::mutex> lock(mu_);
-    h = hits_;
-    m = misses_;
-    n = cache_.size();
-  }
-};
-
-//=============================================================================
-// aer-0028: process-wide hipTensor plan cache
-//=============================================================================
-//
-// WHY
-// GPUResourceManager is a MEMBER of the contractor, and a contractor is built
-// and destroyed per instruction (create_contractor / delete contractor
-// throughout tensor_net.hpp). So GPUDevice::init() runs hiptensorCreate and
-// starts an EMPTY plan cache every evaluation, and ~101 hipTensor plans are
-// rebuilt from nothing each time.
-//
-// aer-0027 removed the cotengra search (t_path_ms=0 on a repeat). Job 20512566
-// measured what is left: with t_path already zero, t_setup is still 3431 ms
-// (grid n=16) and 2603 ms (rand3 n=64) against a GPU contraction of 7.8 ms and
-// 5.7 ms. The contraction is 0.22% of its own setup, and essentially all the
-// remainder is this cache being thrown away and rebuilt. Target: ~450x.
-//
-// WHY ONLY THE HANDLE AND THE PLAN CACHE MOVE
-// CachedPlan owns hipTensor descriptors, the plan object, and HOST-side mode /
-// extent / stride vectors. It owns no device memory and calls no hipMalloc.
-// Every device pointer, the workspace and the stream are passed as arguments to
-// hiptensorContraction at call time (see contract_split_complex). So the pool,
-// the tensor arena, the stream and the thrust buffers stay per-contractor,
-// where their lifetime is already correct, and only {handle, plan cache} are
-// shared. The handle must move WITH the plans because the descriptors are
-// initialised against it; a plan built on one handle and executed on another is
-// undefined.
-//
-// THE LIFETIME TRAP
-// hiptensorInitContractionDescriptor and hiptensorInitContractionPlan retain
-// pointers INTO the CachedPlan's own storage (documented at the top of
-// get_or_create). Destroying or relocating an entry while a reference to it is
-// live is a use-after-free whose symptom is silent zero-output, not a crash.
-// contract_single_slice holds `const CachedPlan &` across a per-tile loop, so:
-//   * rehash on insert is SAFE -- unordered_map preserves references to
-//     elements across rehash, invalidating only iterators;
-//   * erase is NOT safe mid-contraction.
-// Eviction is therefore never performed inside get_or_create. trim() exists as
-// a separate call, made only from setup_contraction() before any reference has
-// been taken.
-//
-// THREAD SAFETY
-// A process-wide cache can be reached from concurrent contractors. get_or_create
-// and trim take a mutex; the returned reference is used outside it, which is
-// sound only because of the no-erase rule above. Plan CREATION on the shared
-// handle is serialised by the same mutex.
-//
-// MPI: setup_pool_and_cache contains no collectives, so this is rank-local and
-// needs none of aer-0027's nprocs_ == 1 restriction. Each rank is its own
-// process and gets its own registry.
-//
-// Off by default. AER_TN_SHARED_PLAN_CACHE=1 enables;
-// AER_TN_SHARED_PLAN_CACHE_MAX caps entries (default 4096, host memory only,
-// roughly a kilobyte or two each).
-
-static bool tn_shared_plan_cache() {
-  static bool checked = false;
-  static bool cached = false;
-  if (!checked) {
-    const char *v = std::getenv("AER_TN_SHARED_PLAN_CACHE");
-    bool want = (v != nullptr && v[0] == '1' && v[1] == '\0');
-
-    // AER_TN_DISABLE_PLAN_CACHE wins. Its path returns a reference to
-    // overwritten_slot_, a single MEMBER of the cache that every call
-    // rewrites; the comment on it says the reference is valid only "until the
-    // next call to get_or_create". That is tolerable for a per-contractor
-    // cache, where the sole caller consumes the reference before calling
-    // again. It is NOT tolerable for a process-wide one, where a second
-    // contractor's call can rewrite the slot while the first still holds the
-    // reference -- and the reference is used outside the mutex, so no lock
-    // makes it safe. The two knobs are mutually exclusive rather than silently
-    // corrupting, and the diagnostic kill switch takes precedence because its
-    // whole purpose is to rule out cache-relocation hazards.
-    const char *d = std::getenv("AER_TN_DISABLE_PLAN_CACHE");
-    if (want && d != nullptr && std::string(d) == "1") {
-      fprintf(stderr,
-              "[AER_TN] AER_TN_DISABLE_PLAN_CACHE=1 overrides "
-              "AER_TN_SHARED_PLAN_CACHE=1: the disable path hands back a "
-              "reference to one overwritten slot, which cannot be shared "
-              "between contractors. Plan-cache sharing is OFF for this run.\n");
-      want = false;
-    }
-    cached = want;
-    checked = true;
-  }
-  return cached;
-}
-
-static size_t tn_shared_plan_cache_max() {
-  static bool checked = false;
-  static size_t cached = 4096;
-  if (!checked) {
-    const char *v = std::getenv("AER_TN_SHARED_PLAN_CACHE_MAX");
-    if (v != nullptr) {
-      char *end = nullptr;
-      long long p = std::strtoll(v, &end, 10);
-      if (end != v && p > 0)
-        cached = static_cast<size_t>(p);
-    }
-    checked = true;
-  }
-  return cached;
-}
-
-// One {handle, cache} per device id, created on first use and DELIBERATELY
-// never destroyed. Tearing a hiptensorHandle_t down during static destruction
-// would order it against the HIP runtime's own teardown, and any plan still
-// referencing it would be used-after-free; leaking one handle per device for
-// the life of the process is the safer trade.
-template <typename data_t> class SharedPlanRegistry {
-public:
-  struct Slot {
-    hiptensorHandle_t *handle;
-    HipTensorPlanCache<data_t> cache;
-    Slot() : handle(nullptr) {}
-  };
-
-  static Slot *acquire(int device_id) {
-    static std::mutex reg_mu;
-    static std::map<int, Slot *> slots;
-    std::lock_guard<std::mutex> lock(reg_mu);
-    typename std::map<int, Slot *>::iterator it = slots.find(device_id);
-    if (it != slots.end())
-      return it->second;
-    Slot *s = new Slot();          // never deleted, by design (see above)
-    check_hiptensor(hiptensorCreate(&s->handle), "hiptensorCreate(shared)",
-                    device_id);
-    s->cache.init(s->handle, device_id);
-    slots[device_id] = s;
-    return s;
-  }
-};
-
 //=============================================================================
 // MemoryPool
 //=============================================================================
@@ -848,16 +330,8 @@ public:
 
   void plan_layout(
       const std::vector<std::tuple<size_t, int, int, int>> &intermediates,
-      size_t workspace_bytes, int num_steps) {
+      int num_steps) {
     allocations_.clear();
-
-    if (workspace_bytes > 0) {
-      PoolAllocation ws;
-      ws.offset = 0; ws.size = workspace_bytes;
-      ws.birth_step = 0; ws.death_step = num_steps - 1;
-      ws.tensor_index = -1;
-      allocations_.push_back(ws);
-    }
 
     std::vector<size_t> order(intermediates.size());
     std::iota(order.begin(), order.end(), 0);
@@ -909,19 +383,6 @@ public:
     std::stringstream ss;
     ss << "MemoryPool: tensor index " << tensor_index << " not found";
     throw std::runtime_error(ss.str());
-  }
-
-  void *get_workspace_ptr() const {
-    for (size_t i = 0; i < allocations_.size(); i++)
-      if (allocations_[i].tensor_index == -1)
-        return static_cast<char *>(pool_ptr_) + allocations_[i].offset;
-    return nullptr;
-  }
-
-  size_t get_workspace_size() const {
-    for (size_t i = 0; i < allocations_.size(); i++)
-      if (allocations_[i].tensor_index == -1) return allocations_[i].size;
-    return 0;
   }
 
   size_t total_size() const { return pool_size_; }
@@ -1000,8 +461,9 @@ template <typename data_t> struct AccumulatePlanarFunctor {
 // layer is needed for the steps this route accepts.
 //
 // FOUR REAL GEMMs, NOT ONE COMPLEX GEMM. This backend stores complex values as
-// two separate real planes (see the OI7 note on hipTensor's complex path), and
-// execute_contraction_planes below takes six plane pointers. hipblasZgemm
+// two separate real planes (historically for hipTensor's broken complex path;
+// kept on the route's own merits), and
+// execute_contraction_gemm below takes six plane pointers. hipblasZgemm
 // requires interleaved complex, which this layout is not, and interleaving it
 // would mean changing the pool, the upload, project_slice's plane arithmetic
 // and accumulate_planar_to_output -- the machinery the OI9 comment identifies
@@ -1105,24 +567,20 @@ template <typename data_t> class GPUDevice {
   size_t total_memory_;
   size_t free_memory_;
   hipStream_t stream_;
-  hiptensorHandle_t *ht_handle_;
   bool handle_valid_;
 #ifdef AER_HIPBLAS
-  // aer-0040: created only when the GEMM route is enabled, destroyed in
-  // release() alongside the stream. Never shared through SharedPlanRegistry:
-  // that slot exists to keep hipTensor PLANS alive across contractors, and a
-  // hipBLAS handle owns no plans.
+  // aer-0040: the device's GEMM handle, destroyed in release() alongside
+  // the stream. Never shared across contractors: a hipBLAS handle owns no
+  // plans, so there is nothing to keep alive.
   hipblasHandle_t bl_handle_;
   bool bl_handle_valid_;
 #endif
 
-  HipTensorPlanCache<data_t> plan_cache_;
   // aer-0028: when shared-plan-cache mode is on this points at the process-wide
   // slot for this device and plan_cache_ above goes unused. The pool, the
   // arena, the stream and the thrust buffers are deliberately NOT shared --
   // they own device memory whose lifetime is already correct per contractor,
   // and only the handle and the plans need to outlive one.
-  typename SharedPlanRegistry<data_t>::Slot *shared_slot_ = nullptr;
   MemoryPool pool_;
   std::vector<bool> peer_access_;
   void *tensor_data_ptr_;
@@ -1135,7 +593,7 @@ template <typename data_t> class GPUDevice {
 public:
   GPUDevice()
       : device_id_(-1), total_memory_(0), free_memory_(0), stream_(nullptr),
-        ht_handle_(nullptr), handle_valid_(false),
+        handle_valid_(false),
 #ifdef AER_HIPBLAS
         bl_handle_(nullptr), bl_handle_valid_(false),
 #endif
@@ -1160,25 +618,11 @@ public:
     check_hip(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
               "hipStreamCreateWithFlags", device_id_);
 
-    if (tn_shared_plan_cache()) {
-      // Reuse the process-wide handle. handle_valid_ stays FALSE so release()
-      // does not hiptensorDestroy it out from under plans that outlive this
-      // contractor -- that would be a use-after-free on the next instruction.
-      shared_slot_ = SharedPlanRegistry<data_t>::acquire(device_id_);
-      ht_handle_ = shared_slot_->handle;
-      handle_valid_ = false;
-    } else {
-      check_hiptensor(hiptensorCreate(&ht_handle_), "hiptensorCreate",
-                      device_id_);
-      handle_valid_ = true;
-      plan_cache_.init(ht_handle_, device_id_);
-    }
-
 #ifdef AER_HIPBLAS
-    if (tn_gemm_route()) {
+    {
       check_hipblas(hipblasCreate(&bl_handle_), "hipblasCreate", device_id_);
       bl_handle_valid_ = true;
-      // Same stream as every hipTensor call on this device, so the GEMM route
+      // Same stream as every device call on this device, so the GEMM route
       // keeps the existing ordering and the existing one-sync-per-phase
       // profiling model stays valid.
       check_hipblas(hipblasSetStream(bl_handle_, stream_), "hipblasSetStream",
@@ -1345,99 +789,6 @@ public:
     sampling_out_.clear(); sampling_out_.shrink_to_fit();
   }
 
-  // Execute pairwise contraction. accumulate=true uses beta=1 (D += A*B).
-  //
-  // Split-complex decomposition: A, B, C are stored with real and imaginary
-  // planes in separate contiguous regions of the pool slot. Given pointers
-  // ptr_{a,b,c} to slot starts and the element counts, we derive plane
-  // pointers and issue four real contractions (one hipTensor plan, four
-  // different pointer combinations and alpha/beta values):
-  //
-  //   Cr = Ar*Br - Ai*Bi
-  //   Ci = Ar*Bi + Ai*Br
-  //
-  // When accumulate=true the initial beta is 1 instead of 0 so we add into
-  // the pre-existing Cr / Ci values. The two subsequent calls always use
-  // beta=1 since they accumulate onto the partial result from the first
-  // call of each pair.
-  void execute_contraction(const CachedPlan<data_t> &plan,
-                           void *ptr_a, size_t num_elements_a,
-                           void *ptr_b, size_t num_elements_b,
-                           void *ptr_c, size_t num_elements_c,
-                           void *workspace, uint64_t workspace_size,
-                           bool accumulate = false) {
-    // Packed-slot convenience form: derive each tensor's imaginary plane
-    // from its slot layout ([real plane][imag plane], imag at
-    // plane_bytes(N_full)). Valid only for tensors that occupy a whole
-    // slot — pool intermediates and unprojected inputs. Slice-projected
-    // inputs must use the explicit-plane overload below, because their
-    // imag-plane offset depends on the FULL parent tensor size, not the
-    // projected element count (resolves OI9).
-    const size_t plane_a = plane_bytes(
-        static_cast<int64_t>(num_elements_a), sizeof(data_t));
-    const size_t plane_b = plane_bytes(
-        static_cast<int64_t>(num_elements_b), sizeof(data_t));
-    const size_t plane_c = plane_bytes(
-        static_cast<int64_t>(num_elements_c), sizeof(data_t));
-
-    execute_contraction_planes(
-        plan,
-        reinterpret_cast<data_t *>(ptr_a),
-        reinterpret_cast<data_t *>(reinterpret_cast<char *>(ptr_a) + plane_a),
-        reinterpret_cast<data_t *>(ptr_b),
-        reinterpret_cast<data_t *>(reinterpret_cast<char *>(ptr_b) + plane_b),
-        reinterpret_cast<data_t *>(ptr_c),
-        reinterpret_cast<data_t *>(reinterpret_cast<char *>(ptr_c) + plane_c),
-        workspace, workspace_size, accumulate);
-  }
-
-  // Explicit-plane form. The caller provides the real and imaginary plane
-  // pointers for every operand. Slice projection advances both planes by
-  // the same element offset within the parent tensor's slot, so a sliced
-  // sub-tensor's planes are no longer related by plane_bytes(N_sub) — this
-  // overload is what makes slicing and split-complex compose.
-  void execute_contraction_planes(const CachedPlan<data_t> &plan,
-                                  data_t *Ar, data_t *Ai,
-                                  data_t *Br, data_t *Bi,
-                                  data_t *Cr, data_t *Ci,
-                                  void *workspace, uint64_t workspace_size,
-                                  bool accumulate = false) {
-    hipSetDevice(device_id_);
-    const data_t pos_one = static_cast<data_t>(1.0);
-    const data_t neg_one = static_cast<data_t>(-1.0);
-    const data_t zero    = static_cast<data_t>(0.0);
-    const data_t initial_beta = accumulate ? pos_one : zero;
-
-    // Cr = Ar * Br  (beta = initial)
-    check_hiptensor(
-        hiptensorContraction(ht_handle_, &plan.plan,
-                             &pos_one, Ar, Br,
-                             &initial_beta, Cr, Cr,
-                             workspace, workspace_size, stream_),
-        "hiptensorContraction(Cr=Ar*Br)", device_id_);
-    // Cr -= Ai * Bi  (beta = 1, alpha = -1)
-    check_hiptensor(
-        hiptensorContraction(ht_handle_, &plan.plan,
-                             &neg_one, Ai, Bi,
-                             &pos_one, Cr, Cr,
-                             workspace, workspace_size, stream_),
-        "hiptensorContraction(Cr-=Ai*Bi)", device_id_);
-    // Ci = Ar * Bi  (beta = initial)
-    check_hiptensor(
-        hiptensorContraction(ht_handle_, &plan.plan,
-                             &pos_one, Ar, Bi,
-                             &initial_beta, Ci, Ci,
-                             workspace, workspace_size, stream_),
-        "hiptensorContraction(Ci=Ar*Bi)", device_id_);
-    // Ci += Ai * Br  (beta = 1, alpha = 1)
-    check_hiptensor(
-        hiptensorContraction(ht_handle_, &plan.plan,
-                             &pos_one, Ai, Br,
-                             &pos_one, Ci, Ci,
-                             workspace, workspace_size, stream_),
-        "hiptensorContraction(Ci+=Ai*Br)", device_id_);
-  }
-
 #ifdef AER_HIPBLAS
   // aer-0048: one throwaway routed-shape dispatch to pay rocBLAS/Tensile lazy
   // initialisation at handle-creation time, off the timed path. Self-contained:
@@ -1446,7 +797,7 @@ public:
   // and frees. Shape 8x8x8 is inside the m6n6k6 routed envelope and large
   // enough to select a non-trivial Tensile solution. Errors are swallowed: a
   // warm-up that fails must not take down a run whose real dispatches would
-  // have succeeded. Only reached from init() when tn_gemm_route() &&
+  // have succeeded. Only reached from init() when
   // tn_gemm_warmup(); default off leaves the handle exactly as before.
   void gemm_warmup() {
     hipSetDevice(device_id_);
@@ -1498,9 +849,9 @@ public:
     hipFree(Cr); hipFree(Ci);
   }
 
-  // aer-0040: the routed form of execute_contraction_planes. Same six plane
-  // pointers, same alphas, same betas, same stream; four hipblas*gemm calls
-  // instead of four hiptensorContraction calls. No workspace: GEMM needs none.
+  // aer-0040: the contraction executor. Six plane pointers; four
+  // hipblas*gemm calls per step (or one native Z/Cgemm on the aer-0055
+  // sub-path). No workspace: GEMM needs none.
   //
   // a_trans / b_trans say which of the two admissible packed layouts each
   // operand is in, decided in setup_pool_and_cache and carried on PlanSpec:
@@ -1635,11 +986,6 @@ public:
   size_t total_memory() const { return total_memory_; }
   bool has_peer_access(int other_device) const { return peer_access_[other_device]; }
   hipStream_t stream() const { return stream_; }
-  hiptensorHandle_t *handle() { return ht_handle_; }
-  HipTensorPlanCache<data_t> &plan_cache() {
-    return shared_slot_ ? shared_slot_->cache : plan_cache_;
-  }
-  bool plan_cache_is_shared() const { return shared_slot_ != nullptr; }
   MemoryPool &pool() { return pool_; }
   thrust::device_vector<thrust::complex<data_t>> &output_buffer() { return dev_out_; }
   void *tensor_data_ptr() const { return tensor_data_ptr_; }
@@ -1649,17 +995,10 @@ public:
     if (device_id_ < 0) return;
     hipSetDevice(device_id_);
     pool_.release();
-    // aer-0028: never clear the shared cache here -- surviving this
-    // contractor is the entire point, and the plans are still valid because
-    // the shared handle is never destroyed. The private cache is cleared as
-    // before so non-shared mode is byte-for-byte unchanged.
-    if (!shared_slot_)
-      plan_cache_.clear();
     if (tensor_data_ptr_) { hipFree(tensor_data_ptr_); tensor_data_ptr_ = nullptr; }
     tensor_data_size_ = 0;
     dev_out_.clear(); dev_out_.shrink_to_fit();
     deallocate_sampling_buffers();
-    if (handle_valid_) { hiptensorDestroy(ht_handle_); ht_handle_ = nullptr; handle_valid_ = false; }
 #ifdef AER_HIPBLAS
     if (bl_handle_valid_) { hipblasDestroy(bl_handle_); bl_handle_ = nullptr; bl_handle_valid_ = false; }
 #endif
@@ -1738,65 +1077,6 @@ public:
     for (size_t i = 0; i < devices_.size(); i++)
       min_mem = std::min(min_mem, devices_[i]->free_memory());
     return min_mem;
-  }
-
-  uint64_t query_workspace_for_size(int64_t max_intermediate_elements) {
-    if (devices_.empty()) return 0;
-    GPUDevice<data_t> &primary = *devices_[0];
-    hipSetDevice(primary.device_id());
-
-    int64_t n = static_cast<int64_t>(
-        std::sqrt(static_cast<double>(max_intermediate_elements)));
-    if (n < 2) n = 2;
-    std::vector<int64_t> extents = {n, n};
-    std::vector<int32_t> modes_a = {0, 1};
-    std::vector<int32_t> modes_b = {1, 2};
-    std::vector<int32_t> modes_c = {0, 2};
-
-    hipDataType hip_dtype = (sizeof(data_t) == 8) ? HIP_R_64F : HIP_R_32F;
-    hiptensorComputeType_t compute_type =
-        (sizeof(data_t) == 8) ? HIPTENSOR_COMPUTE_64F : HIPTENSOR_COMPUTE_32F;
-
-    hiptensorTensorDescriptor_t da, db, dc;
-    hiptensorContractionDescriptor_t desc;
-    hiptensorContractionFind_t find;
-    uint64_t workspace = 0;
-    uint32_t align = TENSOR_POINTER_ALIGN;
-
-    auto status = hiptensorInitTensorDescriptor(
-        primary.handle(), &da, 2, extents.data(), nullptr,
-        hip_dtype, HIPTENSOR_OP_IDENTITY);
-    if (status != HIPTENSOR_STATUS_SUCCESS) {
-      fprintf(stderr,
-              "[AER_TN_GPU] WARNING: workspace probe could not init tensor "
-              "descriptor (hipTensor status %d); falling back to 64 MB budget\n",
-              (int)status);
-      return 64 * 1024 * 1024;
-    }
-
-    hiptensorInitTensorDescriptor(primary.handle(), &db, 2, extents.data(),
-        nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY);
-    hiptensorInitTensorDescriptor(primary.handle(), &dc, 2, extents.data(),
-        nullptr, hip_dtype, HIPTENSOR_OP_IDENTITY);
-
-    status = hiptensorInitContractionDescriptor(
-        primary.handle(), &desc,
-        &da, modes_a.data(), align, &db, modes_b.data(), align,
-        &dc, modes_c.data(), align, &dc, modes_c.data(), align,
-        compute_type);
-    if (status != HIPTENSOR_STATUS_SUCCESS) {
-      fprintf(stderr,
-              "[AER_TN_GPU] WARNING: workspace probe could not init contraction "
-              "descriptor (hipTensor status %d); falling back to 64 MB budget\n",
-              (int)status);
-      return 64 * 1024 * 1024;
-    }
-
-    hiptensorInitContractionFind(primary.handle(), &find, tn_hiptensor_algo());
-    hiptensorContractionGetWorkspaceSize(
-        primary.handle(), &desc, &find,
-        HIPTENSOR_WORKSPACE_RECOMMENDED, &workspace);
-    return workspace;
   }
 
   size_t num_devices() const { return devices_.size(); }

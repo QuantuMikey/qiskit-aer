@@ -500,93 +500,56 @@ if(AER_THRUST_SUPPORTED)
     endif()
 
     if(AER_ENABLE_HIPTENSOR)
-      find_package(hiptensor QUIET)
-      if(hiptensor_FOUND)
-        message(STATUS "hipTensor found — enabling tensor network support for ROCm")
+      # aer-0061: the flag now means "TN backend on". hipTensor is neither
+      # linked nor found: the dispatch layer is hipBLAS GEMM unconditionally
+      # (aer-0057) and the dead machinery is deleted (aer-0060). The flag and
+      # the AER_HIPTENSOR macro keep their names so no call site churns; a
+      # cosmetic rename is post-goal.
 
-        # Verify cotengra is available (required for contraction path optimization)
-        execute_process(
-          COMMAND ${Python_EXECUTABLE} -c
-            "import cotengra; print(cotengra.__version__)"
-          RESULT_VARIABLE COTENGRA_RESULT
-          OUTPUT_VARIABLE COTENGRA_VERSION
-          OUTPUT_STRIP_TRAILING_WHITESPACE
-          ERROR_QUIET)
-        if(NOT COTENGRA_RESULT EQUAL 0)
-          message(FATAL_ERROR
-            "AER_ENABLE_HIPTENSOR requires cotengra for contraction path "
-            "optimization. Install with: pip install cotengra>=0.7.0")
-        endif()
-        message(STATUS "cotengra ${COTENGRA_VERSION} found")
+      # cotengra is required for contraction path optimization.
+      execute_process(
+        COMMAND ${Python_EXECUTABLE} -c
+          "import cotengra; print(cotengra.__version__)"
+        OUTPUT_VARIABLE COTENGRA_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE COTENGRA_RESULT)
+      if(NOT COTENGRA_RESULT EQUAL 0)
+        message(FATAL_ERROR
+          "AER_ENABLE_HIPTENSOR requires cotengra for contraction path "
+          "optimization. Install with: pip install cotengra>=0.7.0")
+      endif()
+      message(STATUS "cotengra ${COTENGRA_VERSION} found")
 
-        list(APPEND ROCM_EXTRA_DEFS -DAER_HIPTENSOR)
+      list(APPEND ROCM_EXTRA_DEFS -DAER_HIPTENSOR)
+      list(APPEND ROCM_EXTRA_FLAGS -std=gnu++17)
 
-        # hipTensor 1.5.0 headers use C++17 features (std::is_same_v,
-        # if constexpr) in internal/types_ext.hpp.  Conan sets -std=gnu++14
-        # earlier in the flag list; appending -std=gnu++17 here overrides
-        # it (last flag wins in clang).
-        list(APPEND ROCM_EXTRA_FLAGS -std=gnu++17)
-
-        # hipTensor target name varies by ROCm version.
-        # ROCm 6.4.x exports 'hiptensor' not 'hiptensor::hiptensor'.
-        if(TARGET hiptensor::hiptensor)
-          list(APPEND AER_LIBRARIES hiptensor::hiptensor)
-        elseif(TARGET hiptensor)
-          list(APPEND AER_LIBRARIES hiptensor)
-        else()
-          find_library(HIPTENSOR_LIB hiptensor
-            HINTS ${ROCM_PATH}/lib ${ROCM_PATH}/hiptensor/lib)
-          if(HIPTENSOR_LIB)
-            list(APPEND AER_LIBRARIES ${HIPTENSOR_LIB})
-            include_directories(${ROCM_PATH}/include)
-          else()
-            message(FATAL_ERROR "hipTensor package found but library not locatable")
-          endif()
-        endif()
-
-        # hipBLAS, for the GEMM contraction route. Present in the image from
-        # stage 02's ROCm meta-package but never linked until now: a
-        # case-insensitive search of this tree for hipblas|rocblas|hipblaslt
-        # returned nothing before this commit.
-        #
-        # Linked inside the hipTensor block deliberately. The GEMM route
-        # replaces the four hiptensorContraction calls in
-        # execute_contraction_planes with four hipblas*gemm calls on the SAME
-        # split-complex planes, so it is an alternative dispatch for a path
-        # that only exists when AER_HIPTENSOR is defined. It is not a separate
-        # backend and must not be selectable without one.
-        #
-        # The target name varies by ROCm version exactly as hipTensor's does,
-        # so the same three-way fallback applies. A miss is a warning, not a
-        # fatal error: without AER_HIPBLAS the contractor keeps the
-        # hiptensorContraction path and every existing capability is unchanged.
-        find_package(hipblas QUIET)
-        if(TARGET roc::hipblas)
-          list(APPEND AER_LIBRARIES roc::hipblas)
-          list(APPEND ROCM_EXTRA_DEFS -DAER_HIPBLAS)
-          message(STATUS "hipBLAS found (roc::hipblas) - GEMM contraction route enabled")
-        elseif(TARGET hipblas)
-          list(APPEND AER_LIBRARIES hipblas)
-          list(APPEND ROCM_EXTRA_DEFS -DAER_HIPBLAS)
-          message(STATUS "hipBLAS found (hipblas) - GEMM contraction route enabled")
-        else()
-          find_library(HIPBLAS_LIB hipblas
-            HINTS ${ROCM_PATH}/lib ${ROCM_PATH}/hipblas/lib)
-          if(HIPBLAS_LIB)
-            list(APPEND AER_LIBRARIES ${HIPBLAS_LIB})
-            list(APPEND ROCM_EXTRA_DEFS -DAER_HIPBLAS)
-            include_directories(${ROCM_PATH}/include)
-            message(STATUS "hipBLAS found (${HIPBLAS_LIB}) - GEMM contraction route enabled")
-          else()
-            message(WARNING
-              "hipBLAS was not found. The GEMM contraction route will not be "
-              "compiled in and contraction stays on hiptensorContraction.")
-          endif()
-        endif()
+      # hipBLAS IS the contraction backend (aer-0057/0059/0060). A miss is
+      # FATAL: there is no fallback engine, and the header #error would fire
+      # anyway -- fail here with the clearer message. The target name varies
+      # by ROCm version, hence the three-way fallback.
+      find_package(hipblas QUIET)
+      if(TARGET roc::hipblas)
+        list(APPEND AER_LIBRARIES roc::hipblas)
+        list(APPEND ROCM_EXTRA_DEFS -DAER_HIPBLAS)
+        message(STATUS "hipBLAS found (roc::hipblas) - tensor-network GEMM backend")
+      elseif(TARGET hipblas)
+        list(APPEND AER_LIBRARIES hipblas)
+        list(APPEND ROCM_EXTRA_DEFS -DAER_HIPBLAS)
+        message(STATUS "hipBLAS found (hipblas) - tensor-network GEMM backend")
       else()
-        message(WARNING
-          "AER_ENABLE_HIPTENSOR is set but hipTensor was not found. "
-          "Tensor network support will not be available for ROCm builds.")
+        find_library(HIPBLAS_LIB hipblas
+          HINTS ${ROCM_PATH}/lib ${ROCM_PATH}/hipblas/lib)
+        if(HIPBLAS_LIB)
+          list(APPEND AER_LIBRARIES ${HIPBLAS_LIB})
+          list(APPEND ROCM_EXTRA_DEFS -DAER_HIPBLAS)
+          include_directories(${ROCM_PATH}/include)
+          message(STATUS "hipBLAS found (${HIPBLAS_LIB}) - tensor-network GEMM backend")
+        else()
+          message(FATAL_ERROR
+            "hipBLAS was not found. hipBLAS is the tensor-network contraction "
+            "backend since aer-0057; there is no fallback engine. Fix the "
+            "hipBLAS discovery (ROCM_PATH=${ROCM_PATH}).")
+        endif()
       endif()
     endif()
 	
