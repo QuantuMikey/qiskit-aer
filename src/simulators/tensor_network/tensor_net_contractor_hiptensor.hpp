@@ -861,7 +861,6 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
     // m6n6k6-grammar-compliant. K-block tiles set accumulate=true so their
     // partial products sum into the same C sub-region; M/N-block tiles write
     // disjoint C sub-regions (accumulate=false).
-    std::vector<Tile> tiles;
     // aer-0060: the Tile machinery is deleted; every step runs whole on the
     // GEMM route.
   };
@@ -3225,11 +3224,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     if (tn_debug()) {
       fprintf(stderr,
               "[AER_TN_DEBUG]   step %zu exec: "
-              "A_re=%p B_re=%p C_re=%p ws=%p ws_sz=%lu modes_c=%s "
+              "A_re=%p B_re=%p C_re=%p modes_c=%s "
               "strided=%c%c\n",
               step, (void *)all_planes[left].re, (void *)all_planes[right].re,
               (void *)all_planes[result_idx].re,
-              workspace, (unsigned long)ws_size,
               modes_to_str(ps.modes_c).c_str(),
               ps.strides_a.empty() ? '-' : 'A',
               ps.strides_b.empty() ? '-' : 'B');
