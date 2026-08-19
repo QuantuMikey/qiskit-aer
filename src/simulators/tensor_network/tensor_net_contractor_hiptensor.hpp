@@ -44,6 +44,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <unistd.h> // aer-0064: getpid for race-free plan temp names
 
 #include <hip/hip_runtime.h>
 
@@ -2600,23 +2601,46 @@ bool TensorNetContractor_HipTensor<data_t>::agree_plan_cache_hit(
 }
 #endif
 
-// aer-0049: replay leg. Reads AER_TN_PLAN_FILE and, if it decodes and keys
-// onto the current network, installs it as plan_. Returns false (fresh search)
-// on any of: knob unset, bypass set, file absent, wrong key, malformed file,
-// unresolvable sliced coordinates. Every refusal except "knob unset / file
-// absent" prints its reason unconditionally — replaying a plan is a
-// deliberate, high-stakes act and a silent fall-through to a scattered search
-// would make the pinned run's numbers wrong without a trace.
+// aer-0049: replay leg. Reads the pinned plan (AER_TN_PLAN_FILE, or the
+// aer-0064 AER_TN_PLAN_DIR entry for this topology) and, if it decodes and
+// keys onto the current network, installs it as plan_. Returns false (fresh
+// search) on any of: no persistence configured, bypass set, file absent,
+// wrong key, malformed file, unresolvable sliced coordinates. Every refusal
+// except "not configured / file absent" prints its reason unconditionally —
+// replaying a plan is a deliberate, high-stakes act and a silent
+// fall-through to a scattered search would make the pinned run's numbers
+// wrong without a trace.
+//
+// aer-0064 ordering note: the key is computed BEFORE any file I/O, because
+// in directory mode the key IS the file name. This also moves the
+// not-keyable refusal ahead of the read, which is the more honest order —
+// an unkeyable network could never have matched any file's key anyway.
 //
 // MPI: rank 0 reads the bytes and broadcasts them; every rank then parses the
 // SAME bytes against its own network (identical on every rank by
 // construction), so the verdict is deterministic and uniform with no further
-// agreement collective. Callers must invoke this only under rank-uniform
-// conditions — see the call site in setup_contraction.
+// agreement collective. The key and therefore the resolved path are uniform
+// across ranks for the same reason. Callers must invoke this only under
+// rank-uniform conditions — see the call site in setup_contraction.
 template <typename data_t>
 bool TensorNetContractor_HipTensor<data_t>::try_load_plan_file(bool engaged) {
-  const std::string path = tn_plan_file();
-  if (path.empty() || plan_file_bypass_)
+  if (plan_file_bypass_)
+    return false;
+  if (tn_plan_file().empty() && tn_plan_dir().empty())
+    return false;
+
+  const size_t elem_bytes = 2 * sizeof(data_t);
+  const std::string key =
+      plan_file_network_key(network_desc_, engaged, elem_bytes);
+  if (key.empty()) {
+    if (myrank_ == 0)
+      fprintf(stderr,
+              "[AER_TN_PLAN_FILE] this network is not keyable; no plan can be "
+              "replayed for it; searching fresh\n");
+    return false;
+  }
+  const std::string path = tn_plan_path_for_key(key);
+  if (path.empty())
     return false;
 
   std::string text;
@@ -2651,17 +2675,6 @@ bool TensorNetContractor_HipTensor<data_t>::try_load_plan_file(bool engaged) {
     text = ss.str();
   }
 
-  const size_t elem_bytes = 2 * sizeof(data_t);
-  const std::string key =
-      plan_file_network_key(network_desc_, engaged, elem_bytes);
-  if (key.empty()) {
-    if (myrank_ == 0)
-      fprintf(stderr,
-              "[AER_TN_PLAN_FILE] this network is not keyable; ignoring %s and "
-              "searching fresh\n",
-              path.c_str());
-    return false;
-  }
   std::string why;
   ContractionPlan replayed;
   if (!plan_file_decode(text, network_desc_, key, replayed, why)) {
@@ -2692,8 +2705,22 @@ bool TensorNetContractor_HipTensor<data_t>::try_load_plan_file(bool engaged) {
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
     bool engaged) {
-  const std::string path = tn_plan_file();
-  if (path.empty() || plan_file_bypass_ || myrank_ != 0)
+  if (plan_file_bypass_ || myrank_ != 0)
+    return;
+  if (tn_plan_file().empty() && tn_plan_dir().empty())
+    return;
+  // aer-0064: key before path — in directory mode the key IS the file name.
+  const size_t elem_bytes = 2 * sizeof(data_t);
+  const std::string key =
+      plan_file_network_key(network_desc_, engaged, elem_bytes);
+  if (key.empty()) {
+    fprintf(stderr,
+            "[AER_TN_PLAN_FILE] this network is not keyable; plan not "
+            "captured\n");
+    return;
+  }
+  const std::string path = tn_plan_path_for_key(key);
+  if (path.empty())
     return;
   {
     std::ifstream probe(path.c_str());
@@ -2714,16 +2741,6 @@ void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
             (unsigned long long)tn_plan_file_max_tiles(), path.c_str());
     return;
   }
-  const size_t elem_bytes = 2 * sizeof(data_t);
-  const std::string key =
-      plan_file_network_key(network_desc_, engaged, elem_bytes);
-  if (key.empty()) {
-    fprintf(stderr,
-            "[AER_TN_PLAN_FILE] this network is not keyable; plan not "
-            "captured to %s\n",
-            path.c_str());
-    return;
-  }
   std::string text;
   if (!plan_file_encode(network_desc_, key, plan_, text)) {
     fprintf(stderr,
@@ -2733,7 +2750,16 @@ void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
             path.c_str());
     return;
   }
-  const std::string tmp = path + ".tmp";
+  // aer-0064: the temp name carries the pid so that concurrent processes
+  // capturing the SAME topology (e.g. two array shards racing on first
+  // contact) never interleave writes into one temp file. Each writes its own
+  // self-consistent temp; rename is atomic within a directory on Lustre, so
+  // last rename wins with a valid file either way. The previous fixed
+  // "path.tmp" name was safe only because AER_TN_PLAN_FILE launchers happened
+  // to serialize captures; a shared plan directory removes that accident.
+  std::ostringstream tmpname;
+  tmpname << path << ".tmp." << (unsigned long)getpid();
+  const std::string tmp = tmpname.str();
   {
     std::ofstream f(tmp.c_str(), std::ios::trunc);
     if (!f) {

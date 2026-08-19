@@ -1037,6 +1037,78 @@ static std::string tn_plan_file() {
   return cached;
 }
 
+// aer-0064: AER_TN_PLAN_DIR — the plan LIBRARY. AER_TN_PLAN_FILE stores one
+// plan for one topology, which forced launchers evaluating many classes to
+// either forgo persistence for all but one class or to shard one class per
+// process purely to own a file name. The measured stake (job 21381487,
+// rand3 n=10000 p=4): 81 classes, 2377 s of path search against 10 s of
+// contraction, and a captured plan replaying in 6 ms where its search took
+// 26 s. With a directory, ONE process evaluating all classes captures every
+// plan on first contact and replays all of them forever after.
+//
+// Semantics: each network resolves to <dir>/plan_<fnv1a64(key)>.ctg, where
+// key is the same canonical topology key AER_TN_PLAN_FILE uses (aer-0057
+// pinning included), so a file is bit-identical to what AER_TN_PLAN_FILE
+// would have written for that topology — only the naming is new. Capture,
+// replay, the capture-once rule, the AER_TN_PLAN_FILE_MAX_TILES gate, the
+// bypass flag and every refusal message behave exactly as for
+// AER_TN_PLAN_FILE. Precedence: AER_TN_PLAN_FILE, when set, wins — it is
+// the explicit, single-topology instruction and existing scripts must not
+// change meaning; the directory is consulted only when the file knob is
+// unset. The directory must exist; a missing directory fails the capture
+// write with the existing "cannot open" message and costs nothing else.
+//
+// Concurrency: concurrent processes capturing DIFFERENT topologies write
+// different file names and never interact. Concurrent captures of the SAME
+// topology are serialized by the per-process temp name (see aer-0064 in
+// maybe_write_plan_file); last rename wins with a self-consistent file.
+static std::string tn_plan_dir() {
+  static bool checked = false;
+  static std::string cached;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_PLAN_DIR");
+    if (v != nullptr && v[0] != '\0') {
+      cached = v;
+      // normalize: exactly one separator will be appended at use
+      while (cached.size() > 1 && cached.back() == '/')
+        cached.pop_back();
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+// FNV-1a 64-bit over the canonical key string. Chosen because it is
+// dependency-free, stable across platforms and compilers (the key is ASCII
+// text), and collisions across the handful-to-hundreds of topologies a
+// campaign holds are vanishingly unlikely; a collision would surface as the
+// existing loud "does not replay onto this network" refusal, never as a
+// wrong plan, because the full key is verified inside the file on decode.
+static std::string tn_plan_key_hash(const std::string &key) {
+  uint64_t h = 14695981039346656037ull;
+  for (size_t i = 0; i < key.size(); i++) {
+    h ^= static_cast<uint64_t>(static_cast<unsigned char>(key[i]));
+    h *= 1099511628211ull;
+  }
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
+  return std::string(buf);
+}
+
+// Resolve the plan path for a network key under the precedence rule above.
+// Empty means "no plan persistence configured". Callers must already hold a
+// non-empty key (the not-keyable refusal happens before path resolution in
+// directory mode, since the path cannot exist without a key).
+static std::string tn_plan_path_for_key(const std::string &key) {
+  const std::string file = tn_plan_file();
+  if (!file.empty())
+    return file;
+  const std::string dir = tn_plan_dir();
+  if (dir.empty())
+    return std::string();
+  return dir + "/plan_" + tn_plan_key_hash(key) + ".ctg";
+}
+
 // aer-0051: optional capture-quality gate. The scattered search can land
 // anywhere in a config's runnable window (the 6x5 p=2 capture landed 64
 // slices / 152,390 tiles where the sizer's sweet-spot row was 2048 / 24,261
