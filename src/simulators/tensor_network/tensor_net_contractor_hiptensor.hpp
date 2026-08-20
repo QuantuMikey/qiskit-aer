@@ -2659,7 +2659,14 @@ bool TensorNetContractor_HipTensor<data_t>::try_load_plan_file(bool engaged) {
               "replayed for it; searching fresh\n");
     return false;
   }
-  const std::string path = tn_plan_path_for_key(key);
+  // aer-0068: width-exact entry first, untagged legacy entry second. Both
+  // resolve identically in AER_TN_PLAN_FILE mode (file wins, width ignored),
+  // so the candidate list degenerates to one path there. The chosen path is
+  // decided by rank 0 alone (it is the only reader); the bytes it broadcasts
+  // carry the full key, so every rank verifies the SAME plan regardless of
+  // which candidate supplied it.
+  std::string path = tn_plan_path_for_key(key, nprocs_ > 1 ? nprocs_ : 0);
+  const std::string path_fallback = tn_plan_path_for_key(key);
   if (path.empty())
     return false;
 
@@ -2670,6 +2677,10 @@ bool TensorNetContractor_HipTensor<data_t>::try_load_plan_file(bool engaged) {
     int64_t len = -1;
     if (myrank_ == 0) {
       std::ifstream f(path.c_str());
+      if (!f && path_fallback != path) {
+        path = path_fallback;
+        f.open(path.c_str());
+      }
       if (f) {
         std::ostringstream ss;
         ss << f.rdbuf();
@@ -2688,6 +2699,10 @@ bool TensorNetContractor_HipTensor<data_t>::try_load_plan_file(bool engaged) {
 #endif
   if (!have_text) {
     std::ifstream f(path.c_str());
+    if (!f && path_fallback != path) {
+      path = path_fallback;
+      f.open(path.c_str());
+    }
     if (!f)
       return false;
     std::ostringstream ss;
@@ -2739,7 +2754,11 @@ void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
             "captured\n");
     return;
   }
-  const std::string path = tn_plan_path_for_key(key);
+  // aer-0068: captures are width-tagged under MPI so each width owns its
+  // entry; the capture-once probe checks the SAME name that this width's
+  // loads will try first.
+  const std::string path =
+      tn_plan_path_for_key(key, nprocs_ > 1 ? nprocs_ : 0);
   if (path.empty())
     return;
   {

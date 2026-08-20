@@ -1099,14 +1099,33 @@ static std::string tn_plan_key_hash(const std::string &key) {
 // Empty means "no plan persistence configured". Callers must already hold a
 // non-empty key (the not-keyable refusal happens before path resolution in
 // directory mode, since the path cannot exist without a key).
-static std::string tn_plan_path_for_key(const std::string &key) {
+//
+// aer-0068: width tag. A captured plan keeps its slice count, and slicing is
+// decided against the capture-time rank count (MIN_SLICES_PER_RANK forces
+// >= 1 slice per rank AT PLAN TIME only) -- so a plan library is inherently
+// width-locked: replaying an 8-slice plan at 16 ranks lands in the
+// slices < ranks idle configuration (defined and loud since aer-0067, but
+// half the node does nothing), and replaying it at 1 rank drags the forced
+// 8-way recompute overhead forever. Directory entries therefore carry the
+// capture width in the name: plan_<hash>.r<N>.ctg for N > 1, untagged for
+// single-rank captures. Loads try the width-exact name first and fall back
+// to the untagged name, so pre-0068 libraries (all untagged) keep working
+// at every width they worked at before; what changes is that a run at a NEW
+// width misses, searches AT that width, and captures its own entry instead
+// of silently inheriting a mismatched one. AER_TN_PLAN_FILE stays width-
+// blind: an explicit file is an explicit instruction.
+static std::string tn_plan_path_for_key(const std::string &key,
+                                        int width = 0) {
   const std::string file = tn_plan_file();
   if (!file.empty())
     return file;
   const std::string dir = tn_plan_dir();
   if (dir.empty())
     return std::string();
-  return dir + "/plan_" + tn_plan_key_hash(key) + ".ctg";
+  std::string name = dir + "/plan_" + tn_plan_key_hash(key);
+  if (width > 1)
+    name += ".r" + std::to_string(width);
+  return name + ".ctg";
 }
 
 // aer-0051: optional capture-quality gate. The scattered search can land
