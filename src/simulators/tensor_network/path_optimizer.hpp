@@ -507,42 +507,6 @@ static std::string path_minimize() {
 // for fast iteration; raise toward 128/60 for a hard high-treewidth network
 // where plan quality dominates. Read once and cached, so a process uses one
 // consistent budget.
-// aer-0065: MPI-cooperative path search. When ON (default) and nprocs > 1,
-// MPIParallelPathOptimizer divides the AER_TN_PATH_MAX_REPEATS trial budget
-// across ranks -- rank r runs ~budget/R trials on its own seed stream
-// (seed + r, the offset that already exists) and the MINLOC(total_flops)
-// collective picks the winner, so the SAME total trial count finishes in
-// ~1/R the wall. Measured stake (job 21381487, rand3 n=10000 p=4): 81
-// classes x ~15-38 s of search, every rank redundantly searching the full
-// budget -- 99.6% of a 40-minute stage, against 10 s of contraction.
-//
-// SEMANTICS CHANGE, stated plainly: under MPI, AER_TN_PATH_MAX_REPEATS now
-// means the TOTAL trial budget across ranks, where the legacy ensemble ran
-// budget x R total (full budget per rank, more diversity, no wall saving).
-// The legacy behaviour is exactly recovered two ways: AER_TN_PATH_MPI_SHARD=0,
-// or shard ON with MAX_REPEATS raised R-fold (identical diversity, same wall
-// as one legacy rank). AER_TN_PATH_MAX_TIME stays a PER-RANK cap -- it is a
-// ceiling, not a target; a time-bound search that used to hit the cap now
-// finishes its smaller shard early, which is the point.
-//
-// Determinism: the drawn plan is a deterministic function of (seed, R,
-// budget) -- reproducible at fixed rank count, DIFFERENT across rank counts
-// (as the legacy ensemble's MINLOC winner already was). Cross-width
-// reproducibility is plan capture's job (AER_TN_PLAN_FILE / AER_TN_PLAN_DIR),
-// unchanged: the captured plan is the MINLOC winner, so first contact pays
-// one sharded search and every later run at ANY width replays it.
-static int tn_path_mpi_shard() {
-  static bool checked = false;
-  static int cached = 1;
-  if (!checked) {
-    const char *v = std::getenv("AER_TN_PATH_MPI_SHARD");
-    if (v != nullptr && v[0] != '\0')
-      cached = (std::strcmp(v, "0") == 0) ? 0 : 1;
-    checked = true;
-  }
-  return cached;
-}
-
 static int path_max_repeats() {
   static bool checked = false;
   static int cached = 64;
@@ -1308,9 +1272,14 @@ public:
   // budget; the default is the whole budget. A no-op base so optimizers that
   // have no trial budget (or tests) need not care; MPIParallelPathOptimizer
   // is the only caller. Idempotent -- set before every find_path delegation.
-  virtual void set_trial_share(int shard, int num_shards) {
+  // aer-0066: returns whether the share was ACCEPTED, so the caller's log can
+  // tell cooperative sharding (Coteng) from the legacy full-budget ensemble
+  // (the Greedy fallback, which has restarts, not a shardable trial budget)
+  // instead of announcing a division that is not happening.
+  virtual bool set_trial_share(int shard, int num_shards) {
     (void)shard;
     (void)num_shards;
+    return false;
   }
   // tiling_available: when false, the planner's >12-free-mode gate throws
   // NeedsTilingException (AUTO) or a hard refusal (OFF, decided by the caller);
@@ -1394,9 +1363,10 @@ public:
 
   // aer-0065: ceil-split so every shard gets >= 1 trial and the shares sum
   // exactly to max_repeats_ (the first budget%shards shards carry one extra).
-  void set_trial_share(int shard, int num_shards) override {
+  bool set_trial_share(int shard, int num_shards) override {
     trial_shard_ = (shard >= 0) ? shard : 0;
     trial_shards_ = (num_shards >= 1) ? num_shards : 1;
+    return true;
   }
 
   int effective_max_repeats() const {
@@ -2083,6 +2053,48 @@ private:
 
 #ifdef AER_MPI
 
+// aer-0065: MPI-cooperative path search. When ON (default) and nprocs > 1,
+// MPIParallelPathOptimizer divides the AER_TN_PATH_MAX_REPEATS trial budget
+// across ranks -- rank r runs ~budget/R trials on its own seed stream
+// (seed + r, the offset that already exists) and the MINLOC(total_flops)
+// collective picks the winner, so the SAME total trial count finishes in
+// ~1/R the wall. Measured stake (job 21381487, rand3 n=10000 p=4): 81
+// classes x ~15-38 s of search, every rank redundantly searching the full
+// budget -- 99.6% of a 40-minute stage, against 10 s of contraction.
+//
+// SEMANTICS CHANGE, stated plainly: under MPI, AER_TN_PATH_MAX_REPEATS now
+// means the TOTAL trial budget across ranks, where the legacy ensemble ran
+// budget x R total (full budget per rank, more diversity, no wall saving).
+// The legacy behaviour is exactly recovered two ways: AER_TN_PATH_MPI_SHARD=0,
+// or shard ON with MAX_REPEATS raised R-fold (identical diversity, same wall
+// as one legacy rank). AER_TN_PATH_MAX_TIME stays a PER-RANK cap -- it is a
+// ceiling, not a target; a time-bound search that used to hit the cap now
+// finishes its smaller shard early, which is the point.
+//
+// Determinism: the drawn plan is a deterministic function of (seed, R,
+// budget) -- reproducible at fixed rank count, DIFFERENT across rank counts
+// (as the legacy ensemble's MINLOC winner already was). Cross-width
+// reproducibility is plan capture's job (AER_TN_PLAN_FILE / AER_TN_PLAN_DIR),
+// unchanged: the captured plan is the MINLOC winner, so first contact pays
+// one sharded search and every later run at ANY width replays it.
+static int tn_path_mpi_shard() {
+  static bool checked = false;
+  static int cached = 1;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_PATH_MPI_SHARD");
+    if (v != nullptr && v[0] != '\0')
+      // plain char test, not strcmp: this file never included <cstring>
+      // and should not grow the dependency for a one-character compare.
+      cached = (v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    checked = true;
+  }
+  return cached;
+}
+
+// aer-0066: defined inside the AER_MPI section because it is the file's
+// only helper with no non-MPI caller -- at file scope it would be the one
+// static function -Wall flags as unused in every non-MPI TU.
+
 class MPIParallelPathOptimizer : public PathOptimizer {
   std::unique_ptr<PathOptimizer> inner_;
   MPI_Comm comm_;
@@ -2106,16 +2118,23 @@ public:
     // flips nothing still states its intent every call, and the knob's OFF
     // value exactly restores the legacy full-budget-per-rank ensemble.
     if (tn_path_mpi_shard() && size > 1) {
-      inner_->set_trial_share(rank, size);
-      if (path_verbose() && rank == 0)
-        fprintf(stderr,
-                "[AER_TN_PATH] MPI cooperative search: %d total trials "
-                "sharded across %d ranks (~%d each), per-rank seeds %lu..%lu; "
-                "AER_TN_PATH_MPI_SHARD=0 restores the legacy full-budget "
-                "ensemble\n",
-                path_max_repeats(), size,
-                (path_max_repeats() + size - 1) / size, (unsigned long)seed,
-                (unsigned long)(seed + size - 1));
+      const bool accepted = inner_->set_trial_share(rank, size);
+      if (path_verbose() && rank == 0) {
+        if (accepted)
+          fprintf(stderr,
+                  "[AER_TN_PATH] MPI cooperative search: %d total trials "
+                  "sharded across %d ranks (~%d each), per-rank seeds "
+                  "%lu..%lu; AER_TN_PATH_MPI_SHARD=0 restores the legacy "
+                  "full-budget ensemble\n",
+                  path_max_repeats(), size,
+                  (path_max_repeats() + size - 1) / size, (unsigned long)seed,
+                  (unsigned long)(seed + size - 1));
+        else
+          fprintf(stderr,
+                  "[AER_TN_PATH] MPI: inner optimizer has no shardable trial "
+                  "budget (greedy fallback); legacy full-budget-per-rank "
+                  "ensemble\n");
+      }
     } else {
       inner_->set_trial_share(0, 1);
     }
