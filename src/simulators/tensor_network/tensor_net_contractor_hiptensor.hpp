@@ -1641,6 +1641,26 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           slice_begin_ = myrank_ * plan_.num_slices / nprocs_;
           slice_end_ = (myrank_ + 1) * plan_.num_slices / nprocs_;
 
+          // aer-0067: slices < ranks is now a DEFINED configuration, stated
+          // out loud. The integer partition above hands the surplus ranks an
+          // EMPTY range (begin == end); contract_all() takes a structural
+          // inert path for them (zero partial, join the reductions), so the
+          // distributed sum stays exact. This is correct but wasteful -- it
+          // arises from replaying a plan captured at a smaller width (plan
+          // libraries are width-locked; aer-0068's width tags keep libraries
+          // per-width so wide runs re-search instead of landing here). Job
+          // 21401164 stage 3 ran exactly this shape (1 slice, 8 ranks) to a
+          // bit-exact result; this line is what was missing from its log.
+          if (plan_.num_slices < (uint_t)nprocs_ && myrank_ == 0)
+            fprintf(stderr,
+                    "[AER_TN] plan has %lu slice(s) for %d ranks: %lu rank(s) "
+                    "hold an empty slice range and contribute a zero partial. "
+                    "Correct but idle -- the plan predates this width; "
+                    "re-search at this width (or use a width-matched "
+                    "AER_TN_PLAN_DIR library) for full utilisation\n",
+                    (unsigned long)plan_.num_slices, nprocs_,
+                    (unsigned long)((uint_t)nprocs_ - plan_.num_slices));
+
       // [MPI DIAG] AER_TN_MPI_DIAG_FULLSLICE forces every rank to contract the
       // whole slice range; contract() then skips the cross-rank reduction, so
       // each rank independently reproduces the single-GCD result. A rank whose
@@ -3138,6 +3158,20 @@ TensorNetContractor_HipTensor<data_t>::create_optimizer() {
 
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract_all() {
+  // aer-0067: structural inert path for an empty slice range. Before this,
+  // an idle rank was inert only INCIDENTALLY (the device loop zeroed the
+  // buffer and the inner slice loop never ran); any future edit to the loop
+  // could silently break that. Now the property is explicit: zero the
+  // primary partial so the cross-rank sum sees exactly zero, touch nothing
+  // else, return.
+  if (slice_end_ <= slice_begin_) {
+    hipSetDevice(gpu_mgr_.device(0).device_id());
+    auto &out_buf = gpu_mgr_.device(0).output_buffer();
+    thrust::fill(thrust_gpu::par.on(gpu_mgr_.device(0).stream()),
+                 out_buf.begin(), out_buf.begin() + out_size_,
+                 thrust::complex<data_t>(0.0, 0.0));
+    return;
+  }
   for (int idev = 0; idev < num_devices_used_; idev++) {
     uint_t dev_slice_begin =
         slice_begin_ + (slice_end_ - slice_begin_) * idev / num_devices_used_;
