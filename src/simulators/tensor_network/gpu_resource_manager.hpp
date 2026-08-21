@@ -310,22 +310,26 @@ struct PoolAllocation {
 class MemoryPool {
   void *pool_ptr_;
   size_t pool_size_;
+  size_t capacity_;    // aer-0070: arena high-water (bytes actually malloc'd)
+  uint64_t epoch_;     // aer-0070: base-pointer generation
   int device_id_;
   bool allocated_;
   std::vector<PoolAllocation> allocations_;
 
 public:
-  MemoryPool() : pool_ptr_(nullptr), pool_size_(0), device_id_(0),
-                 allocated_(false) {}
+  MemoryPool() : pool_ptr_(nullptr), pool_size_(0), capacity_(0), epoch_(0),
+                 device_id_(0), allocated_(false) {}
   ~MemoryPool() { release(); }
   MemoryPool(const MemoryPool &) = delete;
   MemoryPool &operator=(const MemoryPool &) = delete;
   MemoryPool(MemoryPool &&other) noexcept
       : pool_ptr_(other.pool_ptr_), pool_size_(other.pool_size_),
+        capacity_(other.capacity_), epoch_(other.epoch_),
         device_id_(other.device_id_), allocated_(other.allocated_),
         allocations_(std::move(other.allocations_)) {
     other.pool_ptr_ = nullptr;
     other.allocated_ = false;
+    other.capacity_ = 0;
   }
 
   void plan_layout(
@@ -368,13 +372,48 @@ public:
     }
   }
 
+  // aer-0070: grow-only arena, mirroring copy_tensor_data's existing slab
+  // pattern. If the new layout fits the current capacity, the base pointer
+  // is INTENTIONALLY kept -- get_tensor_ptr() offsets are recomputed per
+  // plan_layout(), so a returning topology sees identical slot addresses,
+  // which is what lets aer-0069's captured graphs survive a class switch.
+  // A larger layout frees and re-mallocs, bumping the epoch so every baked
+  // pointer is declared dead. This also fixes a leak: the previous code
+  // hipMalloc'd a fresh pool per topology cache-miss without freeing the
+  // old one. AER_TN_POOL_ARENA=0 restores alloc-per-topology (leak still
+  // fixed): the epoch then moves on every switch, which reproduces the
+  // pre-0070 graph lifetime for A/B purposes.
+  static bool arena_enabled() {
+    static bool checked = false;
+    static bool cached = true;
+    if (!checked) {
+      const char *v = std::getenv("AER_TN_POOL_ARENA");
+      cached = !(v != nullptr && v[0] == '0');
+      checked = true;
+    }
+    return cached;
+  }
+
   void allocate(int device_id) {
     device_id_ = device_id;
     if (pool_size_ == 0) return;
+    if (allocated_ && pool_ptr_ != nullptr && arena_enabled() &&
+        pool_size_ <= capacity_)
+      return;
     hipSetDevice(device_id_);
+    if (allocated_ && pool_ptr_ != nullptr) {
+      hipFree(pool_ptr_);
+      pool_ptr_ = nullptr;
+    }
     check_hip(hipMalloc(&pool_ptr_, pool_size_), "hipMalloc(pool)", device_id_);
+    capacity_ = pool_size_;
+    epoch_++;
     allocated_ = true;
   }
+
+  // aer-0070: consumers holding device addresses derived from this pool
+  // (captured graphs) compare this before trusting them.
+  uint64_t epoch() const { return epoch_; }
 
   void *get_tensor_ptr(int tensor_index) const {
     for (size_t i = 0; i < allocations_.size(); i++)
@@ -393,6 +432,8 @@ public:
       hipSetDevice(device_id_);
       hipFree(pool_ptr_);
       pool_ptr_ = nullptr;
+      capacity_ = 0;
+      epoch_++;
       allocated_ = false;
     }
     allocations_.clear();
@@ -585,6 +626,7 @@ template <typename data_t> class GPUDevice {
   std::vector<bool> peer_access_;
   void *tensor_data_ptr_;
   size_t tensor_data_size_;
+  uint64_t tensor_data_epoch_ = 0; // aer-0070: slab base generation
 
   thrust::device_vector<thrust::complex<data_t>> dev_out_;
   thrust::device_vector<double> sampling_rnds_;
@@ -698,6 +740,13 @@ public:
       check_hip(hipMalloc(&tensor_data_ptr_, total_bytes),
                 "hipMalloc(tensor_data)", device_id_);
       tensor_data_size_ = total_bytes;
+      // aer-0070: slab base moved; input pointers baked into captured
+      // graphs are dead. Same-or-smaller layouts keep the base, and the
+      // per-tensor offsets are a deterministic function of the tensor
+      // sequence -- a returning topology's H2D refresh lands in the SAME
+      // slots, which is why captured graphs stay valid across angle
+      // changes (rebinding refreshes DATA, not pointers).
+      tensor_data_epoch_++;
     }
 
     std::vector<void *> ptrs;
@@ -744,6 +793,8 @@ public:
     check_hip(hipMemGetInfo(&free_memory_, &total), "hipMemGetInfo", device_id_);
     return ptrs;
   }
+
+  uint64_t tensor_data_epoch() const { return tensor_data_epoch_; }
 
   void copy_tensor_data_from(const GPUDevice<data_t> &src) {
     hipSetDevice(device_id_);

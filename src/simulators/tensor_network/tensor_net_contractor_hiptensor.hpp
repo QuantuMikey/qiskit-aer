@@ -43,6 +43,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility> // aer-0070: std::pair graph keys
 #include <vector>
 #include <unistd.h> // aer-0064: getpid for race-free plan temp names
 
@@ -717,8 +718,19 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
     hipGraphExec_t exec = nullptr;
     int visits = 0;
   };
-  std::vector<std::map<uint64_t, StepGraph>> step_graphs_;
+  // aer-0070: keyed by (topology key, slice) per device, so graphs SURVIVE
+  // class switches -- the cycling workload (optimize loops, decode) is the
+  // whole point. Validity rests on two generations checked per contraction:
+  // the pool arena epoch and the input-slab epoch; either moving means some
+  // baked pointer died, and every graph on that device is dropped. The
+  // topology key is the same canonical string the plan file uses, set on
+  // the setup cache-miss path; an unkeyable network keeps graphs off.
+  std::vector<std::map<std::pair<std::string, uint64_t>, StepGraph>>
+      step_graphs_;
+  std::vector<std::pair<uint64_t, uint64_t>> step_graph_epochs_;
+  std::string graph_topo_key_;
   bool step_graphs_disabled_ = false;
+  uint64_t prof_graph_captures_ = 0;
 
   // aer-0047: the (t_setup_ms - t_path_ms) remainder, itemised. It is 41-57
   // percent of runtime at p=2 and had no counter of any kind. All three are
@@ -1350,6 +1362,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_reduce_gpu_ms_ = 0.0;
     prof_reduce_mpi_ms_ = 0.0;
     prof_graph_replays_ = 0;
+    prof_graph_captures_ = 0;
     prof_specs_ms_ = 0.0;
     prof_prebuild_ms_ = 0.0;
     prof_pool_ms_ = 0.0;
@@ -1620,6 +1633,12 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           pool_ready_ = false;
           cache_topology();
           prev_engaged_ = engaged;
+          // aer-0070: graph-library key for this topology (empty = graphs
+          // off for it). Same canonical key as the plan file, so one
+          // topology has one identity everywhere.
+          graph_topo_key_ =
+              plan_file_network_key(network_desc_, engaged,
+                                    2 * sizeof(data_t));
         } catch (const NeedsTilingException &) {
           // Nothing in 3a raises this today -- the slice ceiling is a
           // runtime_error and cache_topology only copies vectors. It is handled
@@ -1863,11 +1882,11 @@ void TensorNetContractor_HipTensor<data_t>::build_sliced_specs() {
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                                                                  bool tiling_available) {
-  // aer-0069: the pool this pass (re)builds owns the slot pointers baked into
-  // any captured graph; drop them all before the buffers move.
-  destroy_step_graphs();
   // aer-0033: this pass rebuilds every step's tile list, so the materialised
-  // sub-block count starts from zero here.
+  // sub-block count starts from zero here. (aer-0070: captured graphs are no
+  // longer dropped here -- the arena keeps the pool base stable when the
+  // layout fits, and the epoch check in contract_single_slice catches the
+  // regrow case.)
   tiles_built_ = 0;
   gemm_steps_routed_ = 0;
   gemm_steps_declined_tiled_ = 0;
@@ -2958,7 +2977,7 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           "gflops_local=%.3f out_size=%lu "
           "gemm_route=%d t_gemm_ms=%.3f gemm_calls=%lu ht_calls=%lu "
           "t_specs_ms=%.3f t_prebuild_ms=%.3f t_pool_ms=%.3f "
-          "graph_replays=%lu\n",
+          "graph_replays=%lu graph_captures=%lu\n",
           entrypoint, myrank_, nprocs_, num_devices_used_,
           (unsigned long)plan_.num_slices, (unsigned long)slices_local,
           plan_.total_flops, local_flops, prof_setup_ms_, prof_path_ms_,
@@ -2972,7 +2991,8 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           prof_gemm_ms_, (unsigned long)prof_gemm_calls_,
           (unsigned long)prof_ht_calls_,
           prof_specs_ms_, prof_prebuild_ms_, prof_pool_ms_,
-          (unsigned long)prof_graph_replays_);
+          (unsigned long)prof_graph_replays_,
+          (unsigned long)prof_graph_captures_);
 }
 
 template <typename data_t>
@@ -3172,9 +3192,11 @@ bool TensorNetContractor_HipTensor<data_t>::topology_matches_previous() const {
 
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::cache_topology() {
-  // aer-0069: a new plan means new step specs and slot layout; every captured
-  // graph is stale.
-  destroy_step_graphs();
+  // aer-0070: captured graphs are NOT destroyed here any more -- they are
+  // keyed by topology and their pointer validity is governed by the pool
+  // and slab epochs checked in contract_single_slice. Destroying them per
+  // class switch is exactly what kept aer-0069 at graph_replays=0 (job
+  // 21440475: 3052 profile lines, all zero).
   prev_modes_.clear();
   prev_extents_.clear();
   for (size_t i = 0; i < input_tensors_.size(); i++) {
@@ -3277,14 +3299,31 @@ void TensorNetContractor_HipTensor<data_t>::destroy_step_graphs() {
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     uint_t slice_index, int device_idx) {
-  if (!tn_hip_graph() || step_graphs_disabled_ || tn_debug()) {
+  if (!tn_hip_graph() || step_graphs_disabled_ || tn_debug() ||
+      graph_topo_key_.empty()) {
     contract_single_slice_direct(slice_index, device_idx);
     return;
   }
-  if (step_graphs_.size() <= (size_t)device_idx)
+  if (step_graphs_.size() <= (size_t)device_idx) {
     step_graphs_.resize((size_t)device_idx + 1);
+    step_graph_epochs_.resize((size_t)device_idx + 1,
+                              {(uint64_t)-1, (uint64_t)-1});
+  }
   auto &dev = gpu_mgr_.device(device_idx);
-  StepGraph &slot = step_graphs_[(size_t)device_idx][slice_index];
+  // aer-0070: generation check. Either base pointer moving kills every
+  // graph on this device -- conservative, cheap (two integer compares),
+  // and the only correctness condition graphs need.
+  const std::pair<uint64_t, uint64_t> gen{dev.pool().epoch(),
+                                          dev.tensor_data_epoch()};
+  if (step_graph_epochs_[(size_t)device_idx] != gen) {
+    for (auto &kv : step_graphs_[(size_t)device_idx])
+      if (kv.second.exec != nullptr)
+        hipGraphExecDestroy(kv.second.exec);
+    step_graphs_[(size_t)device_idx].clear();
+    step_graph_epochs_[(size_t)device_idx] = gen;
+  }
+  StepGraph &slot =
+      step_graphs_[(size_t)device_idx][{graph_topo_key_, slice_index}];
 
   if (slot.exec != nullptr) {
     if (hipGraphLaunch(slot.exec, dev.stream()) == hipSuccess) {
@@ -3333,6 +3372,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
         // capture enqueued nothing; this launch performs visit 2's work.
         if (hipGraphLaunch(exec, dev.stream()) == hipSuccess) {
           slot.exec = exec;
+          prof_graph_captures_++;
           return;
         }
         hipGraphExecDestroy(exec);
