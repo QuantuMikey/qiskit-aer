@@ -112,6 +112,26 @@ static bool tn_pool_reuse() {
 // timers are read and no GPU stream syncs are added, so the default execution
 // path is byte-for-byte unchanged in both result and performance. When on, each
 // reduction entrypoint prints a one-line per-rank phase breakdown to stderr.
+// aer-0069: opt-in HIP-graph replay of the per-slice step sequence. The
+// direct dispatch loop issues ~400 launches per contraction at ~54 us of CPU
+// launch cost each (GPU busy 0.4% on the replayed p=4 library, gflops ~0):
+// after the plan library removed path search, this launch tax IS the
+// remaining wall. A slice's step sequence is a linear async program on one
+// stream -- memset, packs, four GEMMs per step, final accumulate -- so it
+// captures into a hipGraph whose replay costs one launch. Default OFF: the
+// off path is byte-identical to pre-0069, and the on path degrades to the
+// direct loop (loudly, once) on any capture/instantiate/launch error.
+static bool tn_hip_graph() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_HIP_GRAPH");
+    cached = (v != nullptr && v[0] == '1');
+    checked = true;
+  }
+  return cached;
+}
+
 static bool tn_profile() {
   static bool checked = false;
   static bool enabled = false;
@@ -686,6 +706,19 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   double prof_contract_ms_ = 0.0;
   double prof_reduce_gpu_ms_ = 0.0;
   double prof_reduce_mpi_ms_ = 0.0;
+  uint64_t prof_graph_replays_ = 0;
+
+  // aer-0069: one instantiated graph per (device, slice), warm-captured on
+  // that slice's SECOND execution -- the first runs direct and sizes every
+  // lazy allocation (perm scratch resize, rocBLAS workspace) that would be
+  // illegal mid-capture. Invalidated whenever the plan or a pool is rebuilt
+  // (pointers baked into a graph die with the buffers they point at).
+  struct StepGraph {
+    hipGraphExec_t exec = nullptr;
+    int visits = 0;
+  };
+  std::vector<std::map<uint64_t, StepGraph>> step_graphs_;
+  bool step_graphs_disabled_ = false;
 
   // aer-0047: the (t_setup_ms - t_path_ms) remainder, itemised. It is 41-57
   // percent of runtime at p=2 and had no counter of any kind. All three are
@@ -945,6 +978,8 @@ private:
   bool topology_matches_previous() const;
   void cache_topology();
   void contract_single_slice(uint_t slice_index, int device_idx);
+  void contract_single_slice_direct(uint_t slice_index, int device_idx);
+  void destroy_step_graphs();
   void project_slice(uint_t slice_index, int device_idx,
                      std::vector<PlanePtrs> &projected);
   void accumulate_across_gpus();
@@ -1011,7 +1046,9 @@ TensorNetContractor_HipTensor<data_t>::TensorNetContractor_HipTensor()
       plan_file_bypass_(false) {}
 
 template <typename data_t>
-TensorNetContractor_HipTensor<data_t>::~TensorNetContractor_HipTensor() {}
+TensorNetContractor_HipTensor<data_t>::~TensorNetContractor_HipTensor() {
+  destroy_step_graphs();
+}
 
 template <typename data_t>
 std::vector<bool>
@@ -1312,6 +1349,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_ht_calls_ = 0;
     prof_reduce_gpu_ms_ = 0.0;
     prof_reduce_mpi_ms_ = 0.0;
+    prof_graph_replays_ = 0;
     prof_specs_ms_ = 0.0;
     prof_prebuild_ms_ = 0.0;
     prof_pool_ms_ = 0.0;
@@ -1825,6 +1863,9 @@ void TensorNetContractor_HipTensor<data_t>::build_sliced_specs() {
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                                                                  bool tiling_available) {
+  // aer-0069: the pool this pass (re)builds owns the slot pointers baked into
+  // any captured graph; drop them all before the buffers move.
+  destroy_step_graphs();
   // aer-0033: this pass rebuilds every step's tile list, so the materialised
   // sub-block count starts from zero here.
   tiles_built_ = 0;
@@ -2916,7 +2957,8 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           "t_reduce_gpu_ms=%.3f t_reduce_mpi_ms=%.3f t_total_ms=%.3f "
           "gflops_local=%.3f out_size=%lu "
           "gemm_route=%d t_gemm_ms=%.3f gemm_calls=%lu ht_calls=%lu "
-          "t_specs_ms=%.3f t_prebuild_ms=%.3f t_pool_ms=%.3f\n",
+          "t_specs_ms=%.3f t_prebuild_ms=%.3f t_pool_ms=%.3f "
+          "graph_replays=%lu\n",
           entrypoint, myrank_, nprocs_, num_devices_used_,
           (unsigned long)plan_.num_slices, (unsigned long)slices_local,
           plan_.total_flops, local_flops, prof_setup_ms_, prof_path_ms_,
@@ -2929,7 +2971,8 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
 #endif
           prof_gemm_ms_, (unsigned long)prof_gemm_calls_,
           (unsigned long)prof_ht_calls_,
-          prof_specs_ms_, prof_prebuild_ms_, prof_pool_ms_);
+          prof_specs_ms_, prof_prebuild_ms_, prof_pool_ms_,
+          (unsigned long)prof_graph_replays_);
 }
 
 template <typename data_t>
@@ -3129,6 +3172,9 @@ bool TensorNetContractor_HipTensor<data_t>::topology_matches_previous() const {
 
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::cache_topology() {
+  // aer-0069: a new plan means new step specs and slot layout; every captured
+  // graph is stale.
+  destroy_step_graphs();
   prev_modes_.clear();
   prev_extents_.clear();
   for (size_t i = 0; i < input_tensors_.size(); i++) {
@@ -3211,7 +3257,103 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
 }
 
 template <typename data_t>
+void TensorNetContractor_HipTensor<data_t>::destroy_step_graphs() {
+  for (auto &per_dev : step_graphs_)
+    for (auto &kv : per_dev)
+      if (kv.second.exec != nullptr)
+        hipGraphExecDestroy(kv.second.exec);
+  step_graphs_.clear();
+}
+
+// aer-0069: warm-capture wrapper. Visit 1 of a (device, slice) runs the
+// direct loop (sizing every lazy allocation legally); visit 2 captures the
+// direct loop into a graph, instantiates it, and launches it (stream capture
+// enqueues nothing, so the explicit launch IS this visit's execution); visit
+// 3+ is one hipGraphLaunch. Any HIP error at any stage disables graphs for
+// the process with one loud line and falls back to the direct loop, so the
+// result exists either way and the OFF/degraded path is byte-identical to
+// pre-0069. tn_debug() bypasses capture: its per-step host prints and D2H
+// dumps belong on the direct path.
+template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
+    uint_t slice_index, int device_idx) {
+  if (!tn_hip_graph() || step_graphs_disabled_ || tn_debug()) {
+    contract_single_slice_direct(slice_index, device_idx);
+    return;
+  }
+  if (step_graphs_.size() <= (size_t)device_idx)
+    step_graphs_.resize((size_t)device_idx + 1);
+  auto &dev = gpu_mgr_.device(device_idx);
+  StepGraph &slot = step_graphs_[(size_t)device_idx][slice_index];
+
+  if (slot.exec != nullptr) {
+    if (hipGraphLaunch(slot.exec, dev.stream()) == hipSuccess) {
+      prof_graph_replays_++;
+      return;
+    }
+    step_graphs_disabled_ = true;
+    destroy_step_graphs();
+    fprintf(stderr,
+            "[AER_TN] hip-graph replay launch failed on rank %d; graphs "
+            "disabled for this process, continuing on the direct dispatch "
+            "path (results unaffected)\n",
+            myrank_);
+    contract_single_slice_direct(slice_index, device_idx);
+    return;
+  }
+
+  slot.visits++;
+  if (slot.visits < 2) {
+    contract_single_slice_direct(slice_index, device_idx);
+    return;
+  }
+
+  hipGraph_t graph = nullptr;
+  hipError_t err =
+      hipStreamBeginCapture(dev.stream(), hipStreamCaptureModeThreadLocal);
+  if (err == hipSuccess) {
+    try {
+      contract_single_slice_direct(slice_index, device_idx);
+    } catch (...) {
+      // a body throw (e.g. fault injection) mid-capture: end the capture so
+      // the stream leaves capture state, then let the fail-together guard
+      // above see the original exception.
+      hipStreamEndCapture(dev.stream(), &graph);
+      if (graph != nullptr)
+        hipGraphDestroy(graph);
+      step_graphs_disabled_ = true;
+      throw;
+    }
+    err = hipStreamEndCapture(dev.stream(), &graph);
+    if (err == hipSuccess && graph != nullptr) {
+      hipGraphExec_t exec = nullptr;
+      err = hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+      hipGraphDestroy(graph);
+      if (err == hipSuccess) {
+        // capture enqueued nothing; this launch performs visit 2's work.
+        if (hipGraphLaunch(exec, dev.stream()) == hipSuccess) {
+          slot.exec = exec;
+          return;
+        }
+        hipGraphExecDestroy(exec);
+        err = hipErrorUnknown;
+      }
+    } else if (graph != nullptr) {
+      hipGraphDestroy(graph);
+    }
+  }
+  step_graphs_disabled_ = true;
+  destroy_step_graphs();
+  fprintf(stderr,
+          "[AER_TN] hip-graph capture unavailable on rank %d (%s); graphs "
+          "disabled for this process, continuing on the direct dispatch path "
+          "(results unaffected)\n",
+          myrank_, hipGetErrorString(err));
+  contract_single_slice_direct(slice_index, device_idx);
+}
+
+template <typename data_t>
+void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
     uint_t slice_index, int device_idx) {
   if (plan_.steps.empty()) return;
 
