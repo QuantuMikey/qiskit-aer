@@ -122,6 +122,22 @@ static bool tn_pool_reuse() {
 // captures into a hipGraph whose replay costs one launch. Default OFF: the
 // off path is byte-identical to pre-0069, and the on path degrades to the
 // direct loop (loudly, once) on any capture/instantiate/launch error.
+// aer-0071: opt-in process-persistent GPU state (manager + captured
+// graphs). Default OFF: OMP-parallel executor paths may run concurrent
+// contractors, and persistent pools assume one active contractor at a time.
+// The serial expval campaign flow sets it; with it off, behaviour is
+// byte-identical per-instance state, i.e. aer-0070 as shipped.
+static bool tn_gpu_persist() {
+  static bool checked = false;
+  static bool cached = false;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_GPU_PERSIST");
+    cached = (v != nullptr && v[0] == '1');
+    checked = true;
+  }
+  return cached;
+}
+
 static bool tn_hip_graph() {
   static bool checked = false;
   static bool cached = false;
@@ -694,7 +710,11 @@ static void stage_scatter(hipStream_t stream, const data_t *src_re,
 
 template <typename data_t = double>
 class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
-  GPUResourceManager<data_t> gpu_mgr_;
+  // aer-0071: the manager is a reference selected at construction --
+  // the process singleton under AER_TN_GPU_PERSIST=1, this instance's own
+  // manager otherwise. Every existing gpu_mgr_ use is unchanged.
+  GPUResourceManager<data_t> local_gpu_mgr_;
+  GPUResourceManager<data_t> &gpu_mgr_;
   int num_devices_used_;
 
   // Wall-clock phase accumulators (milliseconds) for the current contraction,
@@ -725,11 +745,24 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // baked pointer died, and every graph on that device is dropped. The
   // topology key is the same canonical string the plan file uses, set on
   // the setup cache-miss path; an unkeyable network keeps graphs off.
-  std::vector<std::map<std::pair<std::string, uint64_t>, StepGraph>>
-      step_graphs_;
-  std::vector<std::pair<uint64_t, uint64_t>> step_graph_epochs_;
+  struct GraphState {
+    std::vector<std::map<std::pair<std::string, uint64_t>, StepGraph>> maps;
+    std::vector<std::pair<uint64_t, uint64_t>> epochs;
+    bool disabled = false;
+  };
+  // aer-0071: like gpu_mgr_, the graph state is a reference selected at
+  // construction. Persistent graphs only make sense with the persistent
+  // manager (their validity is the manager's pool/slab epochs), so both
+  // follow the same knob; per-instance mode preserves aer-0070 behaviour
+  // exactly, including its measured graph_captures=0 on ephemeral
+  // contractors.
+  static GraphState &graph_state_singleton() {
+    static GraphState gs;
+    return gs;
+  }
+  GraphState local_graph_state_;
+  GraphState &graphs_;
   std::string graph_topo_key_;
-  bool step_graphs_disabled_ = false;
   uint64_t prof_graph_captures_ = 0;
 
   // aer-0047: the (t_setup_ms - t_path_ms) remainder, itemised. It is 41-57
@@ -1051,7 +1084,11 @@ private:
 
 template <typename data_t>
 TensorNetContractor_HipTensor<data_t>::TensorNetContractor_HipTensor()
-    : num_devices_used_(1), add_sp_tensors_(true), num_base_tensors_(0),
+    : gpu_mgr_(tn_gpu_persist() ? gpu_manager_singleton<data_t>()
+                                 : local_gpu_mgr_),
+      graphs_(tn_gpu_persist() ? graph_state_singleton()
+                                : local_graph_state_),
+      num_devices_used_(1), add_sp_tensors_(true), num_base_tensors_(0),
       num_additional_tensors_(0), out_size_(0), plan_valid_(false),
       slice_begin_(0), slice_end_(0), nprocs_(1), myrank_(0),
       pool_ready_(false), prev_valid_(false), prev_engaged_(false),
@@ -1059,7 +1096,11 @@ TensorNetContractor_HipTensor<data_t>::TensorNetContractor_HipTensor()
 
 template <typename data_t>
 TensorNetContractor_HipTensor<data_t>::~TensorNetContractor_HipTensor() {
-  destroy_step_graphs();
+  // aer-0071: persistent graph state outlives the instance by design (that
+  // is the entire fix -- ephemeral contractors were why captures stayed at
+  // zero). Instance-owned state is torn down as before.
+  if (!tn_gpu_persist())
+    destroy_step_graphs();
 }
 
 template <typename data_t>
@@ -3280,11 +3321,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
 
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::destroy_step_graphs() {
-  for (auto &per_dev : step_graphs_)
+  for (auto &per_dev : graphs_.maps)
     for (auto &kv : per_dev)
       if (kv.second.exec != nullptr)
         hipGraphExecDestroy(kv.second.exec);
-  step_graphs_.clear();
+  graphs_.maps.clear();
+  graphs_.epochs.clear();
 }
 
 // aer-0069: warm-capture wrapper. Visit 1 of a (device, slice) runs the
@@ -3299,15 +3341,15 @@ void TensorNetContractor_HipTensor<data_t>::destroy_step_graphs() {
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     uint_t slice_index, int device_idx) {
-  if (!tn_hip_graph() || step_graphs_disabled_ || tn_debug() ||
+  if (!tn_hip_graph() || graphs_.disabled || tn_debug() ||
       graph_topo_key_.empty()) {
     contract_single_slice_direct(slice_index, device_idx);
     return;
   }
-  if (step_graphs_.size() <= (size_t)device_idx) {
-    step_graphs_.resize((size_t)device_idx + 1);
-    step_graph_epochs_.resize((size_t)device_idx + 1,
-                              {(uint64_t)-1, (uint64_t)-1});
+  if (graphs_.maps.size() <= (size_t)device_idx) {
+    graphs_.maps.resize((size_t)device_idx + 1);
+    graphs_.epochs.resize((size_t)device_idx + 1,
+                          {(uint64_t)-1, (uint64_t)-1});
   }
   auto &dev = gpu_mgr_.device(device_idx);
   // aer-0070: generation check. Either base pointer moving kills every
@@ -3315,22 +3357,22 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   // and the only correctness condition graphs need.
   const std::pair<uint64_t, uint64_t> gen{dev.pool().epoch(),
                                           dev.tensor_data_epoch()};
-  if (step_graph_epochs_[(size_t)device_idx] != gen) {
-    for (auto &kv : step_graphs_[(size_t)device_idx])
+  if (graphs_.epochs[(size_t)device_idx] != gen) {
+    for (auto &kv : graphs_.maps[(size_t)device_idx])
       if (kv.second.exec != nullptr)
         hipGraphExecDestroy(kv.second.exec);
-    step_graphs_[(size_t)device_idx].clear();
-    step_graph_epochs_[(size_t)device_idx] = gen;
+    graphs_.maps[(size_t)device_idx].clear();
+    graphs_.epochs[(size_t)device_idx] = gen;
   }
   StepGraph &slot =
-      step_graphs_[(size_t)device_idx][{graph_topo_key_, slice_index}];
+      graphs_.maps[(size_t)device_idx][{graph_topo_key_, slice_index}];
 
   if (slot.exec != nullptr) {
     if (hipGraphLaunch(slot.exec, dev.stream()) == hipSuccess) {
       prof_graph_replays_++;
       return;
     }
-    step_graphs_disabled_ = true;
+    graphs_.disabled = true;
     destroy_step_graphs();
     fprintf(stderr,
             "[AER_TN] hip-graph replay launch failed on rank %d; graphs "
@@ -3360,7 +3402,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       hipStreamEndCapture(dev.stream(), &graph);
       if (graph != nullptr)
         hipGraphDestroy(graph);
-      step_graphs_disabled_ = true;
+      graphs_.disabled = true;
       throw;
     }
     err = hipStreamEndCapture(dev.stream(), &graph);
@@ -3382,7 +3424,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       hipGraphDestroy(graph);
     }
   }
-  step_graphs_disabled_ = true;
+  graphs_.disabled = true;
   destroy_step_graphs();
   fprintf(stderr,
           "[AER_TN] hip-graph capture unavailable on rank %d (%s); graphs "

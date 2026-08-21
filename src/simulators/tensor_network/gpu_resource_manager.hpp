@@ -1137,6 +1137,25 @@ public:
   const std::vector<int> &device_ids() const { return device_ids_; }
 };
 
+// aer-0071: process-lifetime resource manager, selected by AER_TN_GPU_PERSIST.
+// The contractor is constructed and DELETED per expval call
+// (tensor_net.hpp: create_contractor .. delete contractor), so every
+// instance-owned pool, slab and captured graph dies between contractions --
+// which is why aer-0069/0070 measured graph_captures=0: no instance ever
+// reached a second visit. This singleton is the plan_cache_instance()
+// precedent applied to GPU state: devices are discovered once, the tensor
+// slab and the aer-0070 pool arena persist, and their epochs finally govern
+// something longer-lived than one contraction. One instance per data_t.
+// CONCURRENCY CONTRACT: persistent mode assumes ONE active contractor per
+// process at a time (true for the tensor_network expval/statevector flows;
+// the OMP-parallel executor paths must leave the knob off, which is why the
+// default is off).
+template <typename data_t>
+GPUResourceManager<data_t> &gpu_manager_singleton() {
+  static GPUResourceManager<data_t> mgr;
+  return mgr;
+}
+
 } // namespace TensorNetwork
 } // namespace AER
 
