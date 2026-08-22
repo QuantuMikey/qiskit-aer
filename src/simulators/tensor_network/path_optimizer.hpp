@@ -1717,8 +1717,24 @@ public:
               // mutated the main kwargs and every main search would
               // have run max_repeats=1, parallel=False. The Python-
               // level dict.copy() is unambiguous in any binding.
-              py::dict pkw =
-                  py::reinterpret_steal<py::dict>(kwargs.attr("copy")());
+              // aer-0084: the 0082 line above described the right
+              // idea with the wrong API. reinterpret_steal exists for
+              // RAW PyObject* from the C API; attr("copy")() returns
+              // an OWNING py::object temporary, so the steal claimed
+              // the reference without incref, the temporary decref'd
+              // on destruction, and the fresh copy was freed while
+              // pkw still pointed at it -- the first pkw[...] write
+              // hit freed memory: the deterministic segfault of jobs
+              // 21466846/21466847 directly after the [AER_TN_PATH]
+              // parallel line, at both p=1 and p=8. The copy is now a
+              // manual shallow item loop: no ownership-transfer API at
+              // all, only plain item reads and writes with ordinary
+              // refcounting. Shallow is correct and intended: the
+              // probe overrides only top-level keys, and sharing
+              // sub-objects with the main kwargs mirrors dict.copy().
+              py::dict pkw;
+              for (auto item : kwargs)
+                pkw[item.first] = item.second;
               // aer-0082: several probe trials, not one. Trials sample
               // heterogeneous methods (a cheap greedy draw says nothing
               // about a kahypar draw's 10+ GB), and VmHWM is a
