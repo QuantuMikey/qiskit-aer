@@ -299,8 +299,8 @@ static int path_parallel_setting(size_t num_tensors) {
   }
 
   uint64_t budget = TensorNetPathMem::node_mem_budget_bytes(
-      "/sys/fs/cgroup/memory.max",
-      "/sys/fs/cgroup/memory/memory.limit_in_bytes", "/proc/meminfo");
+      "/sys/fs/cgroup", "/sys/fs/cgroup/memory", "/proc/self/cgroup",
+      "/proc/meminfo");
   long ranks = TensorNetPathMem::local_ranks_sharing_node();
   long mem_workers = TensorNetPathMem::mem_permitted_workers(
       static_cast<uint64_t>(num_tensors), budget, ranks);

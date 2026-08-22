@@ -83,6 +83,98 @@ inline bool parse_u64(const char *s, uint64_t &val) {
   return true;
 }
 
+// aer-0077: parse a memory quantity with an optional K/M/G/T suffix
+// (SLURM sites differ in whether SLURM_MEM_PER_NODE carries one; a bare
+// number is MB per SLURM's documentation and stays MB for the caller).
+// Returns bytes; false on garbage.
+inline bool parse_mem_mb_or_suffixed(const char *s, uint64_t &bytes) {
+  char *end = nullptr;
+  unsigned long long v = std::strtoull(s, &end, 10);
+  if (end == s || v == 0)
+    return false;
+  uint64_t mult = 1024ull * 1024ull; // bare number = MB
+  switch (*end) {
+  case 'K': case 'k': mult = 1024ull; break;
+  case 'M': case 'm': mult = 1024ull * 1024ull; break;
+  case 'G': case 'g': mult = 1024ull * 1024ull * 1024ull; break;
+  case 'T': case 't': mult = 1024ull * 1024ull * 1024ull * 1024ull; break;
+  default: break;
+  }
+  bytes = static_cast<uint64_t>(v) * mult;
+  return true;
+}
+
+// aer-0077: on cgroup v2 the binding limit usually lives at the
+// PROCESS'S OWN cgroup (or an ancestor), not the hierarchy root -- at
+// the root memory.max simply reads "max" and a root-only probe walks
+// straight past the real limit. Resolve the process's cgroup relative
+// path from /proc/self/cgroup ("0::<path>" for v2, "N:memory:<path>"
+// for v1's memory controller) and take the MINIMUM limit over the
+// cgroup and all its ancestors, since a limit at any level binds.
+// Roots and the self file are parameters so the walk is unit-testable
+// against fake trees.
+inline bool self_cgroup_rel_path(const char *self_file, bool v2, char *out,
+                                 size_t cap) {
+  FILE *f = std::fopen(self_file, "r");
+  if (f == nullptr)
+    return false;
+  char line[512];
+  bool found = false;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    size_t len = std::strlen(line);
+    if (len > 0 && line[len - 1] == '\n')
+      line[len - 1] = '\0';
+    if (v2) {
+      if (std::strncmp(line, "0::", 3) == 0) {
+        std::snprintf(out, cap, "%s", line + 3);
+        found = true;
+        break;
+      }
+    } else {
+      const char *c = std::strstr(line, ":memory:");
+      if (c == nullptr) {
+        const char *c2 = std::strstr(line, ",memory:");
+        if (c2 != nullptr)
+          c = c2;
+      }
+      if (c != nullptr) {
+        std::snprintf(out, cap, "%s", std::strchr(c + 1, ':') + 1);
+        found = true;
+        break;
+      }
+    }
+  }
+  std::fclose(f);
+  return found;
+}
+
+// Minimum finite limit over <root><rel>/<file>, walking rel up to "".
+// reader is one of the flat-file limit readers above.
+template <typename Reader>
+inline uint64_t ancestor_min_limit(const char *root, const char *rel,
+                                   const char *file, Reader reader) {
+  char rel_buf[400];
+  std::snprintf(rel_buf, sizeof(rel_buf), "%s", rel);
+  uint64_t best = 0;
+  for (;;) {
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s%s/%s", root, rel_buf, file);
+    uint64_t v = reader(path);
+    if (v > 0 && (best == 0 || v < best))
+      best = v;
+    char *slash = std::strrchr(rel_buf, '/');
+    if (slash == nullptr || slash == rel_buf) {
+      if (rel_buf[0] != '\0') {
+        rel_buf[0] = '\0';
+        continue;
+      }
+      break;
+    }
+    *slash = '\0';
+  }
+  return best;
+}
+
 constexpr uint64_t kUnlimited = (1ull << 60);
 
 // cgroup v2 memory.max: decimal bytes or the literal "max".
@@ -109,20 +201,22 @@ inline uint64_t cgroup_v1_limit(const char *path) {
   return v;
 }
 
-// SLURM grants: SLURM_MEM_PER_NODE is MB for the node's share; if only
-// SLURM_MEM_PER_CPU is set, multiply by the leading integer of
-// SLURM_JOB_CPUS_PER_NODE. Zero when neither is present or parseable.
+// SLURM grants: SLURM_MEM_PER_NODE is MB for the node's share (some
+// sites carry a K/M/G/T suffix -- both parse); if only SLURM_MEM_PER_CPU
+// is set, multiply by the leading integer of SLURM_JOB_CPUS_PER_NODE.
+// Zero when neither is present or parseable.
 inline uint64_t slurm_granted_bytes() {
   const char *mpn = std::getenv("SLURM_MEM_PER_NODE");
-  uint64_t v = 0;
-  if (mpn != nullptr && parse_u64(mpn, v) && v > 0)
-    return v * 1024ull * 1024ull;
+  uint64_t b = 0;
+  if (mpn != nullptr && parse_mem_mb_or_suffixed(mpn, b))
+    return b;
   const char *mpc = std::getenv("SLURM_MEM_PER_CPU");
   const char *cpn = std::getenv("SLURM_JOB_CPUS_PER_NODE");
   uint64_t per_cpu = 0, cpus = 0;
-  if (mpc != nullptr && cpn != nullptr && parse_u64(mpc, per_cpu) &&
-      parse_u64(cpn, cpus) && per_cpu > 0 && cpus > 0)
-    return per_cpu * cpus * 1024ull * 1024ull;
+  if (mpc != nullptr && cpn != nullptr &&
+      parse_mem_mb_or_suffixed(mpc, per_cpu) && parse_u64(cpn, cpus) &&
+      per_cpu > 0 && cpus > 0)
+    return per_cpu * cpus;
   return 0;
 }
 
@@ -146,12 +240,37 @@ inline uint64_t meminfo_available_bytes(const char *path) {
 }
 
 // The node-level budget: minimum of the defined signals, 0 if none.
-inline uint64_t node_mem_budget_bytes(const char *cg2, const char *cg1,
+// aer-0077: cgroup limits are resolved at the PROCESS'S cgroup and its
+// ancestors (via self_file), not just the hierarchy root -- the root
+// probe alone reads "max" on v2 systems where the job's limit lives at
+// the leaf. Roots and self_file are parameters for unit testing; the
+// production caller passes the real /sys/fs/cgroup, /sys/fs/cgroup/
+// memory and /proc/self/cgroup.
+inline uint64_t node_mem_budget_bytes(const char *cg2_root,
+                                      const char *cg1_root,
+                                      const char *self_file,
                                       const char *meminfo) {
-  uint64_t best = 0;
-  uint64_t c2 = cgroup_v2_limit(cg2);
-  uint64_t c1 = cgroup_v1_limit(cg1);
+  uint64_t c2 = 0, c1 = 0;
+  char rel[400];
+  if (self_cgroup_rel_path(self_file, true, rel, sizeof(rel)))
+    c2 = ancestor_min_limit(cg2_root, rel, "memory.max",
+                            [](const char *p) { return cgroup_v2_limit(p); });
+  if (c2 == 0) {
+    char root_file[512];
+    std::snprintf(root_file, sizeof(root_file), "%s/memory.max", cg2_root);
+    c2 = cgroup_v2_limit(root_file);
+  }
+  if (self_cgroup_rel_path(self_file, false, rel, sizeof(rel)))
+    c1 = ancestor_min_limit(cg1_root, rel, "memory.limit_in_bytes",
+                            [](const char *p) { return cgroup_v1_limit(p); });
+  if (c1 == 0) {
+    char root_file[512];
+    std::snprintf(root_file, sizeof(root_file), "%s/memory.limit_in_bytes",
+                  cg1_root);
+    c1 = cgroup_v1_limit(root_file);
+  }
   uint64_t sl = slurm_granted_bytes();
+  uint64_t best = 0;
   const uint64_t signals[3] = {c2, c1, sl};
   for (uint64_t s : signals)
     if (s > 0 && (best == 0 || s < best))
@@ -162,8 +281,11 @@ inline uint64_t node_mem_budget_bytes(const char *cg2, const char *cg1,
 }
 
 // Ranks sharing this node's budget. SLURM_TASKS_PER_NODE leads ("8",
-// "8(x2)", "6,2" all start with the local count on homogeneous layouts);
-// AER_TN_PATH_LOCAL_RANKS overrides for non-SLURM launchers.
+// "8(x2)", "6,2" all parse to their LEADING count). On heterogeneous
+// layouts the leading count may exceed this node's actual rank count,
+// which divides the budget too finely and yields FEWER workers -- the
+// safe direction. AER_TN_PATH_LOCAL_RANKS overrides for non-SLURM
+// launchers or when precision matters.
 inline long local_ranks_sharing_node() {
   const char *ov = std::getenv("AER_TN_PATH_LOCAL_RANKS");
   uint64_t v = 0;
