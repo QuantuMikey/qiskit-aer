@@ -25,6 +25,7 @@
 #ifdef AER_THRUST_ROCM
 
 #include <atomic>
+#include "simulators/tensor_network/path_mem_budget.hpp"
 #include <chrono>
 #include <algorithm>
 #include <climits>
@@ -1525,6 +1526,10 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           memory_budget = agreed_budget;
         }
 #endif
+
+        // aer-0080: publish the agreed device budget for host-side
+        // VRAM-derived defaults (slice fence auto-sizing).
+        AER::TensorNetPathMem::device_budget_bytes() = memory_budget;
 
         if (tn_verbose() && myrank_ == 0)
           fprintf(stderr,

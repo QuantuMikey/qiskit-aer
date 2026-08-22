@@ -330,7 +330,7 @@ inline uint64_t env_u64(const char *name, uint64_t dflt) {
 // per_trial(T) = BASE + T x PER_TENSOR (bytes).
 inline uint64_t trial_bytes_estimate(uint64_t num_tensors) {
   uint64_t base = env_u64("AER_TN_PATH_TRIAL_BASE_MB", 8500) * 1024ull * 1024ull;
-  uint64_t per_t = env_u64("AER_TN_PATH_TRIAL_KB_PER_TENSOR", 192) * 1024ull;
+  uint64_t per_t = env_u64("AER_TN_PATH_TRIAL_KB_PER_TENSOR", 320) * 1024ull;
   return base + num_tensors * per_t;
 }
 
@@ -366,6 +366,15 @@ inline long mem_permitted_workers(uint64_t num_tensors, uint64_t node_budget,
 // verified by direct test: a touched 300 MB allocation measures as a
 // 300 MB delta). Both degrade gracefully: 0 / false on systems without
 // procfs, and the caller falls back to the model.
+// aer-0080: the device memory budget, measured once at set_network
+// (hipMemGetInfo minus workspace, MPI-agreed across ranks), published
+// here so host-side sizing decisions can be VRAM-derived without any
+// new device queries. 0 until set_network has run.
+inline uint64_t &device_budget_bytes() {
+  static uint64_t b = 0;
+  return b;
+}
+
 inline uint64_t read_vmhwm_kb() {
   FILE *f = std::fopen("/proc/self/status", "r");
   if (f == nullptr)

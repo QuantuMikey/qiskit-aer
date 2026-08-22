@@ -370,8 +370,26 @@ static uint64_t slice_target_bytes() {
   // power-of-two of headroom. min(budget, device memory) still applies.
   static bool checked = false;
   static uint64_t cached = 8589934592ULL;
+  // aer-0080: when the knob is unset the fence is VRAM-DERIVED --
+  // device budget / 8 -- instead of a hardcoded byte count. On this
+  // system's MI250X GCDs (65200 MB budget) the rule yields ~8.15 GiB,
+  // i.e. the measured-safe 8 GiB constant EMERGES from the rule, while
+  // a GPU with more memory scales automatically. The device budget is
+  // published by set_network, which runs before any path search (log
+  // ordering: "[AER_TN] memory:" precedes "[AER_TN_PATH]"); if it is
+  // somehow unavailable the historic 8 GiB constant remains. Explicit
+  // AER_TN_SLICE_TARGET_BYTES still wins outright, floor 2 MiB.
   if (!checked) {
     const char *val = std::getenv("AER_TN_SLICE_TARGET_BYTES");
+    if (val == nullptr) {
+      uint64_t dev = TensorNetPathMem::device_budget_bytes();
+      if (dev > 0) {
+        uint64_t derived = dev / 8;
+        if (derived < 2097152ULL)
+          derived = 2097152ULL;
+        cached = derived;
+      }
+    }
     if (val != nullptr) {
       char *end = nullptr;
       unsigned long long parsed = std::strtoull(val, &end, 10);
@@ -798,8 +816,11 @@ static bool tn_plan_cache_enabled() {
   static bool checked = false;
   static bool cached = false;
   if (!checked) {
+    // aer-0080: default ON. The in-process plan cache is a pure win
+    // validated across every campaign since aer-0027; "0" disables for
+    // A/B, matching the POOL_REUSE opt-out convention.
     const char *v = std::getenv("AER_TN_PLAN_CACHE");
-    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    cached = !(v != nullptr && v[0] == '0' && v[1] == '\0');
     checked = true;
   }
   return cached;
