@@ -1662,6 +1662,88 @@ public:
       }
       // sbplx, sses: no seed kwarg (backends don't accept it).
 
+      // aer-0079: MEASURED worker sizing. The model in aer-0076 sizes the
+      // pool from an estimate that took three battery jobs to calibrate
+      // and remains workload-family-specific; the measurement below makes
+      // the estimate a fallback and the knobs pure overrides. When the
+      // count is auto-decided (no explicit AER_TN_PATH_PARALLEL), a
+      // memory budget exists, and more than one worker is on the table:
+      // run ONE trial serially in-process through an identical throwaway
+      // optimizer, read the kernel's peak-RSS delta around it (VmHWM
+      // after clear_refs -- mechanism verified by direct test), price a
+      // worker at that delta plus interpreter overhead
+      // (AER_TN_PATH_WORKER_OVERHEAD_MB, default 1024), charge the
+      // parent's retained trial arena against the budget, and size the
+      // pool from what fits -- never above the CPU-derived count. The
+      // probe tree is discarded; the main search then runs exactly as
+      // before, so plan capture, caching and determinism are untouched.
+      // Probe failure of any kind (procfs absent, reset refused, trial
+      // raised) falls back to the aer-0076 sizing already in `par`.
+      int eff_par = par;
+      if (std::getenv("AER_TN_PATH_PARALLEL") == nullptr && par >= 2) {
+        uint64_t pb_budget = TensorNetPathMem::node_mem_budget_bytes(
+            "/sys/fs/cgroup", "/sys/fs/cgroup/memory", "/proc/self/cgroup",
+            "/proc/meminfo");
+        long pb_ranks = TensorNetPathMem::local_ranks_sharing_node();
+        if (pb_budget > 0 && TensorNetPathMem::reset_peak_rss()) {
+          uint64_t rss0 = TensorNetPathMem::read_vmhwm_kb();
+          bool probed = false;
+          if (rss0 > 0) {
+            try {
+              py::dict pkw(kwargs);
+              pkw["max_repeats"] = 1;
+              pkw["parallel"] = false;
+              auto popt = ctg.attr("HyperOptimizer")(**pkw);
+              popt.attr("search")(inputs, output, sizes);
+              probed = true;
+            } catch (py::error_already_set &pe) {
+              pe.discard_as_unraisable("AER_TN_PATH probe trial");
+            }
+          }
+          if (probed) {
+            uint64_t rss1 = TensorNetPathMem::read_vmhwm_kb();
+            uint64_t trial_b = (rss1 > rss0) ? (rss1 - rss0) * 1024ull : 0;
+            if (trial_b > 0) {
+              uint64_t overhead =
+                  TensorNetPathMem::env_u64("AER_TN_PATH_WORKER_OVERHEAD_MB",
+                                            1024) *
+                  1024ull * 1024ull;
+              uint64_t reserve = TensorNetPathMem::env_u64(
+                                     "AER_TN_PATH_PARENT_RESERVE_MB", 4096) *
+                                 1024ull * 1024ull;
+              uint64_t per_rank =
+                  pb_budget / static_cast<uint64_t>(pb_ranks > 0 ? pb_ranks
+                                                                 : 1);
+              uint64_t spent = reserve + trial_b; // parent + retained arena
+              uint64_t usable = (per_rank > spent) ? per_rank - spent : 0;
+              uint64_t worker_cost = trial_b + overhead;
+              long mw = static_cast<long>(usable / worker_cost);
+              if (mw < 1)
+                mw = 1;
+              if (mw < eff_par)
+                eff_par = static_cast<int>(mw);
+              fprintf(stderr,
+                      "[AER_TN_PATH] probe: trial_peak_mb=%llu "
+                      "worker_cost_mb=%llu usable_mb=%llu -> %d worker(s) "
+                      "[measured]\n",
+                      static_cast<unsigned long long>(trial_b /
+                                                      (1024ull * 1024ull)),
+                      static_cast<unsigned long long>(worker_cost /
+                                                      (1024ull * 1024ull)),
+                      static_cast<unsigned long long>(usable /
+                                                      (1024ull * 1024ull)),
+                      eff_par);
+            }
+          }
+        }
+      }
+      if (eff_par != par) {
+        if (eff_par <= 1)
+          kwargs["parallel"] = false;
+        else
+          kwargs["parallel"] = eff_par;
+      }
+
       auto opt = ctg.attr("HyperOptimizer")(**kwargs);
       try {
         tree = opt.attr("search")(inputs, output, sizes);

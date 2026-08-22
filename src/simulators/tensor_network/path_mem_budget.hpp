@@ -359,6 +359,40 @@ inline long mem_permitted_workers(uint64_t num_tensors, uint64_t node_budget,
   return static_cast<long>(n);
 }
 
+// aer-0079: kernel-accounted peak-RSS measurement, so the per-trial cost
+// can be MEASURED on the live workload instead of modeled. VmHWM is the
+// process's peak resident set as tracked by the kernel; writing "5" to
+// /proc/self/clear_refs resets the peak counter (no privilege needed --
+// verified by direct test: a touched 300 MB allocation measures as a
+// 300 MB delta). Both degrade gracefully: 0 / false on systems without
+// procfs, and the caller falls back to the model.
+inline uint64_t read_vmhwm_kb() {
+  FILE *f = std::fopen("/proc/self/status", "r");
+  if (f == nullptr)
+    return 0;
+  char key[64];
+  unsigned long long kb = 0;
+  uint64_t out = 0;
+  char line[256];
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    if (std::sscanf(line, "%63s %llu", key, &kb) == 2 &&
+        std::strcmp(key, "VmHWM:") == 0) {
+      out = kb;
+      break;
+    }
+  }
+  std::fclose(f);
+  return out;
+}
+
+inline bool reset_peak_rss() {
+  FILE *f = std::fopen("/proc/self/clear_refs", "w");
+  if (f == nullptr)
+    return false;
+  bool ok = std::fputs("5", f) >= 0;
+  return (std::fclose(f) == 0) && ok;
+}
+
 } // namespace TensorNetPathMem
 } // namespace AER
 
