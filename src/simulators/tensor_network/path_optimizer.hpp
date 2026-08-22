@@ -1774,8 +1774,13 @@ public:
               // parallelism at small networks, where searches are
               // seconds either way; buys a rule that never resizes
               // into a known-fatal pool.
+              // aer-0083: num_tensors is the PARAMETER NAME inside
+              // path_parallel_setting, not a variable at this site --
+              // build 21463409 failed on exactly this identifier. The
+              // site's own expression, the same one passed to
+              // path_parallel_setting at line ~1668, is used instead.
               uint64_t floor_b = TensorNetPathMem::trial_bytes_estimate(
-                  static_cast<uint64_t>(num_tensors));
+                  static_cast<uint64_t>(network.tensors.size()));
               uint64_t base_cost = (trial_b > floor_b) ? trial_b : floor_b;
               uint64_t worker_cost = (base_cost * margin) / 100 + overhead;
               long mw = static_cast<long>(usable / worker_cost);
