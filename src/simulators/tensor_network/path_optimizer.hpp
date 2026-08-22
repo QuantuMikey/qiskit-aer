@@ -621,6 +621,19 @@ static double path_max_time() {
 // fit one device the split can cost more than it saves. It exists for the case
 // distribution is for -- a contraction too large for one device -- and for
 // measuring where the crossover lies.
+// aer-0085: FORGE mode. AER_TN_PLAN_FORGE=1 declares this run a plan
+// forge: its product is a banked plan for later replay, so the search
+// runs SERIALLY (one trial in memory at a time -- the safe shape at
+// any network size) and the planner targets a TOTAL slice count
+// (AER_TN_PLAN_TARGET_SLICES, default 16) so the captured plan replays
+// at every width up to that count through the width-blind
+// AER_TN_PLAN_FILE. The total is divided across ranks here in the
+// compiled layer, so launchers pass intent, not arithmetic.
+static bool tn_plan_forge() {
+  const char *v = std::getenv("AER_TN_PLAN_FORGE");
+  return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
 static uint64_t min_slices_per_rank() {
   // aer-0062: default raised 0 -> 1, paired with the slice-target raise
   // above. A big fence lets moderately hard circuits draw 4-16-slice
@@ -646,6 +659,18 @@ static uint64_t min_slices_per_rank() {
       }
     }
     checked = true;
+  }
+  if (tn_plan_forge()) {
+    uint64_t target =
+        TensorNetPathMem::env_u64("AER_TN_PLAN_TARGET_SLICES", 16);
+    int np = 1;
+#ifdef AER_MPI
+    MPI_Comm_size(MPI_COMM_WORLD, &np);
+#endif
+    uint64_t per_rank =
+        (target + static_cast<uint64_t>(np) - 1) / static_cast<uint64_t>(np);
+    if (per_rank > cached)
+      return per_rank;
   }
   return cached;
 }
@@ -1701,11 +1726,37 @@ public:
       // Probe failure of any kind (procfs absent, reset refused, trial
       // raised) falls back to the aer-0076 sizing already in `par`.
       int eff_par = par;
-      if (std::getenv("AER_TN_PATH_PARALLEL") == nullptr && par >= 2) {
+      // aer-0085: a forge runs SERIALLY by definition -- its product is
+      // the plan, not the wall, and one trial in memory at a time is
+      // the safe shape at any network size.
+      if (tn_plan_forge()) {
+        eff_par = -1;
+        fprintf(stderr, "[AER_TN_PATH] forge: serial search\n");
+      }
+      // aer-0085: the probe is switchable, bounded, and never silent.
+      // AER_TN_PATH_PROBE=0 disables it outright (a flag read: "0"
+      // means off, unlike the value knobs where 0 falls to a default).
+      // Every non-measured exit below names its branch, because job
+      // 21468267 proved a silent fallback is a diagnosis dead-end.
+      const char *probe_sw = std::getenv("AER_TN_PATH_PROBE");
+      const bool probe_off =
+          probe_sw != nullptr && probe_sw[0] == '0' && probe_sw[1] == '\0';
+      if (probe_off && !tn_plan_forge())
+        fprintf(stderr, "[AER_TN_PATH] probe: disabled by "
+                        "AER_TN_PATH_PROBE=0 [skipped]\n");
+      if (!tn_plan_forge() && !probe_off &&
+          std::getenv("AER_TN_PATH_PARALLEL") == nullptr && par >= 2) {
         uint64_t pb_budget = TensorNetPathMem::node_mem_budget_bytes(
             "/sys/fs/cgroup", "/sys/fs/cgroup/memory", "/proc/self/cgroup",
             "/proc/meminfo");
         long pb_ranks = TensorNetPathMem::local_ranks_sharing_node();
+        if (pb_budget == 0) {
+          fprintf(stderr, "[AER_TN_PATH] probe: no memory budget signal "
+                          "[skipped, model sizing stands]\n");
+        } else if (!TensorNetPathMem::reset_peak_rss()) {
+          fprintf(stderr, "[AER_TN_PATH] probe: peak-RSS reset unavailable "
+                          "[skipped, model sizing stands]\n");
+        }
         if (pb_budget > 0 && TensorNetPathMem::reset_peak_rss()) {
           uint64_t rss0 = TensorNetPathMem::read_vmhwm_kb();
           bool probed = false;
@@ -1743,16 +1794,30 @@ public:
               pkw["max_repeats"] = static_cast<int>(
                   TensorNetPathMem::env_u64("AER_TN_PATH_PROBE_TRIALS", 3));
               pkw["parallel"] = false;
+              // aer-0085: the probe carries its OWN time budget instead
+              // of inheriting the main search's -- a single serial
+              // trial at depth can otherwise run unbounded (the probe
+              // cannot preempt a running trial; the bound caps how many
+              // start).
+              pkw["max_time"] = static_cast<int>(TensorNetPathMem::env_u64(
+                  "AER_TN_PATH_PROBE_MAX_TIME", 120));
               auto popt = ctg.attr("HyperOptimizer")(**pkw);
               popt.attr("search")(inputs, output, sizes);
               probed = true;
             } catch (py::error_already_set &pe) {
+              fprintf(stderr,
+                      "[AER_TN_PATH] probe: trial raised: %s [failed, "
+                      "model sizing stands]\n",
+                      pe.what());
               pe.discard_as_unraisable("AER_TN_PATH probe trial");
             }
           }
           if (probed) {
             uint64_t rss1 = TensorNetPathMem::read_vmhwm_kb();
             uint64_t trial_b = (rss1 > rss0) ? (rss1 - rss0) * 1024ull : 0;
+            if (trial_b == 0)
+              fprintf(stderr, "[AER_TN_PATH] probe: zero RSS delta "
+                              "[fallback, model sizing stands]\n");
             if (trial_b > 0) {
               uint64_t overhead =
                   TensorNetPathMem::env_u64("AER_TN_PATH_WORKER_OVERHEAD_MB",
