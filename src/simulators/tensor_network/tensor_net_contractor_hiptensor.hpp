@@ -1656,6 +1656,11 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
         // collective of the pass, so a throw here leaves the siblings blocked
         // at the end-of-pass agreement below rather than at a collective. It is
         // caught into setup_status for the same reason.
+        // aer-0087: the plan is not valid until this setup says so --
+        // reset here so neither a caught setup failure below nor a
+        // stale value from a previous topology under GPU_PERSIST can
+        // leak into the capture decision.
+        plan_valid_ = false;
         try {
           // Slice-count ceiling: refuse an over-sliced plan rather than grind
           // (see tn_max_slices). plan_.num_slices is the MINLOC-broadcast
@@ -1869,14 +1874,20 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     }
   }
 
-  // aer-0049: capture point. Reached only after the whole setup succeeded —
-  // path search, slice ceiling (3a), specs, prebuild, pool allocation — so
-  // a written plan is by
-  // construction one that clears BOTH ceilings and sets up on this device.
-  // A run that trips a ceiling throws before reaching here and leaves no
-  // file, so re-running capture retries with a fresh (scattered) search
-  // until an in-window plan lands. Rank-0-only and collective-free.
-  maybe_write_plan_file(engaged);
+  // aer-0049: capture point. aer-0087: the claim this comment used to
+  // make -- "a run that trips a ceiling throws before reaching here" --
+  // stopped being true when aer-0037's window 3a caught setup throws
+  // into setup_status for collective safety: execution CONTINUES to
+  // this line on the error path, and job 21470538 captured a
+  // slices=0, flops=1.4e40 plan into the shared library that way.
+  // Capture is therefore guarded on plan_valid_, which only this
+  // setup's successful pass sets, and the skip is LOUD.
+  if (plan_valid_) {
+    maybe_write_plan_file(engaged);
+  } else if (myrank_ == 0) {
+    fprintf(stderr, "[AER_TN_PLAN_FILE] capture skipped: setup did not "
+                    "complete, plan not valid\n");
+  }
 
   if (tn_verbose() && myrank_ == 0)
     fprintf(stderr, "[AER_TN] setup: %zu steps, %lu slices, %.2e FLOPs, %d GPUs\n",
@@ -3269,8 +3280,15 @@ TensorNetContractor_HipTensor<data_t>::create_optimizer() {
     // AER_TN_MIN_SLICES_PER_RANK defaults to 0, which leaves min_slices at 1
     // and the planner's behaviour exactly as before.
     uint64_t min_slices = 1;
-    if (nprocs_ > 1 && min_slices_per_rank() > 0)
-      min_slices = min_slices_per_rank() * static_cast<uint64_t>(nprocs_);
+    // aer-0087: the nprocs_ > 1 gate silently discarded the floor for
+    // every single-rank run -- all eleven forge jobs of 21470533..543
+    // captured slices=1 plans because of it, defeating the forge's
+    // whole purpose (a plan rich enough to replay at every width). A
+    // forge applies the floor at ANY rank count; ordinary single-rank
+    // runs keep the historic behavior.
+    if ((nprocs_ > 1 || tn_plan_forge()) && min_slices_per_rank() > 0)
+      min_slices = min_slices_per_rank() *
+                   static_cast<uint64_t>(nprocs_ > 1 ? nprocs_ : 1);
     inner = std::unique_ptr<PathOptimizer>(new CotengPathOptimizer(
         "combo", -1, -1.0, "hyper", elem_bytes, min_slices));
   } catch (...) {
