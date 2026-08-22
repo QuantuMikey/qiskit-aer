@@ -1737,7 +1737,19 @@ public:
                                                                  : 1);
               uint64_t spent = reserve + trial_b; // parent + retained arena
               uint64_t usable = (per_rank > spent) ? per_rank - spent : 0;
-              uint64_t worker_cost = trial_b + overhead;
+              // aer-0081: the measured trial is ONE SAMPLE of a
+              // variable cost -- at T=6078 the p=8 battery cell OOM'd
+              // at ~67 GB with 7, 6 AND 5 workers (21456577, 21462112,
+              // 21462547), a pattern a fixed per-trial cost cannot
+              // produce: later trials (different partitioner draws)
+              // peak higher than the first. Price a worker at 3/2 of
+              // the measurement (AER_TN_PATH_TRIAL_MARGIN_PCT, default
+              // 150) so the pool survives the spread, not just the
+              // sample.
+              uint64_t margin =
+                  TensorNetPathMem::env_u64("AER_TN_PATH_TRIAL_MARGIN_PCT",
+                                            150);
+              uint64_t worker_cost = (trial_b * margin) / 100 + overhead;
               long mw = static_cast<long>(usable / worker_cost);
               if (mw < 1)
                 mw = 1;
