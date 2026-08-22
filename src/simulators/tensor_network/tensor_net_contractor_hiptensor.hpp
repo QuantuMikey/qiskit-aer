@@ -1666,6 +1666,29 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           // (see tn_max_slices). plan_.num_slices is the MINLOC-broadcast
           // value, identical on every rank, so every rank raises this together
           // and each reports its own message.
+          // aer-0088: ZERO slices on a nonempty network is a setup
+          // error, not an idle configuration. Job 21470539: a
+          // 1.4e40-FLOP path gave the slicer an impossible per-slice
+          // budget, it returned num_slices=0, the aer-0067 idle-rank
+          // allowance (written for ranks BEYOND the slice count)
+          // declared it "correct but idle", and the contraction of
+          // nothing returned an exact-zero answer as a plain result --
+          // silent-wrong, the worst failure class. Refuse it here,
+          // where the over-slicing twin is already refused, so
+          // plan_valid_ stays false and the aer-0087 guard keeps the
+          // plan out of the library.
+          if (plan_.num_slices == 0 && !plan_.steps.empty()) {
+            std::stringstream err;
+            err << "[AER_TN] plan has ZERO slices for a nonempty network: "
+                   "the slicer could not satisfy the per-slice budget "
+                   "(path cost "
+                << plan_.total_flops
+                << " FLOPs -- the search produced an unusably expensive "
+                   "path). Re-search with a larger trial budget or "
+                   "different methods; raising AER_TN_SLICE_TARGET_BYTES "
+                   "only masks the path quality problem.";
+            throw std::runtime_error(err.str());
+          }
           if (tn_max_slices() > 0 && plan_.num_slices > tn_max_slices()) {
             std::stringstream err;
             err << "[AER_TN] plan has " << plan_.num_slices
