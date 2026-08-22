@@ -1054,6 +1054,17 @@ public:
     }
     check_hip(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
               "hipStreamCreateWithFlags(recreate)", device_id_);
+#ifdef AER_HIPBLAS
+    // aer-0073: the hipBLAS handle is bound to the stream ONCE, at device
+    // init -- a recreated stream must be re-bound or every subsequent GEMM
+    // enqueues onto the destroyed stream: a use-after-free hiding inside
+    // the recovery path, which would have converted a survivable capture
+    // failure into corruption. The handle itself (and its rocBLAS
+    // workspace) is stream-independent and survives the swap.
+    if (bl_handle_valid_)
+      check_hipblas(hipblasSetStream(bl_handle_, stream_),
+                    "hipblasSetStream(recreate)", device_id_);
+#endif
   }
   MemoryPool &pool() { return pool_; }
   thrust::device_vector<thrust::complex<data_t>> &output_buffer() { return dev_out_; }
