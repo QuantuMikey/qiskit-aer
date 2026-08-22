@@ -1711,8 +1711,21 @@ public:
           bool probed = false;
           if (rss0 > 0) {
             try {
-              py::dict pkw(kwargs);
-              pkw["max_repeats"] = 1;
+              // aer-0082: a REAL COPY. py::dict pkw(kwargs) copies the
+              // HANDLE -- pybind object copy-construction is reference
+              // semantics -- so the probe's overrides would have
+              // mutated the main kwargs and every main search would
+              // have run max_repeats=1, parallel=False. The Python-
+              // level dict.copy() is unambiguous in any binding.
+              py::dict pkw =
+                  py::reinterpret_steal<py::dict>(kwargs.attr("copy")());
+              // aer-0082: several probe trials, not one. Trials sample
+              // heterogeneous methods (a cheap greedy draw says nothing
+              // about a kahypar draw's 10+ GB), and VmHWM is a
+              // high-water mark, so running N serial trials measures
+              // the MAX over N method samples at zero extra accounting.
+              pkw["max_repeats"] = static_cast<int>(
+                  TensorNetPathMem::env_u64("AER_TN_PATH_PROBE_TRIALS", 3));
               pkw["parallel"] = false;
               auto popt = ctg.attr("HyperOptimizer")(**pkw);
               popt.attr("search")(inputs, output, sizes);
@@ -1749,7 +1762,22 @@ public:
               uint64_t margin =
                   TensorNetPathMem::env_u64("AER_TN_PATH_TRIAL_MARGIN_PCT",
                                             150);
-              uint64_t worker_cost = (trial_b * margin) / 100 + overhead;
+              // aer-0082: the model estimate is the FLOOR under the
+              // measurement -- if the probe's trials happened to sample
+              // only cheap methods, the (deliberately conservative)
+              // model keeps the pool from oversizing -- and the
+              // variance MARGIN applies to whichever governs, because
+              // the max-trial spread the margin covers exists above
+              // the floor exactly as above a measurement (a 5-worker
+              // pool priced off the unmargined floor at T=6078 is the
+              // configuration job 21462547 measured fatal). Costs some
+              // parallelism at small networks, where searches are
+              // seconds either way; buys a rule that never resizes
+              // into a known-fatal pool.
+              uint64_t floor_b = TensorNetPathMem::trial_bytes_estimate(
+                  static_cast<uint64_t>(num_tensors));
+              uint64_t base_cost = (trial_b > floor_b) ? trial_b : floor_b;
+              uint64_t worker_cost = (base_cost * margin) / 100 + overhead;
               long mw = static_cast<long>(usable / worker_cost);
               if (mw < 1)
                 mw = 1;
