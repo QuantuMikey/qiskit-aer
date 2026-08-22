@@ -1674,6 +1674,37 @@ public:
       // seed-routing kwarg is added conditionally per backend using py::dict
       // of extra kwargs merged in via py::kwargs.
       py::dict kwargs;
+      // aer-0086: AER_TN_PATH_METHODS restricts cotengra's trial
+      // methods (comma-separated, e.g. "greedy" or "greedy,labels").
+      // Unset keeps cotengra's default list. The lever exists because
+      // trial cost is METHOD-dominated: on the low-treewidth networks
+      // of tree-structured circuits, greedy-family trials run in
+      // milliseconds at megabytes while a kahypar trial's partitioning
+      // arena measures 8-13+ GB at depth -- and on such networks the
+      // cheap methods are near-optimal, so a forge restricted to them
+      // banks a plan in seconds where the default list needs an hour.
+      // The printed plan_flops is the acceptance check either way.
+      {
+        const char *mth = std::getenv("AER_TN_PATH_METHODS");
+        if (mth != nullptr && mth[0] != '\0') {
+          py::list mlist;
+          std::string cur;
+          for (const char *c = mth;; ++c) {
+            if (*c == ',' || *c == '\0') {
+              if (!cur.empty()) {
+                mlist.append(py::str(cur));
+                cur.clear();
+              }
+              if (*c == '\0')
+                break;
+            } else {
+              cur.push_back(*c);
+            }
+          }
+          if (py::len(mlist) > 0)
+            kwargs["methods"] = mlist;
+        }
+      }
       kwargs["minimize"] = path_minimize();
       kwargs["max_repeats"] = effective_max_repeats();
       kwargs["max_time"] = max_time_;
