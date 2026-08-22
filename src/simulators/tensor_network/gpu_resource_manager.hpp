@@ -1037,6 +1037,24 @@ public:
   size_t total_memory() const { return total_memory_; }
   bool has_peer_access(int other_device) const { return peer_access_[other_device]; }
   hipStream_t stream() const { return stream_; }
+
+  // aer-0072: replace the device stream after a failed graph capture. A
+  // capture aborted mid-flight (job 21451954: an instance-local scratch
+  // resize threw std::bad_alloc under capture) can leave the stream in a
+  // permanently failed state -- and since aer-0071 the stream is
+  // process-persistent, so the poison outlived the contractor and killed
+  // every later async op with "previous error during capture". Recreating
+  // the stream is the only reliable reset; callers hold no cached
+  // references to the raw handle (stream() is re-read at every use).
+  void recreate_stream() {
+    hipSetDevice(device_id_);
+    if (stream_) {
+      hipStreamDestroy(stream_);
+      stream_ = nullptr;
+    }
+    check_hip(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+              "hipStreamCreateWithFlags(recreate)", device_id_);
+  }
   MemoryPool &pool() { return pool_; }
   thrust::device_vector<thrust::complex<data_t>> &output_buffer() { return dev_out_; }
   void *tensor_data_ptr() const { return tensor_data_ptr_; }

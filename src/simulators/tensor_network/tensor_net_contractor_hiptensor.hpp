@@ -3389,36 +3389,57 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     return;
   }
 
+  // aer-0072: RUN-DIRECT-THEN-CAPTURE. The 0069 protocol captured the
+  // body's second-ever execution -- but "second-ever" was counted in
+  // persistent state while lazy allocations (perm-scratch resize, first
+  // GEMM shapes through this instance's route) are per-INSTANCE, and an
+  // allocation under capture is illegal (job 21451954:
+  // hipErrorStreamCaptureUnsupported out of a scratch resize, then a
+  // poisoned persistent stream failing every later async op). Now the
+  // capturing visit first executes the direct body -- producing THIS
+  // call's real result and paying every instance-local first-touch in
+  // normal stream mode -- and only then captures a second, NON-executing
+  // pass of the identical body, instantiating without launching. The
+  // captured pass cannot allocate (its twin just ran in this instance),
+  // and if anything still fails, the result already exists, graphs
+  // disable loudly, and the stream is RECREATED so a failed capture can
+  // never poison subsequent work again.
+  contract_single_slice_direct(slice_index, device_idx);
+
   hipGraph_t graph = nullptr;
   hipError_t err =
       hipStreamBeginCapture(dev.stream(), hipStreamCaptureModeThreadLocal);
   if (err == hipSuccess) {
+    bool body_threw = false;
     try {
       contract_single_slice_direct(slice_index, device_idx);
     } catch (...) {
-      // a body throw (e.g. fault injection) mid-capture: end the capture so
-      // the stream leaves capture state, then let the fail-together guard
-      // above see the original exception.
-      hipStreamEndCapture(dev.stream(), &graph);
+      body_threw = true;
+    }
+    err = hipStreamEndCapture(dev.stream(), &graph);
+    if (body_threw) {
       if (graph != nullptr)
         hipGraphDestroy(graph);
       graphs_.disabled = true;
-      throw;
+      destroy_step_graphs();
+      dev.recreate_stream();
+      fprintf(stderr,
+              "[AER_TN] hip-graph capture pass threw on rank %d; graphs "
+              "disabled, stream recreated, continuing on the direct path "
+              "(this contraction's result was already produced directly)\n",
+              myrank_);
+      return;
     }
-    err = hipStreamEndCapture(dev.stream(), &graph);
     if (err == hipSuccess && graph != nullptr) {
       hipGraphExec_t exec = nullptr;
       err = hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
       hipGraphDestroy(graph);
       if (err == hipSuccess) {
-        // capture enqueued nothing; this launch performs visit 2's work.
-        if (hipGraphLaunch(exec, dev.stream()) == hipSuccess) {
-          slot.exec = exec;
-          prof_graph_captures_++;
-          return;
-        }
-        hipGraphExecDestroy(exec);
-        err = hipErrorUnknown;
+        // NOT launched: the direct run above already did this visit's
+        // work; the exec serves visit 3 onward.
+        slot.exec = exec;
+        prof_graph_captures_++;
+        return;
       }
     } else if (graph != nullptr) {
       hipGraphDestroy(graph);
@@ -3426,12 +3447,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   }
   graphs_.disabled = true;
   destroy_step_graphs();
+  dev.recreate_stream();
   fprintf(stderr,
           "[AER_TN] hip-graph capture unavailable on rank %d (%s); graphs "
-          "disabled for this process, continuing on the direct dispatch path "
-          "(results unaffected)\n",
+          "disabled for this process, stream recreated, continuing on the "
+          "direct dispatch path (results unaffected)\n",
           myrank_, hipGetErrorString(err));
-  contract_single_slice_direct(slice_index, device_idx);
 }
 
 template <typename data_t>
