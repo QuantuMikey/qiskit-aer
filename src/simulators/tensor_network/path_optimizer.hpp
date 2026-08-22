@@ -29,6 +29,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "simulators/tensor_network/path_mem_budget.hpp"
+
 // aer-0026: sched_getaffinity()/CPU_COUNT for the cotengra worker count. Linux
 // only, which this file already is (ROCm/HIP, MPICH, LUMI).
 #include <sched.h>
@@ -271,13 +273,16 @@ static std::string path_optlib() {
 // The chosen value and BOTH inputs are printed once per process, so the first
 // job after this lands says outright whether affinity is visible inside the
 // container. That question is why this is measured rather than assumed.
-static int path_parallel_setting() {
-  static bool checked = false;
-  static int cached = -2;
-  if (checked)
-    return cached;
-  checked = true;
-
+static int path_parallel_setting(size_t num_tensors) {
+  // aer-0076: the pool is sized from THREE signals, not two -- CPUs
+  // available (affinity), CPUs granted (SLURM), and now the host memory
+  // actually granted to this process (cgroup/SLURM/meminfo chain in
+  // path_mem_budget.hpp). Peak search RSS is parent + workers x
+  // per_trial(T), so the memory-permitted count depends on the network
+  // size and is computed per search rather than cached; the explicit
+  // knob still wins outright. Battery jobs 21456575/76/77/78/80 are the
+  // measurements behind this: 7 CPU-sized workers host-OOM'd a 64 GB
+  // 1-GCD share at every depth past p=5 while the GPU sat untouched.
   long affinity = -1;
   cpu_set_t mask;
   CPU_ZERO(&mask);
@@ -293,19 +298,27 @@ static int path_parallel_setting() {
       slurm = parsed;
   }
 
+  uint64_t budget = TensorNetPathMem::node_mem_budget_bytes(
+      "/sys/fs/cgroup/memory.max",
+      "/sys/fs/cgroup/memory/memory.limit_in_bytes", "/proc/meminfo");
+  long ranks = TensorNetPathMem::local_ranks_sharing_node();
+  long mem_workers = TensorNetPathMem::mem_permitted_workers(
+      static_cast<uint64_t>(num_tensors), budget, ranks);
+
+  int result = -2;
   const char *v = std::getenv("AER_TN_PATH_PARALLEL");
   std::string source = "auto-detected";
   if (v != nullptr) {
     std::string s(v);
     source = "AER_TN_PATH_PARALLEL";
     if (s == "auto") {
-      cached = -2;
+      result = -2;
     } else if (s == "0" || s == "false" || s == "False") {
-      cached = -1;
+      result = -1;
     } else {
       char *end = nullptr;
       long parsed = std::strtol(v, &end, 10);
-      cached = (end != v && parsed > 0) ? static_cast<int>(parsed) : -2;
+      result = (end != v && parsed > 0) ? static_cast<int>(parsed) : -2;
     }
   } else {
     long n = affinity;
@@ -315,21 +328,33 @@ static int path_parallel_setting() {
       n = 1;
     if (n > 32)
       n = 32;
-    cached = (n <= 1) ? -1 : static_cast<int>(n);
+    if (mem_workers > 0 && mem_workers < n) {
+      n = mem_workers;
+      source = "memory-capped";
+    }
+    result = (n <= 1) ? -1 : static_cast<int>(n);
   }
 
   char desc[64];
-  if (cached == -2)
+  if (result == -2)
     snprintf(desc, sizeof(desc), "cotengra 'auto' (whole-node CPU count)");
-  else if (cached == -1)
+  else if (result == -1)
     snprintf(desc, sizeof(desc), "False (serial)");
   else
-    snprintf(desc, sizeof(desc), "%d worker(s)", cached);
+    snprintf(desc, sizeof(desc), "%d worker(s)", result);
   fprintf(stderr,
           "[AER_TN_PATH] parallel: sched_getaffinity=%ld "
-          "SLURM_CPUS_PER_TASK=%ld -> %s [%s]\n",
-          affinity, slurm, desc, source.c_str());
-  return cached;
+          "SLURM_CPUS_PER_TASK=%ld mem_budget_mb=%llu local_ranks=%ld "
+          "trial_est_mb=%llu mem_workers=%ld tensors=%zu -> %s [%s]\n",
+          affinity, slurm,
+          static_cast<unsigned long long>(budget / (1024ull * 1024ull)),
+          ranks,
+          static_cast<unsigned long long>(
+              TensorNetPathMem::trial_bytes_estimate(
+                  static_cast<uint64_t>(num_tensors)) /
+              (1024ull * 1024ull)),
+          mem_workers, num_tensors, desc, source.c_str());
+  return result;
 }
 
 static uint64_t slice_target_bytes() {
@@ -1619,7 +1644,7 @@ public:
       // This CHANGES PATHS. Worker count decides how many trials finish inside
       // max_time and in what order, so plans found before and after this commit
       // are not comparable and neither are timings taken against them.
-      const int par = path_parallel_setting();
+      const int par = path_parallel_setting(network.tensors.size());
       if (par == -1)
         kwargs["parallel"] = false;
       else if (par >= 1)
