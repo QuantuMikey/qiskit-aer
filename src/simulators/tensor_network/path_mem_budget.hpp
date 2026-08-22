@@ -131,14 +131,34 @@ inline bool self_cgroup_rel_path(const char *self_file, bool v2, char *out,
         break;
       }
     } else {
-      const char *c = std::strstr(line, ":memory:");
-      if (c == nullptr) {
-        const char *c2 = std::strstr(line, ",memory:");
-        if (c2 != nullptr)
-          c = c2;
-      }
-      if (c != nullptr) {
-        std::snprintf(out, cap, "%s", std::strchr(c + 1, ':') + 1);
+      // aer-0078: v1 lines are "N:controller-list:path" with a
+      // COMMA-SEPARATED controller list -- "memory,cpuacct",
+      // "cpu,memory", or "memory" alone are all real forms, and a
+      // substring probe for ":memory:"/",memory:" missed the
+      // memory-first list entirely. Split on the two colons and match
+      // "memory" as an exact token in the list.
+      const char *c1 = std::strchr(line, ':');
+      if (c1 == nullptr)
+        continue;
+      const char *c2p = std::strchr(c1 + 1, ':');
+      if (c2p == nullptr)
+        continue;
+      char ctrls[256];
+      size_t clen = static_cast<size_t>(c2p - (c1 + 1));
+      if (clen >= sizeof(ctrls))
+        continue;
+      std::memcpy(ctrls, c1 + 1, clen);
+      ctrls[clen] = '\0';
+      bool has_memory = false;
+      char *save = nullptr;
+      for (char *tok = strtok_r(ctrls, ",", &save); tok != nullptr;
+           tok = strtok_r(nullptr, ",", &save))
+        if (std::strcmp(tok, "memory") == 0) {
+          has_memory = true;
+          break;
+        }
+      if (has_memory) {
+        std::snprintf(out, cap, "%s", c2p + 1);
         found = true;
         break;
       }
