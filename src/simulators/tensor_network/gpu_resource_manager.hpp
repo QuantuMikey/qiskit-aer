@@ -608,6 +608,8 @@ template <typename data_t> class GPUDevice {
   size_t total_memory_;
   size_t free_memory_;
   hipStream_t stream_;
+  void *bl_workspace_ = nullptr;        // aer-0074 pinned rocBLAS workspace
+  size_t bl_workspace_bytes_ = 0;
   bool handle_valid_;
 #ifdef AER_HIPBLAS
   // aer-0040: the device's GEMM handle, destroyed in release() alongside
@@ -669,6 +671,34 @@ public:
       // profiling model stays valid.
       check_hipblas(hipblasSetStream(bl_handle_, stream_), "hipblasSetStream",
                     device_id_);
+      // aer-0074: pin a persistent rocBLAS workspace. Under the default
+      // device-memory policy rocBLAS may allocate and free workspace ON
+      // EVERY CALL -- a hidden hipMalloc/hipFree pair inside each of the
+      // 169-403 GEMMs per contraction (an allocator tax on the direct
+      // path) and an allocation under stream capture EVERY time, immune
+      // to warm-up: job 21452487's capture pass threw even though its
+      // twin had just executed in the same instance, which is exactly the
+      // per-call-allocation signature. Pinning via hipblasSetWorkspace
+      // stops per-call allocation unconditionally: the direct path sheds
+      // the tax whether or not capture ever works, and capture gets its
+      // first legitimate chance. The workspace is handle-scoped, so it
+      // survives aer-0072 stream recreation with no re-pin needed.
+      // AER_TN_GEMM_WORKSPACE_MB sizes it (default 64; 0 disables pinning
+      // and restores the per-call policy for A/B).
+      {
+        size_t ws_mb = 64;
+        const char *wv = std::getenv("AER_TN_GEMM_WORKSPACE_MB");
+        if (wv != nullptr && wv[0] != '\0')
+          ws_mb = (size_t)std::strtoul(wv, nullptr, 10);
+        if (ws_mb > 0) {
+          check_hip(hipMalloc(&bl_workspace_, ws_mb * 1024ull * 1024ull),
+                    "hipMalloc(gemm workspace)", device_id_);
+          bl_workspace_bytes_ = ws_mb * 1024ull * 1024ull;
+          check_hipblas(hipblasSetWorkspace(bl_handle_, bl_workspace_,
+                                            bl_workspace_bytes_),
+                        "hipblasSetWorkspace", device_id_);
+        }
+      }
       // aer-0041: ATOMICS OFF. The hipBLAS API reference states that some
       // functions use atomic operations for performance, that this "may cause
       // functions to not give bit-wise reproducible results", and that the
@@ -1081,6 +1111,7 @@ public:
     deallocate_sampling_buffers();
 #ifdef AER_HIPBLAS
     if (bl_handle_valid_) { hipblasDestroy(bl_handle_); bl_handle_ = nullptr; bl_handle_valid_ = false; }
+    if (bl_workspace_) { hipFree(bl_workspace_); bl_workspace_ = nullptr; bl_workspace_bytes_ = 0; }
 #endif
     if (stream_) { hipStreamDestroy(stream_); stream_ = nullptr; }
   }

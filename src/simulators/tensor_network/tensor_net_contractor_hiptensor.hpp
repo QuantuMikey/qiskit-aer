@@ -3406,6 +3406,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   // never poison subsequent work again.
   contract_single_slice_direct(slice_index, device_idx);
 
+  // aer-0074: the captured pass enqueues nothing but its host-side timers
+  // still run, double-counting this visit's t_gemm/gemm_calls. Snapshot and
+  // restore so the profile line reports the DIRECT work only.
+  const double snap_gemm_ms = prof_gemm_ms_;
+  const uint64_t snap_gemm_calls = prof_gemm_calls_;
+  const uint64_t snap_ht_calls = prof_ht_calls_;
   hipGraph_t graph = nullptr;
   hipError_t err =
       hipStreamBeginCapture(dev.stream(), hipStreamCaptureModeThreadLocal);
@@ -3416,6 +3422,9 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     } catch (...) {
       body_threw = true;
     }
+    prof_gemm_ms_ = snap_gemm_ms;
+    prof_gemm_calls_ = snap_gemm_calls;
+    prof_ht_calls_ = snap_ht_calls;
     err = hipStreamEndCapture(dev.stream(), &graph);
     if (body_threw) {
       if (graph != nullptr)
