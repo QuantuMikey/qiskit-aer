@@ -57,6 +57,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 namespace AER {
 namespace TensorNetPathMem {
@@ -401,6 +404,58 @@ inline bool reset_peak_rss() {
   bool ok = std::fputs("5", f) >= 0;
   return (std::fclose(f) == 0) && ok;
 }
+
+// aer-0090: a scoped soft cap on the process's data segment, so a search
+// trial whose memory demand is unbounded (a degenerate drawn tree's stats
+// caches -- 158 GiB on one rank at T=49070, job 21474691) dies as a
+// catchable Python MemoryError INSIDE cotengra's per-trial exception
+// handler (hyper.py 326-339 catches any Exception, warns, scores the
+// trial inf, and moves on) instead of taking the node down. RLIMIT_DATA,
+// not RLIMIT_AS: anonymous heap counts under DATA on modern kernels,
+// while HIP's large virtual-address reservations do not, so the engine's
+// device mappings stay untouched. Soft limit only, never raised above an
+// existing tighter limit, restored in the destructor (exception-safe), so
+// nothing after the search ever runs capped. Forked search workers
+// inherit the soft limit, which is the protective direction. Verified by
+// direct test on the exact cotengra classes: under the cap the degenerate
+// contract_stats raises MemoryError, the discard frees the memory, and
+// the next trial in the same process succeeds.
+class ScopedRlimitData {
+public:
+  explicit ScopedRlimitData(uint64_t cap_bytes) {
+#ifndef _WIN32
+    if (cap_bytes == 0)
+      return;
+    if (::getrlimit(RLIMIT_DATA, &saved_) != 0)
+      return;
+    rlim_t cap = static_cast<rlim_t>(cap_bytes);
+    if (saved_.rlim_max != RLIM_INFINITY && cap > saved_.rlim_max)
+      cap = saved_.rlim_max;
+    if (saved_.rlim_cur != RLIM_INFINITY && saved_.rlim_cur <= cap)
+      return; // an existing limit is already at least as tight
+    struct rlimit r = saved_;
+    r.rlim_cur = cap;
+    armed_ = (::setrlimit(RLIMIT_DATA, &r) == 0);
+#else
+    (void)cap_bytes;
+#endif
+  }
+  ~ScopedRlimitData() {
+#ifndef _WIN32
+    if (armed_)
+      ::setrlimit(RLIMIT_DATA, &saved_);
+#endif
+  }
+  ScopedRlimitData(const ScopedRlimitData &) = delete;
+  ScopedRlimitData &operator=(const ScopedRlimitData &) = delete;
+  bool armed() const { return armed_; }
+
+private:
+#ifndef _WIN32
+  struct rlimit saved_ {};
+#endif
+  bool armed_ = false;
+};
 
 } // namespace TensorNetPathMem
 } // namespace AER

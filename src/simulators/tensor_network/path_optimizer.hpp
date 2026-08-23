@@ -1609,6 +1609,55 @@ public:
 
     py::object tree;
 
+    // aer-0090: cap the search's memory. Jobs 21474687-691 (post-0089): at
+    // p>=7 essentially every greedy/labels draw on the real network goes
+    // degenerate, and the trial then dies at a float conversion (cotengra
+    // warns "Trial error: int too large to convert to float" and discards)
+    // or, worse, in its stats build -- 158 GiB on one rank at T=49070
+    // before any conversion was reached. No model can price a quantity
+    // that depends on the drawn tree, so the OS enforces the budget: the
+    // process's data segment is soft-capped for the duration of the search
+    // (probe and reconf included), turning a monster trial into a
+    // MemoryError that cotengra's own per-trial handler absorbs. Default
+    // cap: this rank's share of the node budget. AER_TN_PATH_TRIAL_MEM_MB
+    // overrides in MB; 0 disables.
+    uint64_t search_cap_bytes = 0;
+    {
+      const char *cap_env = std::getenv("AER_TN_PATH_TRIAL_MEM_MB");
+      const bool cap_disabled =
+          cap_env != nullptr && cap_env[0] == '0' && cap_env[1] == '\0';
+      if (!cap_disabled) {
+        uint64_t mb = 0;
+        if (cap_env != nullptr && TensorNetPathMem::parse_u64(cap_env, mb) &&
+            mb > 0) {
+          search_cap_bytes = mb * 1024ull * 1024ull;
+        } else if (cap_env == nullptr) {
+          const uint64_t budget = TensorNetPathMem::node_mem_budget_bytes(
+              "/sys/fs/cgroup", "/sys/fs/cgroup/memory", "/proc/self/cgroup",
+              "/proc/meminfo");
+          long ranks = TensorNetPathMem::local_ranks_sharing_node();
+          if (ranks < 1)
+            ranks = 1;
+          if (budget > 0)
+            search_cap_bytes = budget / static_cast<uint64_t>(ranks);
+        }
+      }
+    }
+    auto search_mem_cap =
+        std::make_unique<TensorNetPathMem::ScopedRlimitData>(search_cap_bytes);
+    if (search_mem_cap->armed())
+      fprintf(stderr,
+              "[AER_TN_PATH] search memory cap: %llu MB (RLIMIT_DATA, "
+              "per-rank share; AER_TN_PATH_TRIAL_MEM_MB overrides, 0 "
+              "disables)\n",
+              (unsigned long long)(search_cap_bytes >> 20));
+    else
+      fprintf(stderr,
+              "[AER_TN_PATH] search memory cap: off (%s)\n",
+              search_cap_bytes == 0
+                  ? "disabled or no memory budget signal"
+                  : "existing limit already tighter, or setrlimit refused");
+
     if (preset_ == "random-greedy") {
       // RandomGreedyOptimizer takes seed as a direct named kwarg — no routing.
       auto opt = ctg.attr("RandomGreedyOptimizer")(
@@ -1930,13 +1979,28 @@ public:
       } catch (py::error_already_set &e) {
         // cotengra raises KeyError('tree') when every hyperopt trial failed
         // (no contraction tree was ever produced). Surface a named,
-        // actionable error instead of the bare KeyError.
+        // actionable error instead of the bare KeyError. aer-0090: include
+        // the number of trials cotengra actually ran -- jobs 21474687-691
+        // logged warning counts far above any 64-repeat budget (15368 per
+        // rank at p=8) from a find_path that provably ran once per rank,
+        // a multiplier not yet source-located; this counter makes the next
+        // occurrence name itself.
+        size_t ntrials = 0;
+        try {
+          ntrials = py::len(opt.attr("scores"));
+        } catch (...) {
+        }
         std::ostringstream msg;
-        msg << "CotengPathOptimizer: cotengra produced no contraction tree "
-               "(every search trial failed). Underlying error: "
+        msg << "CotengPathOptimizer: cotengra produced no contraction tree ("
+            << ntrials
+            << " trial(s) ran; every one failed and was discarded -- see the "
+               "'Trial error:' warnings above for the per-trial causes). "
+               "Underlying error: "
             << e.what();
         throw std::runtime_error(msg.str());
       }
+      fprintf(stderr, "[AER_TN_PATH] search done: %zu trial(s)\n",
+              (size_t)py::len(opt.attr("scores")));
       // aer-0089: the subtree reconfiguration that ReconfTrialFn previously
       // applied to EVERY trial now runs ONCE, on the winner -- same
       // cotengra defaults (subtree_size=8, maxiter=500), 1/64th the cost
@@ -1958,6 +2022,10 @@ public:
         re.discard_as_unraisable("AER_TN_PATH winner reconf");
       }
     }
+
+    // aer-0090: restore the process limit before any post-search work. The
+    // winner's slicing, the engine, and HIP must never run capped.
+    search_mem_cap.reset();
 
     // AER_TN_FORCE_SLICING=1: if the natural path needed no slicing, slice
     // anyway (at least 2 slices). This is the validation hook that lets the
@@ -2004,33 +2072,63 @@ public:
     // guard. Deterministic, seed-free: identical trees cut identically on
     // every rank.
     {
+      // aer-0090: sizes compared in log2 for the same reason as in
+      // pick_slice_index -- the 0089 int64 cast of max_size() throws
+      // py::error_already_set the moment a degenerate winner exceeds 2^63,
+      // before the loop can slice at all. The concrete element count is
+      // cast only once the peak is proven under target (target < 2^63).
+      py::object py_log2 = py::module_::import("math").attr("log2");
+      const double log2_target =
+          std::log2(static_cast<double>(target_elements));
       for (int guard = 0; guard < 128; ++guard) {
-        int64_t cur = tree.attr("max_size")().cast<int64_t>();
-        if (static_cast<uint64_t>(cur) <= target_elements)
+        const double cur_log2 =
+            py_log2(tree.attr("max_size")()).cast<double>();
+        if (cur_log2 <= log2_target + 1e-9)
           break;
         py::object ix = pick_slice_index(tree);
         if (ix.is_none())
           break; // no summed bond left to slice: residual peak is output-bound
         tree.attr("remove_ind_")(ix);
       }
-      const int64_t final_max = tree.attr("max_size")().cast<int64_t>();
-      if (static_cast<uint64_t>(final_max) > target_elements) {
+      const double final_log2 =
+          py_log2(tree.attr("max_size")()).cast<double>();
+      if (final_log2 > log2_target + 1e-9) {
+        // aer-0090: two distinct failure shapes, named apart. Candidates
+        // remaining means the 128-removal guard ran out against a tree so
+        // degenerate that slicing cannot reasonably save it -- a
+        // search-quality failure, not a slicing limitation. No candidates
+        // means the residual peak is truly bound by output modes.
+        py::object more = pick_slice_index(tree);
         std::ostringstream msg;
-        msg << "CotengPathOptimizer: peak intermediate (" << final_max
-            << " elements) exceeds the m6n6k6 tiling envelope ("
-            << target_elements
-            << ") and cannot be reduced further by slicing -- the residual peak "
-               "is bounded by output (open) modes the engine cannot split. This "
-               "output rank exceeds m6n6k6 tiling; request a lower-rank output "
-               "(expectation value, amplitude, or a smaller reduced density "
-               "matrix).";
+        if (!more.is_none()) {
+          msg << "CotengPathOptimizer: the winning tree's peak intermediate "
+                 "(2^"
+              << final_log2
+              << " elements) is still above the m6n6k6 tiling envelope (2^"
+              << log2_target
+              << ") after 128 explicit slicing steps. A peak this far above "
+                 "target is a search-quality failure -- the drawn tree is "
+                 "degenerate -- not a slicing limitation. Widen the method "
+                 "pool (unset AER_TN_PATH_METHODS), raise the trial budget, "
+                 "or raise AER_TN_PATH_MAX_TIME.";
+        } else {
+          msg << "CotengPathOptimizer: peak intermediate (2^" << final_log2
+              << " elements) exceeds the m6n6k6 tiling envelope (2^"
+              << log2_target
+              << ") and cannot be reduced further by slicing -- the residual "
+                 "peak is bounded by output (open) modes the engine cannot "
+                 "split. This output rank exceeds m6n6k6 tiling; request a "
+                 "lower-rank output (expectation value, amplitude, or a "
+                 "smaller reduced density matrix).";
+        }
         throw std::runtime_error(msg.str());
       }
       if (path_verbose()) {
         fprintf(stderr,
                 "[AER_TN_PATH] tiling envelope enforced: peak %lld <= target "
                 "%llu (%zu sliced modes)\n",
-                (long long)final_max, (unsigned long long)target_elements,
+                (long long)tree.attr("max_size")().cast<int64_t>(),
+                (unsigned long long)target_elements,
                 (size_t)py::len(tree.attr("sliced_inds")));
       }
     }
@@ -2131,12 +2229,18 @@ private:
   // Deterministic and seed-free: argmax in traverse order, ties to the
   // first seen, so identical trees slice identically on every rank.
   static py::object pick_slice_index(py::object &tree) {
+    // aer-0090: node sizes are exact Python ints and on degenerate draws
+    // dwarf a double (jobs 21474687-691: peaks far beyond 2^1024, where
+    // float(size) raises OverflowError -- the 0089 cast<double> here would
+    // itself abort). Compare in log2: Python's math.log2 takes
+    // arbitrary-precision ints exactly.
+    py::object py_log2 = py::module_::import("math").attr("log2");
     py::object best_node = py::none();
     double best_size = -1.0;
     for (auto &item : tree.attr("traverse")()) {
       py::tuple t = item.cast<py::tuple>();
       py::object node = py::reinterpret_borrow<py::object>(t[0]);
-      const double s = tree.attr("get_size")(node).cast<double>();
+      const double s = py_log2(tree.attr("get_size")(node)).cast<double>();
       if (s > best_size) {
         best_size = s;
         best_node = node;
