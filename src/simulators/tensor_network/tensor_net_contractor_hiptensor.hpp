@@ -227,12 +227,22 @@ static uint64_t tn_path_seed() {
 // produced tens of thousands of slices, job 19231523, which never completed).
 // This guard refuses such a plan with a clear error instead of grinding. It
 // fires identically on every MPI rank (the MINLOC-broadcast plan is the same
-// everywhere), so the failure is collective and clean. Default 8192 is
-// generous; recovery is to loosen AER_TN_SLICE_TARGET_BYTES, raise this if the
-// cost is acceptable, or use method='statevector'. 0 disables the check.
+// everywhere), so the failure is collective and clean. Enforcement is
+// override-only as of aer-0094 (see below); the check runs only when the
+// operator sets an explicit ceiling.
+// aer-0094: the ceiling DEFAULT is retired. A fixed 8192 was an engine-era
+// wall guard that twice blocked legitimate physics in one day (jobs
+// 21476822/21476823: this campaign's parallelization axis IS slices, per
+// its source paper), and it is exactly the kind of arbitrary constant the
+// operator directive forbids. The planner now computes and prints the
+// exact plan cost (total FLOPs, slices, steps) at plan time, and the
+// wall-derived in-situ gate -- contract the first slice, measure it,
+// extrapolate against the allocation's remaining wall, decide -- is
+// aer-0095. AER_TN_MAX_SLICES remains as a pure override: set it to
+// enforce an explicit ceiling; unset (or 0) means no ceiling.
 static uint64_t tn_max_slices() {
   static bool checked = false;
-  static uint64_t cached = 8192;
+  static uint64_t cached = 0;
   if (!checked) {
     const char *val = std::getenv("AER_TN_MAX_SLICES");
     if (val != nullptr) {
@@ -243,8 +253,8 @@ static uint64_t tn_max_slices() {
       } else {
         fprintf(stderr,
                 "[AER_TN] warning: AER_TN_MAX_SLICES='%s' is not a non-negative "
-                "integer; using default %llu.\n",
-                val, (unsigned long long)cached);
+                "integer; leaving the ceiling off.\n",
+                val);
       }
     }
     checked = true;

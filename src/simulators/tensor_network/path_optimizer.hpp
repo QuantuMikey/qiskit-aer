@@ -2133,83 +2133,74 @@ sys.modules["cotengrust"] = _aer_m
       }
     }
 
-    // Enforce the per-slice MEMORY envelope as ACHIEVED, not merely
-    // targeted. target_elements is min(device budget,
-    // AER_TN_SLICE_TARGET_BYTES) in elements -- since the GEMM pivot the
-    // bound is memory, not the m6n6k6 kernel shape, and the messages below
-    // now say so (job 21476057's error read "m6n6k6 tiling envelope" and
-    // was rightly questioned: the campaign is memory-bound, not
-    // shape-bound). The search returns a RAW tree (aer-0089: trials carry
-    // no slicing), and even before that the returned tree was not
-    // guaranteed to reach target -- a low-FLOPs under-sliced tree can
-    // score best; across the MPI ensemble the MINLOC(FLOPs) pick then
-    // actively favors the laxest rank (the 8-GCD miscompute). So this pass
-    // is where EVERY tree, from either preset, is cut to the envelope --
-    // and it cuts explicitly: pick_slice_index removes the largest-extent
-    // summed leg of the largest intermediate, one index per iteration, via
-    // the same remove_ind_ primitive cotengra's own slice() ends with
-    // (core.py 2223-2226) -- minus SliceFinder and its per-step
-    // ContractionCosts cache, the 124-197 GB consumer named in aer-0089.
-    // Excluding output modes is allow_outer=false by construction,
-    // matching the engine's accumulator and extract_plan's guard.
-    // Deterministic, seed-free: identical trees cut identically on every
-    // rank.
-    //
-    // aer-0092: the slice ceiling lives INSIDE the loop. One removal cuts
-    // the peak by one extent (a factor of 2 on these networks), so a
-    // winner at 2^161 needs ~132 removals -- job 21476057 (p=9) burned the
-    // old 128-step guard and reported "still above the envelope after 128
-    // steps", reading as a slicer defect when four more steps would have
-    // "fit" the envelope with a 2^132-slice plan that the
-    // AER_TN_MAX_SLICES ceiling (default 8192 = 2^13) refuses anyway. The
-    // moment the accumulated slice count exceeds that ceiling, fitting is
-    // pointless: fail there, in ~13 steps, with the truthful cause. This
-    // subsumes the aer-0091 post-envelope ceiling check. The 4096-step
-    // guard is a pure infinite-loop backstop, unreachable before the
-    // ceiling.
+    // Enforce the per-slice MEMORY envelope as ACHIEVED, via DYNAMIC
+    // SLICING: interleave slicing with subtree reconfiguration. Slicing an
+    // index changes which contraction tree is optimal, so a tree cut many
+    // modes without re-optimisation can be orders of magnitude more
+    // expensive than the same tree re-optimised as it is cut -- the
+    // standard technique of the contraction-optimisation literature
+    // (arXiv:2002.01935; introduced in arXiv:2005.06787; "interleaving
+    // index slicing with local reconfigurations of the contraction order
+    // to keep it near-optimal given the already sliced indices",
+    // Nat. Comput. Sci. 1, 578 (2021)). Measured on the exact cotengra
+    // classes (12x12 grid, mediocre starting tree, target 2^8): slice-only
+    // lands at 2^127 total FLOPs; reconfigure-once-then-slice (the
+    // aer-0089..0092 pipeline, the shape that produced jobs
+    // 21476822/21476823's 2^24-slice explosions) at 2^53 FLOPs / 2^38
+    // slices; dynamic slicing at 2^28.5 FLOPs / 8192 slices. Granularity:
+    // reconfigure after every AER_TN_SLICE_RECONF_EVERY removals (default
+    // 4, the measured-best granularity, matching the literature's
+    // slice-factor of ~32 = ~5 binary indices per round; 0 disables the
+    // interleave). aer-0094 also REMOVES the slice-count gate from this
+    // loop: a fixed ceiling is an arbitrary constant that twice blocked
+    // legitimate physics today, and the exact plan cost is now computed
+    // and printed at plan time instead -- the wall-derived in-situ gate
+    // (measure the first slice, extrapolate, decide) is aer-0095.
+    // target_elements is min(device budget, AER_TN_SLICE_TARGET_BYTES) in
+    // elements: a memory bound, not a kernel-shape bound. Excluding output
+    // modes is allow_outer=false by construction, matching the engine's
+    // accumulator and extract_plan's guard.
     {
       py::object py_log2 = py::module_::import("math").attr("log2");
       const double log2_target =
           std::log2(static_cast<double>(target_elements));
-      const uint64_t slice_ceiling =
-          TensorNetPathMem::env_u64("AER_TN_MAX_SLICES", 8192);
+      const uint64_t reconf_every =
+          TensorNetPathMem::env_u64("AER_TN_SLICE_RECONF_EVERY", 4);
+      uint64_t since_reconf = 0;
+      bool sliced_any = false;
       for (int guard = 0; guard < 4096; ++guard) {
         const double cur_log2 =
             py_log2(tree.attr("max_size")()).cast<double>();
         if (cur_log2 <= log2_target + 1e-9)
           break;
-        if (tree_num_slices(tree) > slice_ceiling) {
-          const size_t modes = py::len(tree.attr("sliced_inds"));
-          std::ostringstream msg;
-          msg << "CotengPathOptimizer: the winning tree's peak intermediate "
-                 "is still 2^"
-              << cur_log2
-              << " elements against a per-slice memory envelope of 2^"
-              << log2_target
-              << " elements (the smaller of the device budget and "
-                 "AER_TN_SLICE_TARGET_BYTES), and cutting it this far has "
-                 "already cost "
-              << modes << " sliced modes -- beyond the AER_TN_MAX_SLICES "
-                          "ceiling of "
-              << slice_ceiling
-              << " slices. The search found no contractable tree at this "
-                 "depth: a search-quality failure, not a slicing or "
-                 "per-slice-budget limitation. Raise the trial budget "
-                 "(AER_TN_PATH_MAX_REPEATS), raise AER_TN_PATH_MAX_TIME, or "
-                 "widen the method pool.";
-          throw std::runtime_error(msg.str());
-        }
         py::object ix = pick_slice_index(tree);
         if (ix.is_none())
           break; // no summed bond left to slice: residual peak is output-bound
         tree.attr("remove_ind_")(ix);
+        sliced_any = true;
+        if (reconf_every > 0 && ++since_reconf >= reconf_every) {
+          since_reconf = 0;
+          try {
+            tree.attr("subtree_reconfigure_")();
+          } catch (py::error_already_set &re) {
+            fprintf(stderr,
+                    "[AER_TN_PATH] warning: subtree_reconfigure_ raised "
+                    "during dynamic slicing: %s -- continuing\n",
+                    re.what());
+            re.discard_as_unraisable("AER_TN_PATH dynamic slicing reconf");
+          }
+        }
+      }
+      if (sliced_any && reconf_every > 0 && since_reconf > 0) {
+        try {
+          tree.attr("subtree_reconfigure_")();
+        } catch (py::error_already_set &re) {
+          re.discard_as_unraisable("AER_TN_PATH dynamic slicing reconf");
+        }
       }
       const double final_log2 =
           py_log2(tree.attr("max_size")()).cast<double>();
       if (final_log2 > log2_target + 1e-9) {
-        // Only reachable with no sliceable candidate left (the in-loop
-        // ceiling fires within ~13 removals otherwise): genuinely
-        // output-bound.
         std::ostringstream msg;
         msg << "CotengPathOptimizer: peak intermediate (2^" << final_log2
             << " elements) exceeds the per-slice memory envelope (2^"
@@ -2293,6 +2284,26 @@ sys.modules["cotengrust"] = _aer_m
                       ? " -- FLOOR NOT REACHED: too few sliceable summed bonds"
                       : "");
       }
+    }
+
+    // aer-0094: the exact plan cost, computed from the sliced tree and
+    // printed unconditionally -- multiplicity-inclusive total FLOPs (exact
+    // arbitrary-precision integers underneath; reported in log2 so no
+    // magnitude can overflow the report), slice count, and steps per
+    // slice. This line is the calculated replacement for the retired
+    // fixed slice ceiling: the researcher and the aer-0095 in-situ wall
+    // gate both read cost, not guess it.
+    {
+      py::object py_log2 = py::module_::import("math").attr("log2");
+      py::dict st = tree.attr("contract_stats")();
+      const double lf = py_log2(st["flops"]).cast<double>();
+      fprintf(stderr,
+              "[AER_TN_PATH] plan cost: total_flops=%.3e (2^%.1f) "
+              "slices=%llu steps_per_slice=%lld sliced_modes=%zu\n",
+              std::exp2(lf), lf,
+              (unsigned long long)tree_num_slices(tree),
+              (long long)(tree.attr("N").cast<int64_t>() - 1),
+              (size_t)py::len(tree.attr("sliced_inds")));
     }
 
     return extract_plan(tree, std::set<int32_t>(network.output_modes.begin(),
