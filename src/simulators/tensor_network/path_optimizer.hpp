@@ -1705,6 +1705,112 @@ public:
                   ? "disabled or no memory budget signal"
                   : "existing limit already tighter, or setrlimit refused");
 
+    // aer-0101: bound the memory of per-trial tree scoring. Every hyperopt
+    // trial ends in tree.contract_stats() (hyper.py trial wrappers;
+    // scoring.py ensure_basic_quantities_are_computed), and stock
+    // contract_stats walks every interior node through get_flops/get_size
+    // -> get_involved (core.py:826), a cached_node_property that
+    // materializes AND RETAINS a dict of every index involved in that
+    // node's subgraph, for every node at once. On the unbalanced trees
+    // greedy and kahypar draw for these circuits, spine nodes each involve
+    // O(N) indices across O(N) nodes: the retained caches are quadratic in
+    // the network, measured in the field as the 158 GiB raw-tree stats
+    // transient of job 21474691 and, under the aer-0090 RLIMIT, as the
+    // empty-message MemoryError trial deaths of jobs 21479115/21479355/
+    // 21480712 (12 of 12 and 9 of 9 trials on single ranks). The cap was
+    // therefore selecting AGAINST badly shaped trees mid-scoring at a cost
+    // of minutes and one budget slot each, instead of letting them score
+    // and lose honestly.
+    //
+    // The replacement is a streaming stats pass installed over
+    // ContractionTree.contract_stats: one post-order traverse() computing
+    // each parent's involved set from its children's legs, retaining legs
+    // only for frontier nodes (children freed the moment their parent is
+    // computed) and never touching the per-node caches. Identical exact
+    // integers, identical tracked post-state (_flops/_write/_sizes and
+    // flags, so a later max_size() reuses them), identical multiplicity
+    // handling. Two guards keep it conservative: trees WITH sliced_inds
+    // delegate to stock byte-for-byte (trials are slice-free since
+    // aer-0089; the sliced winner's plan-cost call keeps the proven
+    // path), and the already-tracked fast path delegates too. Class-level
+    // and process-local: serial (forge) searches are covered fully;
+    // parallel loky workers are separate processes and keep stock stats --
+    // stated plainly, not claimed. AER_TN_STREAM_STATS=0 restores stock
+    // for debugging; the default is the hands-off path.
+    {
+      static bool stream_stats_done = false;
+      const char *ss = std::getenv("AER_TN_STREAM_STATS");
+      const bool ss_off = ss != nullptr && ss[0] == '0' && ss[1] == '\0';
+      if (!stream_stats_done && !ss_off) {
+        try {
+          py::exec(R"AER(
+import cotengra.core as _aer_core
+if not getattr(_aer_core.ContractionTree.contract_stats,
+               "_aer_streaming", False):
+    _aer_stock_cs = _aer_core.ContractionTree.contract_stats
+    def _aer_streaming_cs(self, force=False):
+        if self.sliced_inds or self.N <= 2:
+            return _aer_stock_cs(self, force=force)
+        if (not force and self._track_flops and self._track_write
+                and self._track_size):
+            return _aer_stock_cs(self, force=False)
+        flops = 0
+        write = 0
+        sizes = _aer_core.MaxCounter()
+        legs_of = {}
+        appearances = self.appearances
+        size_dict = self.size_dict
+        N = self.N
+        get_legs = self.get_legs
+        for node, l, r in self.traverse():
+            l_legs = get_legs(l) if len(l) == 1 else legs_of.pop(l)
+            r_legs = get_legs(r) if len(r) == 1 else legs_of.pop(r)
+            involved = _aer_core.legs_union((l_legs, r_legs))
+            flops += _aer_core.compute_size_by_dict(involved, size_dict)
+            if len(node) == N:
+                legs = {ix: 0 for ix in self.output}
+            else:
+                legs = {ix: c for ix, c in involved.items()
+                        if c < appearances[ix]}
+            node_size = _aer_core.compute_size_by_dict(legs, size_dict)
+            write += node_size
+            sizes.add(node_size)
+            if len(node) != N:
+                legs_of[node] = legs
+        self._flops = flops
+        self._write = write
+        self._sizes = sizes
+        self._track_flops = self._track_write = self._track_size = True
+        return {"flops": self.multiplicity * flops,
+                "write": self.multiplicity * write,
+                "size": sizes.max()}
+    _aer_streaming_cs._aer_streaming = True
+    _aer_streaming_cs._aer_stock = _aer_stock_cs
+    _aer_core.ContractionTree.contract_stats = _aer_streaming_cs
+)AER");
+          stream_stats_done = true;
+          fprintf(stderr,
+                  "[AER_TN_PATH] trial stats memory-bounded (streaming "
+                  "pass over contract_stats; AER_TN_STREAM_STATS=0 "
+                  "restores stock)\n");
+        } catch (py::error_already_set &sb) {
+          fprintf(stderr,
+                  "[AER_TN_PATH] warning: could not install streaming "
+                  "contract_stats: %s -- stock stats remain, trials on "
+                  "unbalanced trees can exhaust the search memory cap\n",
+                  sb.what());
+          sb.discard_as_unraisable("AER_TN_PATH streaming stats");
+        }
+      } else if (!stream_stats_done && ss_off) {
+        static bool said = false;
+        if (!said) {
+          said = true;
+          fprintf(stderr, "[AER_TN_PATH] streaming trial stats disabled "
+                          "(AER_TN_STREAM_STATS=0)\n");
+        }
+      }
+    }
+
     // aer-0091/0096: while the cap is armed, cotengrust must not run. Rust
     // ABORTS the process on allocation failure ("memory allocation of N
     // bytes failed", SIGABRT) instead of raising -- jobs 21476058/21476059
