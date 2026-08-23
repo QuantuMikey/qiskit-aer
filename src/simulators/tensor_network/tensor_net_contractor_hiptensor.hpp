@@ -27,6 +27,7 @@
 #include <atomic>
 #include "simulators/tensor_network/path_mem_budget.hpp"
 #include <chrono>
+#include <ctime>
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -260,6 +261,87 @@ static uint64_t tn_max_slices() {
     checked = true;
   }
   return cached;
+}
+
+// aer-0095: the wall gate, with no constants and no model. The first slice
+// of every contraction is timed on the real kernel sequence, and the
+// remaining per-device slice count extrapolates it: t_est = t1 x
+// (dev0_share - 1). Job 21477745 validates the premise this is built on:
+// four ranks contracted 128 slices each at 9.36 s/slice within 0.3% of one
+// another, so slice one predicts the run. The wall comes from the
+// allocation itself -- SLURM_JOB_END_TIME (epoch seconds, exported by the
+// scheduler) minus now -- with AER_TN_WALL_BUDGET_S as the override chain
+// and, absent both, the gate off with one logged line. AER_TN_WALL_GATE:
+// unset or '1' aborts an infeasible contraction; 'warn' reports only; '0'
+// disables. The decision is rank-LOCAL by design: an in-loop collective
+// would hang against aer-0067's idle-rank early return, while a local
+// throw is collectivized by the existing agree_or_fail_together machinery
+// -- worst case on a near-threshold split between ranks is exactly the
+// status quo ante (the run proceeds to its natural end) plus a printed
+// report. A gated-out forge has already banked its plan file at setup, so
+// the report's numbers size the replay allocation directly.
+inline double tn_wall_remaining_s(const char **source) {
+  const char *endt = std::getenv("SLURM_JOB_END_TIME");
+  if (endt != nullptr) {
+    char *e = nullptr;
+    long long epoch = std::strtoll(endt, &e, 10);
+    if (e != endt && epoch > 0) {
+      *source = "SLURM_JOB_END_TIME";
+      return (double)epoch - (double)time(nullptr);
+    }
+  }
+  const char *budget = std::getenv("AER_TN_WALL_BUDGET_S");
+  if (budget != nullptr) {
+    char *e = nullptr;
+    long long secs = std::strtoll(budget, &e, 10);
+    if (e != budget && secs > 0) {
+      *source = "AER_TN_WALL_BUDGET_S";
+      return (double)secs;
+    }
+  }
+  *source = nullptr;
+  return -1.0;
+}
+
+inline void tn_wall_gate_check(double t1_s, uint64_t dev0_share, int rank) {
+  const char *mode = std::getenv("AER_TN_WALL_GATE");
+  if (mode != nullptr && mode[0] == '0' && mode[1] == '\0')
+    return;
+  const bool warn_only =
+      mode != nullptr && std::strcmp(mode, "warn") == 0;
+  if (dev0_share < 2)
+    return; // nothing left to extrapolate
+  const char *source = nullptr;
+  const double remaining = tn_wall_remaining_s(&source);
+  if (source == nullptr) {
+    static bool logged = false;
+    if (!logged) {
+      fprintf(stderr,
+              "[AER_TN] wall gate off: neither SLURM_JOB_END_TIME nor "
+              "AER_TN_WALL_BUDGET_S is set\n");
+      logged = true;
+    }
+    return;
+  }
+  const double t_est = t1_s * (double)(dev0_share - 1);
+  fprintf(stderr,
+          "[AER_TN] wall gate: first slice %.3f s x %llu remaining = %.1f s "
+          "estimated vs %.1f s remaining (%s), rank %d\n",
+          t1_s, (unsigned long long)(dev0_share - 1), t_est, remaining,
+          source, rank);
+  if (t_est <= remaining || warn_only)
+    return;
+  std::stringstream err;
+  err << "[AER_TN] contraction infeasible on this allocation: the first "
+         "slice took "
+      << t1_s << " s on the real kernel sequence, and " << (dev0_share - 1)
+      << " more slices on this device extrapolate to " << t_est
+      << " s against " << remaining << " s of remaining wall (" << source
+      << "). This decision is measured, not modeled: resubmit with a wall "
+         ">= the estimate plus setup, or replay the already-banked plan on "
+         "more ranks so each carries fewer slices. AER_TN_WALL_GATE=warn "
+         "reports without aborting; AER_TN_WALL_GATE=0 disables.";
+  throw std::runtime_error(err.str());
 }
 
 //=============================================================================
@@ -3356,6 +3438,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
                  thrust::complex<data_t>(0.0, 0.0));
     return;
   }
+  // aer-0095: the wall gate's clock starts here, so t1 is the first
+  // slice's true cost including its share of buffer setup on this call.
+  const std::chrono::steady_clock::time_point gate_t0 =
+      std::chrono::steady_clock::now();
   for (int idev = 0; idev < num_devices_used_; idev++) {
     uint_t dev_slice_begin =
         slice_begin_ + (slice_end_ - slice_begin_) * idev / num_devices_used_;
@@ -3371,6 +3457,22 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
 
     for (uint_t s = dev_slice_begin; s < dev_slice_end; s++) {
       contract_single_slice(s, idev);
+      // aer-0095: after the very first slice of the call, synchronize the
+      // stream so the elapsed time is the slice's true cost, then gate the
+      // remainder against the allocation's remaining wall. Devices run
+      // concurrently on their own streams, so per-call cost is governed by
+      // the largest per-device share -- the ceiling of the rank's slice
+      // count over the device count, independent of how the split rounds.
+      // The sync adds no work: these kernels must complete regardless.
+      if (idev == 0 && s == dev_slice_begin) {
+        hipStreamSynchronize(gpu_mgr_.device(0).stream());
+        const double t1_s = tn_ms_since(gate_t0) / 1000.0;
+        const uint64_t max_share =
+            ((uint64_t)(slice_end_ - slice_begin_) +
+             (uint64_t)num_devices_used_ - 1) /
+            (uint64_t)num_devices_used_;
+        tn_wall_gate_check(t1_s, max_share, myrank_);
+      }
     }
   }
 }
