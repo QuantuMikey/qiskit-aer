@@ -2661,7 +2661,17 @@ private:
       }
 
       plan.sliced.push_back(si);
-      plan.num_slices *= static_cast<uint64_t>(si.extent);
+      // aer-0102: saturate, do not wrap -- aer-0091 parity with
+      // tree_num_slices. Job 21483368 (p=10): 92-120 extent-2 sliced
+      // modes wrapped this product to ZERO (2^92 mod 2^64), so a real
+      // tree's plan carried num_slices=0 into the reduction. UINT64_MAX
+      // is the "at least 2^64 slices" sentinel; the MPI validation and
+      // the contractor both refuse it loudly.
+      const uint64_t aer0102_ext = static_cast<uint64_t>(si.extent);
+      if (aer0102_ext > 0 && plan.num_slices > UINT64_MAX / aer0102_ext)
+        plan.num_slices = UINT64_MAX;
+      else
+        plan.num_slices *= aer0102_ext;
     }
 
     plan.total_flops = tree.attr("total_flops")().cast<double>();
@@ -3035,32 +3045,71 @@ public:
           "output path; re-planning all ranks with tiling engaged.");
     }
 
+    // aer-0102: a rank whose search RETURNED but returned a degenerate
+    // plan is treated exactly like a searchless rank, with attribution,
+    // BEFORE the reduction -- whatever produces such a plan, it must
+    // never enter the MINLOC as a finite candidate.
+    if (local_ok &&
+        (local.steps.size() + 1 != network.tensors.size() ||
+         local.num_slices == 0)) {
+      local_ok = false;
+      std::ostringstream dm;
+      dm << "search returned a degenerate plan (steps=" << local.steps.size()
+         << ", num_slices=" << local.num_slices << ", network tensors="
+         << network.tensors.size() << ")";
+      local_msg = dm.str();
+      fprintf(stderr,
+              "[AER_TN_PATH] rank %d: %s; this rank will adopt the winning "
+              "rank's plan.\n",
+              rank, local_msg.c_str());
+    }
+
+    // aer-0102: the aer-0100 sentinel was std::numeric_limits<double>::
+    // infinity() -- and this translation unit compiles with -ffast-math
+    // (CMakeLists.txt:460, ROCM_EXTRA_FLAGS), which implies
+    // -ffinite-math-only: the compiler is licensed to assume no infinity
+    // exists, so the sentinel materialized as an arbitrary finite value
+    // and the "cost < infinity" all-fail test folded to constant true.
+    // Field result, in the adoption path's first two executions: jobs
+    // 21483368 (p=10) and 21483895 (p=8) each held real finite plans on
+    // the searching ranks (p=8: seven plans, best 2.192e15 FLOPs at 256
+    // slices), yet the MINLOC crowned a SEARCHLESS rank -- its garbage
+    // sentinel undercut every real cost -- and broadcast that rank's
+    // default-constructed plan: steps=0, num_slices=0, total_flops an
+    // uninitialized denormal. The aer-0067 idle-rank allowance then read
+    // zero slices as a small replayed plan, every rank contracted
+    // nothing, and an exact zero shipped as the answer -- silent-wrong,
+    // the worst class. Job 21483367 (p=9, zero searchless ranks) never
+    // selected the sentinel and transported correctly: exactly the
+    // observed law. The fix removes infinity and inf-comparisons from
+    // this TU entirely (audited: these were the only two uses).
+    // All-fail is decided by the integer failed-rank count BEFORE the
+    // MINLOC; the searchless sentinel is finite DBL_MAX, unreachable by
+    // any real plan cost. Both are fast-math-proof. -ffast-math itself
+    // is left untouched: it is load-bearing for kernel performance, and
+    // the contract is that this TU never relies on inf/NaN semantics.
     int local_failed = local_ok ? 0 : 1;
     int failed_ranks = 0;
     MPI_Allreduce(&local_failed, &failed_ranks, 1, MPI_INT, MPI_SUM, comm_);
-
-    struct { double cost; int rank; } local_result, global_result;
-    local_result.cost = local_ok
-                            ? local.total_flops
-                            : std::numeric_limits<double>::infinity();
-    local_result.rank = rank;
-    MPI_Allreduce(&local_result, &global_result, 1, MPI_DOUBLE_INT,
-                  MPI_MINLOC, comm_);
-
-    if (!(global_result.cost < std::numeric_limits<double>::infinity())) {
-      // Identical reduced values on every rank -> an identical throw on
-      // every rank, still BEFORE any broadcast: the fail-together
-      // guarantee holds exactly where it matters.
+    if (failed_ranks >= size) {
+      // Integer agreement, identical on every rank, still BEFORE any
+      // broadcast: the fail-together guarantee holds exactly where it
+      // matters.
       std::ostringstream msg;
       msg << "[AER_TN] MPI path search: every rank failed (" << failed_ranks
           << " of " << size
           << " produced no plan); nothing to adopt. This rank's cause: "
-          << (local_ok ? std::string("(this rank reported a non-finite plan "
-                                     "cost despite succeeding, which should "
-                                     "not happen)")
+          << (local_ok ? std::string("(no cause recorded on this rank)")
                        : local_msg);
       throw std::runtime_error(msg.str());
     }
+
+    struct { double cost; int rank; } local_result, global_result;
+    local_result.cost = local_ok ? local.total_flops
+                                 : std::numeric_limits<double>::max();
+    local_result.rank = rank;
+    MPI_Allreduce(&local_result, &global_result, 1, MPI_DOUBLE_INT,
+                  MPI_MINLOC, comm_);
 
     if (path_verbose() && rank == 0) {
       fprintf(stderr,
@@ -3124,6 +3173,37 @@ public:
               comm_);
 
     ContractionPlan plan = ContractionPlan::deserialize(path_data);
+
+    // aer-0102: validate the adopted plan on every rank from the SAME
+    // broadcast bytes, so the decision is identical everywhere and any
+    // throw is collective by construction. A degenerate plan must never
+    // leave this function (see the sentinel comment above for what it
+    // did downstream), and a saturated slice count -- at least 2^64
+    // slices, the extract_plan sentinel -- is unusably expensive by
+    // definition and refused here with the honest remedy named.
+    if (network.tensors.size() >= 2 &&
+        (plan.steps.empty() || plan.num_slices == 0 ||
+         plan.steps.size() + 1 != network.tensors.size())) {
+      std::ostringstream msg;
+      msg << "[AER_TN] MPI path search: the adopted plan from rank "
+          << global_result.rank << " is degenerate (steps="
+          << plan.steps.size() << ", num_slices=" << plan.num_slices
+          << ", network tensors=" << network.tensors.size()
+          << ", failed_ranks=" << failed_ranks << " of " << size
+          << "). Refusing to contract it on any rank.";
+      throw std::runtime_error(msg.str());
+    }
+    if (plan.num_slices == UINT64_MAX) {
+      std::ostringstream msg;
+      msg << "[AER_TN] MPI path search: the winning plan's slice count "
+             "saturated (at least 2^64 slices; "
+          << plan.sliced.size()
+          << " sliced modes): the search produced an unusably expensive "
+             "path on every rank that finished. Re-search with a larger "
+             "trial budget or different methods; no allocation can "
+             "contract this plan.";
+      throw std::runtime_error(msg.str());
+    }
 
     // Re-resolve each sliced mode ID into THIS rank's mode namespace via its
     // structural coordinate (extents and num_slices are unchanged).
