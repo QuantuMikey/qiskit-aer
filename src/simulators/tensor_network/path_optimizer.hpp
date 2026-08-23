@@ -1662,22 +1662,30 @@ public:
                   ? "disabled or no memory budget signal"
                   : "existing limit already tighter, or setrlimit refused");
 
-    // aer-0091: while the cap is armed, cotengrust must not run. Rust
+    // aer-0091/0096: while the cap is armed, cotengrust must not run. Rust
     // ABORTS the process on allocation failure ("memory allocation of N
     // bytes failed", SIGABRT) instead of raising -- jobs 21476058/21476059
-    // died exactly this way, mid-trial at the RLIMIT, killing the whole
-    // job where a Python trial would have been discarded and the search
-    // continued. cotengra dispatches greedy/random-greedy/optimal to
-    // cotengrust whenever importlib finds it (path_basic.py 1267/1285/
-    // 1581), so the block substitutes a module of the same name whose
-    // functions ARE cotengra's own Python implementations (path_basic
-    // module-level optimize_greedy / optimize_random_greedy_track_flops /
-    // optimize_optimal): find_spec succeeds, the import succeeds, and
-    // every trial becomes MemoryError-recoverable. The dispatch getters
-    // are lru_cached, so this is applied once and holds for the process
-    // lifetime -- which is the safe direction, since a later uncapped
-    // search losing some Rust speed is nothing against a capped search
-    // losing the node. AER_TN_PATH_ALLOW_RUST=1 opts out.
+    // died exactly this way. The 0091 shim replaced sys.modules only, and
+    // job 21478441's fault-handler backtrace proved that insufficient: at
+    // IMPORT TIME cotengra freezes the resolved Rust function into a
+    // module-level partial (path_greedy.py:7, ssa_greedy_optimize =
+    // functools.partial(get_optimize_greedy(), use_ssa=True)), and
+    // trial_greedy calls that captured object forever after -- no module
+    // swap can reach a captured function. presets.py:58 holds the optimal
+    // getter's result the same way on preset instances. So the block now
+    // does all of it: install a module named cotengrust whose functions
+    // ARE cotengra's own Python implementations (find_spec succeeds, the
+    // import succeeds), clear the three lru-cached getters so every future
+    // resolution lands on the shim, rebind path_greedy's frozen partial
+    // directly to the Python implementation, and sweep preset instances
+    // for a captured optimal. Validated against a reproduction of the
+    // container's import topology: a sentinel "cotengrust" installed
+    // FIRST so the import-time capture happens (the sentinel fires,
+    // proving the trap), then this exact block, after which the partial,
+    // a full hyper greedy search, and every getter resolve pure Python
+    // with zero sentinel hits. The dispatch getters are lru_cached, so
+    // this is applied once and holds for the process lifetime -- the safe
+    // direction. AER_TN_PATH_ALLOW_RUST=1 opts out.
     if (search_mem_cap->armed()) {
       const char *allow_rust = std::getenv("AER_TN_PATH_ALLOW_RUST");
       const bool rust_ok =
@@ -1686,8 +1694,10 @@ public:
       if (!rust_ok && !rust_block_done) {
         try {
           py::exec(R"(
-import sys, types, importlib.machinery
+import sys, types, importlib.machinery, functools
 from cotengra.pathfinders import path_basic as _aer_pb
+from cotengra.pathfinders import path_greedy as _aer_pg
+from cotengra import presets as _aer_presets
 _aer_m = types.ModuleType("cotengrust")
 _aer_m.__spec__ = importlib.machinery.ModuleSpec("cotengrust", loader=None)
 _aer_m.optimize_greedy = _aer_pb.optimize_greedy
@@ -1695,6 +1705,14 @@ _aer_m.optimize_random_greedy_track_flops = (
     _aer_pb.optimize_random_greedy_track_flops)
 _aer_m.optimize_optimal = _aer_pb.optimize_optimal
 sys.modules["cotengrust"] = _aer_m
+_aer_pb.get_optimize_greedy.cache_clear()
+_aer_pb.get_optimize_random_greedy_track_flops.cache_clear()
+_aer_pb.get_optimize_optimal.cache_clear()
+_aer_pg.ssa_greedy_optimize = functools.partial(
+    _aer_pb.optimize_greedy, use_ssa=True)
+for _aer_obj in vars(_aer_presets).values():
+    if hasattr(_aer_obj, "_optimize_optimal_fn"):
+        _aer_obj._optimize_optimal_fn = _aer_pb.optimize_optimal
 )");
           rust_block_done = true;
           fprintf(stderr,
