@@ -2260,16 +2260,37 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
       const double final_log2 =
           py_log2(tree.attr("max_size")()).cast<double>();
       if (final_log2 > log2_target + 1e-9) {
+        // aer-0098: two truthfully-named exits. With candidates remaining
+        // this can only be the 4096-iteration backstop -- reachable in
+        // principle on a tree needing thousands of cuts (74k summed
+        // indices exist at the deepest campaign networks), and the
+        // output-bound wording would then be false. Candidate-free means
+        // genuinely output-bound.
+        py::object more = pick_slice_index(tree);
         std::ostringstream msg;
-        msg << "CotengPathOptimizer: peak intermediate (2^" << final_log2
-            << " elements) exceeds the per-slice memory envelope (2^"
-            << log2_target
-            << " elements, the smaller of the device budget and "
-               "AER_TN_SLICE_TARGET_BYTES) and cannot be reduced further by "
-               "slicing -- the residual peak is bounded by output (open) "
-               "modes the engine cannot split. Request a lower-rank output "
-               "(expectation value, amplitude, or a smaller reduced density "
-               "matrix), or raise AER_TN_SLICE_TARGET_BYTES.";
+        if (!more.is_none()) {
+          msg << "CotengPathOptimizer: dynamic slicing stopped at the "
+                 "4096-iteration backstop with the peak still 2^"
+              << final_log2
+              << " elements against the per-slice memory envelope of 2^"
+              << log2_target
+              << " and sliceable candidates remaining -- the winning tree "
+                 "needs thousands of cuts, which no plan survives. This is "
+                 "a search-quality failure: raise the trial budget "
+                 "(AER_TN_PATH_MAX_REPEATS), raise AER_TN_PATH_MAX_TIME, or "
+                 "widen the method pool.";
+        } else {
+          msg << "CotengPathOptimizer: peak intermediate (2^" << final_log2
+              << " elements) exceeds the per-slice memory envelope (2^"
+              << log2_target
+              << " elements, the smaller of the device budget and "
+                 "AER_TN_SLICE_TARGET_BYTES) and cannot be reduced further "
+                 "by slicing -- the residual peak is bounded by output "
+                 "(open) modes the engine cannot split. Request a "
+                 "lower-rank output (expectation value, amplitude, or a "
+                 "smaller reduced density matrix), or raise "
+                 "AER_TN_SLICE_TARGET_BYTES.";
+        }
         throw std::runtime_error(msg.str());
       }
       if (path_verbose()) {
