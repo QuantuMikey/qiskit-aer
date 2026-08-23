@@ -1769,16 +1769,52 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           // where the over-slicing twin is already refused, so
           // plan_valid_ stays false and the aer-0087 guard keeps the
           // plan out of the library.
-          if (plan_.num_slices == 0 && !plan_.steps.empty()) {
+          // aer-0103: the aer-0088 guard required !plan_.steps.empty(),
+          // so a plan that was degenerate in BOTH fields -- zero slices
+          // AND zero steps -- walked through the carve-out. Jobs
+          // 21483368 and 21483895 did exactly that: a default-
+          // constructed plan arrived here, plan_valid_ was set, the
+          // aer-0067 idle-rank allowance declared 0 slices for 8 ranks
+          // "correct but idle", every rank contracted nothing, ZZ=+0.0
+          // shipped as a plain result, and the poison was captured into
+          // the width-8 plan library. On a network of two or more
+          // tensors, ANY of zero slices, empty steps, or a step count
+          // that does not match the network (steps = tensors - 1) is a
+          // setup error, never an idle configuration. A single-tensor
+          // network legitimately has zero steps and stays exempt.
+          if (network_desc_.tensors.size() >= 2 &&
+              (plan_.num_slices == 0 || plan_.steps.empty() ||
+               plan_.steps.size() + 1 != network_desc_.tensors.size())) {
             std::stringstream err;
-            err << "[AER_TN] plan has ZERO slices for a nonempty network: "
-                   "the slicer could not satisfy the per-slice budget "
-                   "(path cost "
+            err << "[AER_TN] degenerate plan for a nonempty network "
+                   "(steps="
+                << plan_.steps.size() << ", num_slices="
+                << plan_.num_slices << ", network tensors="
+                << network_desc_.tensors.size()
+                << "): zero slices, empty steps, or a step count that "
+                   "does not match the network. The plan is refused, "
+                   "plan_valid_ stays false, and nothing is captured. If "
+                   "slices are zero with real steps, the search produced "
+                   "an unusably expensive path (path cost "
                 << plan_.total_flops
-                << " FLOPs -- the search produced an unusably expensive "
-                   "path). Re-search with a larger trial budget or "
+                << " FLOPs): re-search with a larger trial budget or "
                    "different methods; raising AER_TN_SLICE_TARGET_BYTES "
                    "only masks the path quality problem.";
+            throw std::runtime_error(err.str());
+          }
+          // aer-0103: the saturated sentinel (at least 2^64 slices,
+          // aer-0102's extract_plan parity with aer-0091) is refused
+          // here independently of the optional AER_TN_MAX_SLICES
+          // ceiling -- no allocation can contract it, so it must never
+          // reach the partition arithmetic below.
+          if (plan_.num_slices == UINT64_MAX) {
+            std::stringstream err;
+            err << "[AER_TN] plan slice count saturated (at least 2^64 "
+                   "slices, "
+                << plan_.sliced.size()
+                << " sliced modes): the search produced an unusably "
+                   "expensive path. Re-search with a larger trial budget "
+                   "or different methods.";
             throw std::runtime_error(err.str());
           }
           if (tn_max_slices() > 0 && plan_.num_slices > tn_max_slices()) {
