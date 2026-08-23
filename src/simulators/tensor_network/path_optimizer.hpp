@@ -2867,58 +2867,61 @@ public:
       inner_->set_trial_share(0, 1);
     }
 
-    // Per-rank cotengra search uses a rank-dependent seed, so one rank can hit
-    // the planner's free-mode gate while others succeed. NeedsTilingException
-    // must NOT propagate from a single rank here: the ranks that did not throw
-    // would march into the MPI_Allreduce below and desynchronize the collective
-    // (deadlock/abort). Instead, catch it locally, turn it into a flag, and make
-    // the decision collective: if ANY rank needs tiling, EVERY rank throws
-    // together, so the driver's one-shot retry re-plans all ranks with tiling
-    // engaged in lockstep. A non-tiling failure (OOM, CK error) is not this type
-    // and is left to propagate uniformly.
+    // aer-0100: a rank whose OWN search fails is not a dead rank. After the
+    // MINLOC below, every non-winning rank discards its local result and
+    // adopts the broadcast winner's plan anyway -- a searchless rank can
+    // adopt it exactly the same way. The aer-0037 fail-together contract
+    // stays for what it was built for (no rank may unwind past a collective
+    // its siblings will enter: every catch below keeps this rank marching
+    // through the SAME reductions and broadcasts as everyone else), but the
+    // OUTCOME changes: a caught search failure now reports
+    // cost = +infinity into the MINLOC instead of aborting all ranks. Jobs
+    // 21479115, 21479355 and 21480712 each lost an entire 4- or 8-rank
+    // forge to ONE rank whose whole trial shard died at the memory cap
+    // while sibling ranks held finished plans (best-of-N searching makes a
+    // per-rank wipeout an expected draw, not an anomaly: at the observed
+    // ~25% per-rank rate, an 8-rank forge survived with probability
+    // 0.75^8 ~= 10%). Only the all-ranks-failed case is fatal now,
+    // detected from the reduced MINLOC result -- identical on every rank,
+    // BEFORE any broadcast -- so the collectives stay in lockstep and the
+    // job dies with the failed-rank count and this rank's own cause.
+    // NeedsTilingException keeps its collective semantics unchanged; a
+    // searchless rank simply re-plans with everyone else.
     ContractionPlan local;
-    int local_status = 0; // 0 ok, 1 needs tiling, 2 hard failure
+    int local_status = 0; // 0 proceed, 1 needs tiling
+    bool local_ok = true;
     std::string local_msg;
     try {
       local = inner_->find_path(network, memory_limit_bytes, seed + rank,
                                 tiling_available);
     } catch (const NeedsTilingException &) {
+      // Must stay first: derives from std::runtime_error and is a control
+      // signal, not a failure.
       local_status = 1;
     } catch (const std::exception &e) {
-      // aer-0037: this catch is new and it closes a real hang. The per-rank
-      // seed is seed + rank, so ranks search DIFFERENT trajectories and a
-      // failure is genuinely not uniform: cotengra's "no feasible contraction
-      // path" error, a py::error_already_set from a dead loky worker, or a
-      // std::bad_alloc can strike one rank and not another. Before this, such
-      // an exception escaped BEFORE the Allreduce below, so the throwing rank
-      // unwound while every sibling blocked in that Allreduce forever.
-      // py::error_already_set derives from std::runtime_error, so it is caught
-      // here. The NeedsTilingException catch must stay first: it also derives
-      // from std::runtime_error and is a control signal, not a failure.
-      local_status = 2;
+      // py::error_already_set derives from std::runtime_error and lands
+      // here: cotengra's "produced no contraction tree", a dead loky
+      // worker, a std::bad_alloc.
+      local_ok = false;
       local_msg = e.what();
     } catch (...) {
-      // Nothing of unknown type may escape either: it would unwind this
-      // rank alone and leave every sibling in the Allreduce below.
-      local_status = 2;
+      local_ok = false;
       local_msg =
           "[AER_TN] the contraction path search raised an exception of "
-          "unknown type on this rank; caught so the ranks fail together.";
+          "unknown type on this rank.";
+    }
+    if (!local_ok) {
+      fprintf(stderr,
+              "[AER_TN_PATH] rank %d: search produced no plan; this rank "
+              "will adopt the winning rank's plan. Cause: %s\n",
+              rank, local_msg.c_str());
     }
 
-    // MPI_MAX: a hard failure on any rank outranks a tiling retry on another,
-    // so a real error is never masked by a re-plan.
+    // Tiling stays a MAX-collective decision: if ANY rank needs tiling,
+    // EVERY rank throws together and the driver's one-shot retry re-plans
+    // all ranks -- searchless ranks included -- with tiling engaged.
     int global_status = 0;
     MPI_Allreduce(&local_status, &global_status, 1, MPI_INT, MPI_MAX, comm_);
-    if (global_status >= 2) {
-      if (local_status >= 2)
-        throw std::runtime_error(local_msg);
-      throw std::runtime_error(
-          "[AER_TN] MPI path search aborted: at least one rank failed during "
-          "its contraction-path search, so every rank fails together rather "
-          "than blocking at the cross-rank reduction. The failing rank reports "
-          "the underlying cause.");
-    }
     if (global_status == 1) {
       throw NeedsTilingException(
           NeedsTilingException::Gate::Planner,
@@ -2926,16 +2929,44 @@ public:
           "output path; re-planning all ranks with tiling engaged.");
     }
 
+    int local_failed = local_ok ? 0 : 1;
+    int failed_ranks = 0;
+    MPI_Allreduce(&local_failed, &failed_ranks, 1, MPI_INT, MPI_SUM, comm_);
+
     struct { double cost; int rank; } local_result, global_result;
-    local_result.cost = local.total_flops;
+    local_result.cost = local_ok
+                            ? local.total_flops
+                            : std::numeric_limits<double>::infinity();
     local_result.rank = rank;
     MPI_Allreduce(&local_result, &global_result, 1, MPI_DOUBLE_INT,
                   MPI_MINLOC, comm_);
 
+    if (!(global_result.cost < std::numeric_limits<double>::infinity())) {
+      // Identical reduced values on every rank -> an identical throw on
+      // every rank, still BEFORE any broadcast: the fail-together
+      // guarantee holds exactly where it matters.
+      std::ostringstream msg;
+      msg << "[AER_TN] MPI path search: every rank failed (" << failed_ranks
+          << " of " << size
+          << " produced no plan); nothing to adopt. This rank's cause: "
+          << (local_ok ? std::string("(this rank reported a non-finite plan "
+                                     "cost despite succeeding, which should "
+                                     "not happen)")
+                       : local_msg);
+      throw std::runtime_error(msg.str());
+    }
+
     if (path_verbose() && rank == 0) {
       fprintf(stderr,
-              "[AER_TN_PATH] MPI: %d ranks, best from rank %d (%.2e FLOPs)\n",
-              size, global_result.rank, global_result.cost);
+              "[AER_TN_PATH] MPI: %d ranks, best from rank %d (%.2e FLOPs)"
+              "%s\n",
+              size, global_result.rank, global_result.cost,
+              failed_ranks > 0 ? " -- searchless rank(s) adopt it" : "");
+      if (failed_ranks > 0)
+        fprintf(stderr,
+                "[AER_TN_PATH] MPI: %d of %d rank(s) produced no plan and "
+                "adopt the winner's\n",
+                failed_ranks, size);
     }
 
     // The contraction PATH (steps) is positional -- SSA indices into the input
