@@ -1671,8 +1671,21 @@ public:
     // module-level partial (path_greedy.py:7, ssa_greedy_optimize =
     // functools.partial(get_optimize_greedy(), use_ssa=True)), and
     // trial_greedy calls that captured object forever after -- no module
-    // swap can reach a captured function. presets.py:58 holds the optimal
-    // getter's result the same way on preset instances. So the block now
+    // swap can reach a captured function. aer-0097 extends the reach after
+    // an audit prompted by the operator: THREE more captures exist as
+    // module-level preset INSTANCES constructed at import
+    // (presets.greedy_optimize, optimal_optimize, optimal_outer_optimize;
+    // each stores the resolved function in _optimize_fn at __init__,
+    // path_basic.py 1320/1616), all sentinel-proven to hold Rust under the
+    // container's import topology; the 0096 sweep was inert against them
+    // (wrong attribute, and no module-level instance carries
+    // _optimize_optimal_fn). The sweep below rebinds by attribute and
+    // class across presets/path_basic/path_greedy -- validated: 3
+    // instances rebound, all resolving pure Python afterwards. Off the
+    // forge path today (the fork calls the classes directly, and
+    // subtree_reconfigure constructs a fresh OptimalOptimizer per call,
+    // core.py 1865, which resolves through the cleared getter), but a
+    // loaded footgun for any preset-string use in-process. So the block now
     // does all of it: install a module named cotengrust whose functions
     // ARE cotengra's own Python implementations (find_spec succeeds, the
     // import succeeds), clear the three lru-cached getters so every future
@@ -1710,9 +1723,18 @@ _aer_pb.get_optimize_random_greedy_track_flops.cache_clear()
 _aer_pb.get_optimize_optimal.cache_clear()
 _aer_pg.ssa_greedy_optimize = functools.partial(
     _aer_pb.optimize_greedy, use_ssa=True)
-for _aer_obj in vars(_aer_presets).values():
-    if hasattr(_aer_obj, "_optimize_optimal_fn"):
-        _aer_obj._optimize_optimal_fn = _aer_pb.optimize_optimal
+for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
+    for _aer_obj in list(vars(_aer_mod).values()):
+        if hasattr(_aer_obj, "_optimize_optimal_fn"):
+            _aer_obj._optimize_optimal_fn = _aer_pb.optimize_optimal
+        if hasattr(_aer_obj, "_optimize_fn"):
+            if isinstance(_aer_obj, _aer_pb.OptimalOptimizer):
+                _aer_obj._optimize_fn = _aer_pb.get_optimize_optimal("auto")
+            elif isinstance(_aer_obj, _aer_pb.RandomGreedyOptimizer):
+                _aer_obj._optimize_fn = (
+                    _aer_pb.get_optimize_random_greedy_track_flops("auto"))
+            elif isinstance(_aer_obj, _aer_pb.GreedyOptimizer):
+                _aer_obj._optimize_fn = _aer_pb.get_optimize_greedy("auto")
 )");
           rust_block_done = true;
           fprintf(stderr,
@@ -2185,35 +2207,54 @@ for _aer_obj in vars(_aer_presets).values():
       const uint64_t reconf_every =
           TensorNetPathMem::env_u64("AER_TN_SLICE_RECONF_EVERY", 4);
       uint64_t since_reconf = 0;
-      bool sliced_any = false;
+      bool reconf_pending = false;
       for (int guard = 0; guard < 4096; ++guard) {
         const double cur_log2 =
             py_log2(tree.attr("max_size")()).cast<double>();
-        if (cur_log2 <= log2_target + 1e-9)
+        if (cur_log2 <= log2_target + 1e-9) {
+          // aer-0097: flush a pending reconfiguration BEFORE declaring the
+          // envelope met, then RE-CHECK. Reconfiguration minimizes flops
+          // and can trade the peak upward; the 0094 trailing call ran
+          // AFTER the last peak check, so a boundary tree could be pushed
+          // back over target and thrown as a false "output-bound" hard
+          // failure. Flush-and-continue keeps slicing until the peak and
+          // the pending flag settle together; the 12x12 regression is
+          // identical to the 0094 result (2^28.47 FLOPs, 8192 slices).
+          if (reconf_pending) {
+            reconf_pending = false;
+            since_reconf = 0;
+            try {
+              tree.attr("subtree_reconfigure_")();
+            } catch (py::error_already_set &re) {
+              fprintf(stderr,
+                      "[AER_TN_PATH] warning: subtree_reconfigure_ raised "
+                      "during dynamic slicing: %s -- continuing\n",
+                      re.what());
+              re.discard_as_unraisable("AER_TN_PATH dynamic slicing reconf");
+            }
+            continue;
+          }
           break;
+        }
         py::object ix = pick_slice_index(tree);
         if (ix.is_none())
           break; // no summed bond left to slice: residual peak is output-bound
         tree.attr("remove_ind_")(ix);
-        sliced_any = true;
-        if (reconf_every > 0 && ++since_reconf >= reconf_every) {
-          since_reconf = 0;
-          try {
-            tree.attr("subtree_reconfigure_")();
-          } catch (py::error_already_set &re) {
-            fprintf(stderr,
-                    "[AER_TN_PATH] warning: subtree_reconfigure_ raised "
-                    "during dynamic slicing: %s -- continuing\n",
-                    re.what());
-            re.discard_as_unraisable("AER_TN_PATH dynamic slicing reconf");
+        if (reconf_every > 0) {
+          reconf_pending = true;
+          if (++since_reconf >= reconf_every) {
+            since_reconf = 0;
+            reconf_pending = false;
+            try {
+              tree.attr("subtree_reconfigure_")();
+            } catch (py::error_already_set &re) {
+              fprintf(stderr,
+                      "[AER_TN_PATH] warning: subtree_reconfigure_ raised "
+                      "during dynamic slicing: %s -- continuing\n",
+                      re.what());
+              re.discard_as_unraisable("AER_TN_PATH dynamic slicing reconf");
+            }
           }
-        }
-      }
-      if (sliced_any && reconf_every > 0 && since_reconf > 0) {
-        try {
-          tree.attr("subtree_reconfigure_")();
-        } catch (py::error_already_set &re) {
-          re.discard_as_unraisable("AER_TN_PATH dynamic slicing reconf");
         }
       }
       const double final_log2 =
