@@ -2129,38 +2129,72 @@ sys.modules["cotengrust"] = _aer_m
       }
     }
 
-    // Enforce the m6n6k6 tiling envelope as ACHIEVED, not merely targeted.
-    // The search returns a RAW tree (aer-0089: trials carry no slicing),
-    // and even before that the returned tree was not guaranteed to reach
-    // target -- a low-FLOPs under-sliced tree can score best; across the
-    // MPI ensemble the MINLOC(FLOPs) pick then actively favors the laxest
-    // rank (the 8-GCD miscompute). So this pass is where EVERY tree, from
-    // either preset, is cut to the envelope -- and it cuts explicitly:
-    // pick_slice_index removes the largest-extent summed leg of the largest
-    // intermediate, one index per iteration, via the same remove_ind_
-    // primitive cotengra's own slice() ends with (core.py 2223-2226) --
-    // minus SliceFinder and its per-step ContractionCosts cache, which is
-    // the 124-197 GB consumer named in the aer-0089 commit. On the T=1500
-    // degenerate case where SliceFinder took 100 s / 191 entries / 1.27 GB,
-    // the picker removes the same 12 modes to the same 2^29 peak in
-    // 0.3 s / 2.3 MB. Excluding output modes is allow_outer=false by
-    // construction, matching the engine's accumulator and extract_plan's
-    // guard. Deterministic, seed-free: identical trees cut identically on
-    // every rank.
+    // Enforce the per-slice MEMORY envelope as ACHIEVED, not merely
+    // targeted. target_elements is min(device budget,
+    // AER_TN_SLICE_TARGET_BYTES) in elements -- since the GEMM pivot the
+    // bound is memory, not the m6n6k6 kernel shape, and the messages below
+    // now say so (job 21476057's error read "m6n6k6 tiling envelope" and
+    // was rightly questioned: the campaign is memory-bound, not
+    // shape-bound). The search returns a RAW tree (aer-0089: trials carry
+    // no slicing), and even before that the returned tree was not
+    // guaranteed to reach target -- a low-FLOPs under-sliced tree can
+    // score best; across the MPI ensemble the MINLOC(FLOPs) pick then
+    // actively favors the laxest rank (the 8-GCD miscompute). So this pass
+    // is where EVERY tree, from either preset, is cut to the envelope --
+    // and it cuts explicitly: pick_slice_index removes the largest-extent
+    // summed leg of the largest intermediate, one index per iteration, via
+    // the same remove_ind_ primitive cotengra's own slice() ends with
+    // (core.py 2223-2226) -- minus SliceFinder and its per-step
+    // ContractionCosts cache, the 124-197 GB consumer named in aer-0089.
+    // Excluding output modes is allow_outer=false by construction,
+    // matching the engine's accumulator and extract_plan's guard.
+    // Deterministic, seed-free: identical trees cut identically on every
+    // rank.
+    //
+    // aer-0092: the slice ceiling lives INSIDE the loop. One removal cuts
+    // the peak by one extent (a factor of 2 on these networks), so a
+    // winner at 2^161 needs ~132 removals -- job 21476057 (p=9) burned the
+    // old 128-step guard and reported "still above the envelope after 128
+    // steps", reading as a slicer defect when four more steps would have
+    // "fit" the envelope with a 2^132-slice plan that the
+    // AER_TN_MAX_SLICES ceiling (default 8192 = 2^13) refuses anyway. The
+    // moment the accumulated slice count exceeds that ceiling, fitting is
+    // pointless: fail there, in ~13 steps, with the truthful cause. This
+    // subsumes the aer-0091 post-envelope ceiling check. The 4096-step
+    // guard is a pure infinite-loop backstop, unreachable before the
+    // ceiling.
     {
-      // aer-0090: sizes compared in log2 for the same reason as in
-      // pick_slice_index -- the 0089 int64 cast of max_size() throws
-      // py::error_already_set the moment a degenerate winner exceeds 2^63,
-      // before the loop can slice at all. The concrete element count is
-      // cast only once the peak is proven under target (target < 2^63).
       py::object py_log2 = py::module_::import("math").attr("log2");
       const double log2_target =
           std::log2(static_cast<double>(target_elements));
-      for (int guard = 0; guard < 128; ++guard) {
+      const uint64_t slice_ceiling =
+          TensorNetPathMem::env_u64("AER_TN_MAX_SLICES", 8192);
+      for (int guard = 0; guard < 4096; ++guard) {
         const double cur_log2 =
             py_log2(tree.attr("max_size")()).cast<double>();
         if (cur_log2 <= log2_target + 1e-9)
           break;
+        if (tree_num_slices(tree) > slice_ceiling) {
+          const size_t modes = py::len(tree.attr("sliced_inds"));
+          std::ostringstream msg;
+          msg << "CotengPathOptimizer: the winning tree's peak intermediate "
+                 "is still 2^"
+              << cur_log2
+              << " elements against a per-slice memory envelope of 2^"
+              << log2_target
+              << " elements (the smaller of the device budget and "
+                 "AER_TN_SLICE_TARGET_BYTES), and cutting it this far has "
+                 "already cost "
+              << modes << " sliced modes -- beyond the AER_TN_MAX_SLICES "
+                          "ceiling of "
+              << slice_ceiling
+              << " slices. The search found no contractable tree at this "
+                 "depth: a search-quality failure, not a slicing or "
+                 "per-slice-budget limitation. Raise the trial budget "
+                 "(AER_TN_PATH_MAX_REPEATS), raise AER_TN_PATH_MAX_TIME, or "
+                 "widen the method pool.";
+          throw std::runtime_error(msg.str());
+        }
         py::object ix = pick_slice_index(tree);
         if (ix.is_none())
           break; // no summed bond left to slice: residual peak is output-bound
@@ -2169,73 +2203,29 @@ sys.modules["cotengrust"] = _aer_m
       const double final_log2 =
           py_log2(tree.attr("max_size")()).cast<double>();
       if (final_log2 > log2_target + 1e-9) {
-        // aer-0090: two distinct failure shapes, named apart. Candidates
-        // remaining means the 128-removal guard ran out against a tree so
-        // degenerate that slicing cannot reasonably save it -- a
-        // search-quality failure, not a slicing limitation. No candidates
-        // means the residual peak is truly bound by output modes.
-        py::object more = pick_slice_index(tree);
+        // Only reachable with no sliceable candidate left (the in-loop
+        // ceiling fires within ~13 removals otherwise): genuinely
+        // output-bound.
         std::ostringstream msg;
-        if (!more.is_none()) {
-          msg << "CotengPathOptimizer: the winning tree's peak intermediate "
-                 "(2^"
-              << final_log2
-              << " elements) is still above the m6n6k6 tiling envelope (2^"
-              << log2_target
-              << ") after 128 explicit slicing steps. A peak this far above "
-                 "target is a search-quality failure -- the drawn tree is "
-                 "degenerate -- not a slicing limitation. Widen the method "
-                 "pool (unset AER_TN_PATH_METHODS), raise the trial budget, "
-                 "or raise AER_TN_PATH_MAX_TIME.";
-        } else {
-          msg << "CotengPathOptimizer: peak intermediate (2^" << final_log2
-              << " elements) exceeds the m6n6k6 tiling envelope (2^"
-              << log2_target
-              << ") and cannot be reduced further by slicing -- the residual "
-                 "peak is bounded by output (open) modes the engine cannot "
-                 "split. This output rank exceeds m6n6k6 tiling; request a "
-                 "lower-rank output (expectation value, amplitude, or a "
-                 "smaller reduced density matrix).";
-        }
+        msg << "CotengPathOptimizer: peak intermediate (2^" << final_log2
+            << " elements) exceeds the per-slice memory envelope (2^"
+            << log2_target
+            << " elements, the smaller of the device budget and "
+               "AER_TN_SLICE_TARGET_BYTES) and cannot be reduced further by "
+               "slicing -- the residual peak is bounded by output (open) "
+               "modes the engine cannot split. Request a lower-rank output "
+               "(expectation value, amplitude, or a smaller reduced density "
+               "matrix), or raise AER_TN_SLICE_TARGET_BYTES.";
         throw std::runtime_error(msg.str());
       }
       if (path_verbose()) {
         fprintf(stderr,
-                "[AER_TN_PATH] tiling envelope enforced: peak %lld <= target "
-                "%llu (%zu sliced modes)\n",
+                "[AER_TN_PATH] slice envelope enforced: peak %lld <= target "
+                "%llu elements (%zu sliced modes, %llu slices)\n",
                 (long long)tree.attr("max_size")().cast<int64_t>(),
                 (unsigned long long)target_elements,
-                (size_t)py::len(tree.attr("sliced_inds")));
-      }
-    }
-
-    // aer-0091: refuse a slice-grind HERE, at plan time, with the truthful
-    // cause. Job 21476056 (p=8): the envelope dutifully sliced a degenerate
-    // winner over 70 modes (2^70 slices), the floor added more, and the
-    // failure surfaced only at the engine's AER_TN_MAX_SLICES ceiling with
-    // a message blaming the per-slice budget. A winner that needs more
-    // slices than the engine will ever accept is a SEARCH-QUALITY failure,
-    // and it is known the moment the envelope pass ends.
-    {
-      const uint64_t ceiling =
-          TensorNetPathMem::env_u64("AER_TN_MAX_SLICES", 8192);
-      const uint64_t nsl = tree_num_slices(tree);
-      if (nsl > ceiling) {
-        const size_t modes = py::len(tree.attr("sliced_inds"));
-        std::ostringstream msg;
-        msg << "CotengPathOptimizer: fitting the winning tree inside the "
-               "m6n6k6 envelope required "
-            << modes << " sliced modes";
-        if (nsl == UINT64_MAX)
-          msg << " (more than 2^64 slices)";
-        else
-          msg << " (" << nsl << " slices)";
-        msg << ", far beyond the AER_TN_MAX_SLICES ceiling of " << ceiling
-            << ". The search found no contractable tree at this depth -- a "
-               "search-quality failure, not a per-slice-budget problem. "
-               "Raise the trial budget (AER_TN_PATH_MAX_REPEATS), raise "
-               "AER_TN_PATH_MAX_TIME, or widen the method pool.";
-        throw std::runtime_error(msg.str());
+                (size_t)py::len(tree.attr("sliced_inds")),
+                (unsigned long long)tree_num_slices(tree));
       }
     }
 
