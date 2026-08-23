@@ -1607,13 +1607,6 @@ public:
       target_elements = output_elements;
     }
 
-    py::dict slicing_opts;
-    slicing_opts["target_size"] = target_elements;
-    // Outer (output) modes must never be sliced: the engine's accumulator
-    // sums slices, which matches summed-bond slicing only (see extract_plan).
-    slicing_opts["allow_outer"] = false;
-    py::dict reconf_opts;
-
     py::object tree;
 
     if (preset_ == "random-greedy") {
@@ -1624,13 +1617,9 @@ public:
           py::arg("seed") = seed,
           py::arg("progbar") = false);
       tree = opt.attr("search")(inputs, output, sizes);
-      // RandomGreedyOptimizer has no slicing_opts; slice the finished tree
-      // to the same per-slice budget the HyperOptimizer path uses, so both
-      // presets honor the m6n6k6 envelope. No-op when the tree already fits.
-      tree.attr("slice")(py::arg("target_size") = target_elements,
-                         py::arg("allow_outer") = false,
-                         py::arg("seed") = seed,
-                         py::arg("inplace") = true);
+      // aer-0089: no preset-local slicing. The explicit envelope pass below
+      // runs for BOTH presets and is the single place trees are cut to the
+      // m6n6k6 budget.
     } else {
       // HyperOptimizer path: backend chosen by AER_TN_OPTLIB env var.
       //
@@ -1709,8 +1698,21 @@ public:
       kwargs["max_repeats"] = effective_max_repeats();
       kwargs["max_time"] = max_time_;
       kwargs["optlib"] = optlib;
-      kwargs["slicing_opts"] = slicing_opts;
-      kwargs["reconf_opts"] = reconf_opts;
+      // aer-0089: NO slicing_opts and NO reconf_opts, deliberately. Passing
+      // slicing_opts makes cotengra wrap EVERY trial in SlicedTrialFn
+      // (hyper.py 545-546), which runs SliceFinder.search(max_repeats=16)
+      // on every drawn tree; the finder caches a near-full ContractionCosts
+      // copy per accepted index per walk (slicer.py 388, ~110 B x pins
+      // each). At depth every draw sits far above the 2^29 target, so every
+      // trial paid that cache: 1.27 GB / 100 s at T=1500 on a degenerate
+      // draw, and 203 GiB on ONE rank in 3:49 at T=49070 (job 21473960) --
+      // the 124-197 GB OOM band of the p>=7 forges, at last named. A
+      // reconf_opts of {} additionally wrapped every trial in ReconfTrialFn
+      // (hyper.py 553-559, subtree_reconfigure maxiter=500) -- pure time
+      // tax. Trials now score RAW trees; the winner is reconfigured once
+      // below, and ALL slicing happens in the explicit, cache-free envelope
+      // pass after the search. The sizing probe copies these kwargs, so it
+      // inherits the same shape.
       kwargs["progbar"] = false;
 
       // aer-0026: state the worker count instead of letting cotengra's 'auto'
@@ -1930,11 +1932,30 @@ public:
         // (no contraction tree was ever produced). Surface a named,
         // actionable error instead of the bare KeyError.
         std::ostringstream msg;
-        msg << "CotengPathOptimizer: cotengra found no feasible contraction "
-               "path under the current slicing constraints (target_size="
-            << target_elements
-            << " elements, allow_outer=false). Underlying error: " << e.what();
+        msg << "CotengPathOptimizer: cotengra produced no contraction tree "
+               "(every search trial failed). Underlying error: "
+            << e.what();
         throw std::runtime_error(msg.str());
+      }
+      // aer-0089: the subtree reconfiguration that ReconfTrialFn previously
+      // applied to EVERY trial now runs ONCE, on the winner -- same
+      // cotengra defaults (subtree_size=8, maxiter=500), 1/64th the cost
+      // under a 64-repeat forge. An optimisation hint must never fail the
+      // contraction (the distribution-floor rule), so a raise here warns
+      // and continues with the tree as found.
+      try {
+        tree.attr("subtree_reconfigure_")();
+        if (path_verbose()) {
+          py::dict st = tree.attr("contract_stats")();
+          fprintf(stderr, "[AER_TN_PATH] winner reconf: flops=%.3e\n",
+                  st["flops"].cast<double>());
+        }
+      } catch (py::error_already_set &re) {
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: winner subtree_reconfigure_ raised: "
+                "%s -- continuing with the tree as found\n",
+                re.what());
+        re.discard_as_unraisable("AER_TN_PATH winner reconf");
       }
     }
 
@@ -1945,10 +1966,16 @@ public:
     if (force_slicing()) {
       py::dict sliced_inds = tree.attr("sliced_inds");
       if (py::len(sliced_inds) == 0) {
-        tree.attr("slice")(py::arg("target_slices") = 2,
-                           py::arg("allow_outer") = false,
-                           py::arg("seed") = seed,
-                           py::arg("inplace") = true);
+        // aer-0089: explicit picker, not tree.slice() -- one code path for
+        // every cut this function makes, and no SliceFinder anywhere.
+        for (int guard = 0; guard < 8; ++guard) {
+          if (tree_num_slices(tree) >= 2)
+            break;
+          py::object ix = pick_slice_index(tree);
+          if (ix.is_none())
+            break;
+          tree.attr("remove_ind_")(ix);
+        }
         if (path_verbose()) {
           fprintf(stderr,
                   "[AER_TN_PATH] AER_TN_FORCE_SLICING=1: sliced an "
@@ -1959,26 +1986,32 @@ public:
     }
 
     // Enforce the m6n6k6 tiling envelope as ACHIEVED, not merely targeted.
-    // slicing_opts aim the HyperOptimizer at target_size during search, but the
-    // returned tree is not guaranteed to reach it -- the search is heuristic,
-    // and a low-FLOPs under-sliced tree can score best; across the MPI ensemble
-    // the MINLOC(FLOPs) pick then actively favors the laxest rank (the 8-GCD
-    // miscompute). Slice the tree explicitly to target so every plan leaving
-    // this function -- and thus every candidate the ensemble can select -- has
-    // a peak inside the envelope. allow_outer=false confines this to summed
-    // bonds, matching the engine's accumulator and extract_plan's guard.
+    // The search returns a RAW tree (aer-0089: trials carry no slicing),
+    // and even before that the returned tree was not guaranteed to reach
+    // target -- a low-FLOPs under-sliced tree can score best; across the
+    // MPI ensemble the MINLOC(FLOPs) pick then actively favors the laxest
+    // rank (the 8-GCD miscompute). So this pass is where EVERY tree, from
+    // either preset, is cut to the envelope -- and it cuts explicitly:
+    // pick_slice_index removes the largest-extent summed leg of the largest
+    // intermediate, one index per iteration, via the same remove_ind_
+    // primitive cotengra's own slice() ends with (core.py 2223-2226) --
+    // minus SliceFinder and its per-step ContractionCosts cache, which is
+    // the 124-197 GB consumer named in the aer-0089 commit. On the T=1500
+    // degenerate case where SliceFinder took 100 s / 191 entries / 1.27 GB,
+    // the picker removes the same 12 modes to the same 2^29 peak in
+    // 0.3 s / 2.3 MB. Excluding output modes is allow_outer=false by
+    // construction, matching the engine's accumulator and extract_plan's
+    // guard. Deterministic, seed-free: identical trees cut identically on
+    // every rank.
     {
       for (int guard = 0; guard < 128; ++guard) {
         int64_t cur = tree.attr("max_size")().cast<int64_t>();
         if (static_cast<uint64_t>(cur) <= target_elements)
           break;
-        const size_t before = py::len(tree.attr("sliced_inds"));
-        tree.attr("slice")(py::arg("target_size") = target_elements,
-                           py::arg("allow_outer") = false,
-                           py::arg("seed") = seed,
-                           py::arg("inplace") = true);
-        if (py::len(tree.attr("sliced_inds")) == before)
+        py::object ix = pick_slice_index(tree);
+        if (ix.is_none())
           break; // no summed bond left to slice: residual peak is output-bound
+        tree.attr("remove_ind_")(ix);
       }
       const int64_t final_max = tree.attr("max_size")().cast<int64_t>();
       if (static_cast<uint64_t>(final_max) > target_elements) {
@@ -2029,10 +2062,18 @@ public:
         // job to an optimisation hint is not an acceptable trade.
         bool sliced_ok = true;
         try {
-          tree.attr("slice")(py::arg("target_slices") = min_slices_,
-                             py::arg("allow_outer") = false,
-                             py::arg("seed") = seed,
-                             py::arg("inplace") = true);
+          // aer-0089: explicit picker to the floor. Each removal multiplies
+          // the slice count by the removed extent and can only lower the
+          // peak, so the envelope above stays satisfied -- the same
+          // one-direction argument the original ordering note makes.
+          for (int guard = 0; guard < 128; ++guard) {
+            if (tree_num_slices(tree) >= min_slices_)
+              break;
+            py::object ix = pick_slice_index(tree);
+            if (ix.is_none())
+              break;
+            tree.attr("remove_ind_")(ix);
+          }
         } catch (py::error_already_set &e) {
           sliced_ok = false;
           fprintf(stderr,
@@ -2075,6 +2116,51 @@ private:
     for (auto &item : sliced_inds)
       n *= static_cast<uint64_t>(item.second.attr("size").cast<int64_t>());
     return n;
+  }
+
+  // aer-0089: the explicit slicing picker. Returns the summed (non-output)
+  // index of largest extent on the largest intermediate, or none when the
+  // peak is output-bound (nothing sliceable remains on it). The node scan
+  // walks traverse() -- the SAME node set max_size() maxes over -- so the
+  // peak this reduces is the peak the envelope check reads. remove_ind_
+  // strips a removed index from every node's legs, so an already-sliced
+  // index can never be returned. Every API touched here (traverse,
+  // get_size, get_legs, size_dict, output, remove_ind_) was validated by
+  // direct test against cotengra 0.7.5 on the degenerate T=1500 network:
+  // same 12 modes as SliceFinder, 0.3 s / 2.3 MB versus 100 s / 1.27 GB.
+  // Deterministic and seed-free: argmax in traverse order, ties to the
+  // first seen, so identical trees slice identically on every rank.
+  static py::object pick_slice_index(py::object &tree) {
+    py::object best_node = py::none();
+    double best_size = -1.0;
+    for (auto &item : tree.attr("traverse")()) {
+      py::tuple t = item.cast<py::tuple>();
+      py::object node = py::reinterpret_borrow<py::object>(t[0]);
+      const double s = tree.attr("get_size")(node).cast<double>();
+      if (s > best_size) {
+        best_size = s;
+        best_node = node;
+      }
+    }
+    if (best_node.is_none())
+      return py::none();
+    std::set<std::string> outset;
+    for (auto &o : tree.attr("output"))
+      outset.insert(o.cast<std::string>());
+    py::dict size_dict = tree.attr("size_dict");
+    py::dict legs = tree.attr("get_legs")(best_node);
+    py::object best_ix = py::none();
+    int64_t best_ext = 1;
+    for (auto &kv : legs) {
+      if (outset.count(kv.first.cast<std::string>()))
+        continue;
+      const int64_t d = size_dict[kv.first].cast<int64_t>();
+      if (d > best_ext) {
+        best_ext = d;
+        best_ix = py::reinterpret_borrow<py::object>(kv.first);
+      }
+    }
+    return best_ix;
   }
 
   ContractionPlan extract_plan(py::object &tree,
