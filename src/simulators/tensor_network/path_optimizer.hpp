@@ -1658,6 +1658,60 @@ public:
                   ? "disabled or no memory budget signal"
                   : "existing limit already tighter, or setrlimit refused");
 
+    // aer-0091: while the cap is armed, cotengrust must not run. Rust
+    // ABORTS the process on allocation failure ("memory allocation of N
+    // bytes failed", SIGABRT) instead of raising -- jobs 21476058/21476059
+    // died exactly this way, mid-trial at the RLIMIT, killing the whole
+    // job where a Python trial would have been discarded and the search
+    // continued. cotengra dispatches greedy/random-greedy/optimal to
+    // cotengrust whenever importlib finds it (path_basic.py 1267/1285/
+    // 1581), so the block substitutes a module of the same name whose
+    // functions ARE cotengra's own Python implementations (path_basic
+    // module-level optimize_greedy / optimize_random_greedy_track_flops /
+    // optimize_optimal): find_spec succeeds, the import succeeds, and
+    // every trial becomes MemoryError-recoverable. The dispatch getters
+    // are lru_cached, so this is applied once and holds for the process
+    // lifetime -- which is the safe direction, since a later uncapped
+    // search losing some Rust speed is nothing against a capped search
+    // losing the node. AER_TN_PATH_ALLOW_RUST=1 opts out.
+    if (search_mem_cap->armed()) {
+      const char *allow_rust = std::getenv("AER_TN_PATH_ALLOW_RUST");
+      const bool rust_ok =
+          allow_rust != nullptr && allow_rust[0] == '1' && allow_rust[1] == '\0';
+      static bool rust_block_done = false;
+      if (!rust_ok && !rust_block_done) {
+        try {
+          py::exec(R"(
+import sys, types, importlib.machinery
+from cotengra.pathfinders import path_basic as _aer_pb
+_aer_m = types.ModuleType("cotengrust")
+_aer_m.__spec__ = importlib.machinery.ModuleSpec("cotengrust", loader=None)
+_aer_m.optimize_greedy = _aer_pb.optimize_greedy
+_aer_m.optimize_random_greedy_track_flops = (
+    _aer_pb.optimize_random_greedy_track_flops)
+_aer_m.optimize_optimal = _aer_pb.optimize_optimal
+sys.modules["cotengrust"] = _aer_m
+)");
+          rust_block_done = true;
+          fprintf(stderr,
+                  "[AER_TN_PATH] cotengrust disabled for capped searches "
+                  "(Rust aborts at the RLIMIT instead of raising); "
+                  "AER_TN_PATH_ALLOW_RUST=1 opts out\n");
+        } catch (py::error_already_set &rb) {
+          fprintf(stderr,
+                  "[AER_TN_PATH] warning: could not disable cotengrust: %s "
+                  "-- a Rust trial that hits the memory cap will abort the "
+                  "process\n",
+                  rb.what());
+          rb.discard_as_unraisable("AER_TN_PATH cotengrust block");
+        }
+      } else if (rust_ok && !rust_block_done) {
+        fprintf(stderr, "[AER_TN_PATH] cotengrust left enabled "
+                        "(AER_TN_PATH_ALLOW_RUST=1); a Rust trial that hits "
+                        "the memory cap aborts the process\n");
+      }
+    }
+
     if (preset_ == "random-greedy") {
       // RandomGreedyOptimizer takes seed as a direct named kwarg — no routing.
       auto opt = ctg.attr("RandomGreedyOptimizer")(
@@ -2001,6 +2055,28 @@ public:
       }
       fprintf(stderr, "[AER_TN_PATH] search done: %zu trial(s)\n",
               (size_t)py::len(opt.attr("scores")));
+      // aer-0091: name the winner. Job 21476056 showed 64 clean trials at
+      // p=8 whose best still needed 2^70 slices, and nothing in the log
+      // said which method won or how bad the best was. One unconditional
+      // line makes trial-budget and method-pool tuning evidence-driven.
+      try {
+        py::dict best = opt.attr("best");
+        py::object py_log2 = py::module_::import("math").attr("log2");
+        const double lf = py_log2(best["flops"]).cast<double>();
+        const double lsz = py_log2(best["size"]).cast<double>();
+        std::string mname = "?";
+        try {
+          mname = py::str(best["params"]["method"]).cast<std::string>();
+        } catch (py::error_already_set &me) {
+          me.discard_as_unraisable("AER_TN_PATH best method name");
+        }
+        fprintf(stderr,
+                "[AER_TN_PATH] search best: method=%s log2_flops=%.1f "
+                "log2_size=%.1f\n",
+                mname.c_str(), lf, lsz);
+      } catch (py::error_already_set &be) {
+        be.discard_as_unraisable("AER_TN_PATH search best");
+      }
       // aer-0089: the subtree reconfiguration that ReconfTrialFn previously
       // applied to EVERY trial now runs ONCE, on the winner -- same
       // cotengra defaults (subtree_size=8, maxiter=500), 1/64th the cost
@@ -2133,6 +2209,36 @@ public:
       }
     }
 
+    // aer-0091: refuse a slice-grind HERE, at plan time, with the truthful
+    // cause. Job 21476056 (p=8): the envelope dutifully sliced a degenerate
+    // winner over 70 modes (2^70 slices), the floor added more, and the
+    // failure surfaced only at the engine's AER_TN_MAX_SLICES ceiling with
+    // a message blaming the per-slice budget. A winner that needs more
+    // slices than the engine will ever accept is a SEARCH-QUALITY failure,
+    // and it is known the moment the envelope pass ends.
+    {
+      const uint64_t ceiling =
+          TensorNetPathMem::env_u64("AER_TN_MAX_SLICES", 8192);
+      const uint64_t nsl = tree_num_slices(tree);
+      if (nsl > ceiling) {
+        const size_t modes = py::len(tree.attr("sliced_inds"));
+        std::ostringstream msg;
+        msg << "CotengPathOptimizer: fitting the winning tree inside the "
+               "m6n6k6 envelope required "
+            << modes << " sliced modes";
+        if (nsl == UINT64_MAX)
+          msg << " (more than 2^64 slices)";
+        else
+          msg << " (" << nsl << " slices)";
+        msg << ", far beyond the AER_TN_MAX_SLICES ceiling of " << ceiling
+            << ". The search found no contractable tree at this depth -- a "
+               "search-quality failure, not a per-slice-budget problem. "
+               "Raise the trial budget (AER_TN_PATH_MAX_REPEATS), raise "
+               "AER_TN_PATH_MAX_TIME, or widen the method pool.";
+        throw std::runtime_error(msg.str());
+      }
+    }
+
     // aer-0035: raise the slice count to the distribution floor, AFTER the
     // envelope block above. Order matters and only in this direction: extra
     // slicing can only lower the peak, so the envelope stays satisfied, whereas
@@ -2211,8 +2317,20 @@ private:
   static uint64_t tree_num_slices(py::object &tree) {
     py::dict sliced_inds = tree.attr("sliced_inds");
     uint64_t n = 1;
-    for (auto &item : sliced_inds)
-      n *= static_cast<uint64_t>(item.second.attr("size").cast<int64_t>());
+    for (auto &item : sliced_inds) {
+      const uint64_t e =
+          static_cast<uint64_t>(item.second.attr("size").cast<int64_t>());
+      if (e == 0)
+        continue;
+      // aer-0091: saturate instead of wrapping. Job 21476056 (p=8): the
+      // envelope cut a degenerate winner over 70 extent-2 modes; 2^70
+      // wrapped this product to 0, the distribution floor then saw
+      // "0 < 16" and added 128 further modes to a plan already at 2^70
+      // slices, and printed FLOOR NOT REACHED from a 2^198-slice plan.
+      if (n > (UINT64_MAX / e))
+        return UINT64_MAX;
+      n *= e;
+    }
     return n;
   }
 
