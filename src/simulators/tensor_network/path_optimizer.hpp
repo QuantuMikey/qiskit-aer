@@ -37,6 +37,10 @@
 
 #ifdef AER_HIPTENSOR
 #include <pybind11/pybind11.h>
+// aer-0093: py::exec (the aer-0091 cotengrust block) is declared in
+// pybind11/eval.h, not pybind11.h -- build 21476498 failed with "no
+// member named 'exec' in namespace 'pybind11'" at exactly that call.
+#include <pybind11/eval.h>
 #include <pybind11/stl.h>
 namespace py = pybind11;
 #endif
