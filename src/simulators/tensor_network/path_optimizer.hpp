@@ -1400,6 +1400,49 @@ public:
 
 #ifdef AER_HIPTENSOR
 
+// aer-0099: subtree_reconfigure_ mutates before it recontracts -- cotengra
+// removes every branch node of the chosen subtree (core.py:1925) and only
+// then rebuilds it via contract_nodes -> find_path (core.py:1931 -> 1377).
+// An exception inside that window (job 21479115: OverflowError at
+// path_basic.py:232, an int >= 2^1024 cannot convert to float) therefore
+// exits with interior nodes deleted and never re-added; every later
+// traversal dies on the missing children -- the KeyError: frozenset({...})
+// that closed 21479115. "Continuing with the tree as found" was continuing
+// with a corrupted tree. This helper makes reconfiguration transactional:
+// snapshot via tree.copy() (set_state_from copies the children/info maps
+// top-level, core.py:300-347, so removals and insertions on the original
+// cannot reach the snapshot), run, and on ANY raise rebind the caller's
+// handle to the snapshot. If even the snapshot cannot be taken (e.g. under
+// the search RLIMIT), the reconfiguration is SKIPPED outright -- an
+// optimisation hint must never risk the tree (the distribution-floor rule).
+// Returns true only when the reconfiguration ran and stuck.
+static inline bool reconf_tree_transactional(py::object &tree,
+                                             const char *site) {
+  py::object backup;
+  try {
+    backup = tree.attr("copy")();
+  } catch (py::error_already_set &ce) {
+    fprintf(stderr,
+            "[AER_TN_PATH] warning: could not snapshot the tree before %s "
+            "(%s); reconfiguration skipped, tree unchanged\n",
+            site, ce.what());
+    ce.discard_as_unraisable("AER_TN_PATH reconf snapshot");
+    return false;
+  }
+  try {
+    tree.attr("subtree_reconfigure_")();
+    return true;
+  } catch (py::error_already_set &re) {
+    fprintf(stderr,
+            "[AER_TN_PATH] warning: %s raised: %s -- restored the "
+            "pre-reconfiguration tree\n",
+            site, re.what());
+    re.discard_as_unraisable("AER_TN_PATH reconf restore");
+    tree = backup;
+    return false;
+  }
+}
+
 class CotengPathOptimizer : public PathOptimizer {
   std::string minimize_;
   int max_repeats_;
@@ -2127,19 +2170,21 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
       // under a 64-repeat forge. An optimisation hint must never fail the
       // contraction (the distribution-floor rule), so a raise here warns
       // and continues with the tree as found.
-      try {
-        tree.attr("subtree_reconfigure_")();
-        if (path_verbose()) {
+      // aer-0099: transactional; see reconf_tree_transactional. The verbose
+      // flops report moved OUT of the protected call and to log2: casting a
+      // >= 2^1024-FLOP count to double raises exactly like the
+      // reconfiguration itself did on job 21479115, and a report must not be
+      // able to roll back a reconfiguration that succeeded.
+      if (reconf_tree_transactional(tree, "winner subtree_reconfigure_") &&
+          path_verbose()) {
+        try {
+          py::object py_log2 = py::module_::import("math").attr("log2");
           py::dict st = tree.attr("contract_stats")();
-          fprintf(stderr, "[AER_TN_PATH] winner reconf: flops=%.3e\n",
-                  st["flops"].cast<double>());
+          fprintf(stderr, "[AER_TN_PATH] winner reconf: log2_flops=%.1f\n",
+                  py_log2(st["flops"]).cast<double>());
+        } catch (py::error_already_set &pe) {
+          pe.discard_as_unraisable("AER_TN_PATH winner reconf report");
         }
-      } catch (py::error_already_set &re) {
-        fprintf(stderr,
-                "[AER_TN_PATH] warning: winner subtree_reconfigure_ raised: "
-                "%s -- continuing with the tree as found\n",
-                re.what());
-        re.discard_as_unraisable("AER_TN_PATH winner reconf");
       }
     }
 
@@ -2223,15 +2268,8 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
           if (reconf_pending) {
             reconf_pending = false;
             since_reconf = 0;
-            try {
-              tree.attr("subtree_reconfigure_")();
-            } catch (py::error_already_set &re) {
-              fprintf(stderr,
-                      "[AER_TN_PATH] warning: subtree_reconfigure_ raised "
-                      "during dynamic slicing: %s -- continuing\n",
-                      re.what());
-              re.discard_as_unraisable("AER_TN_PATH dynamic slicing reconf");
-            }
+            reconf_tree_transactional(
+                tree, "subtree_reconfigure_ during dynamic slicing (flush)");
             continue;
           }
           break;
@@ -2245,15 +2283,8 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
           if (++since_reconf >= reconf_every) {
             since_reconf = 0;
             reconf_pending = false;
-            try {
-              tree.attr("subtree_reconfigure_")();
-            } catch (py::error_already_set &re) {
-              fprintf(stderr,
-                      "[AER_TN_PATH] warning: subtree_reconfigure_ raised "
-                      "during dynamic slicing: %s -- continuing\n",
-                      re.what());
-              re.discard_as_unraisable("AER_TN_PATH dynamic slicing reconf");
-            }
+            reconf_tree_transactional(
+                tree, "subtree_reconfigure_ during dynamic slicing");
           }
         }
       }
