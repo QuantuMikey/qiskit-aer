@@ -1416,6 +1416,16 @@ public:
 // the search RLIMIT), the reconfiguration is SKIPPED outright -- an
 // optimisation hint must never risk the tree (the distribution-floor rule).
 // Returns true only when the reconfiguration ran and stuck.
+// aer-0104: one gate for the overhead-aware slice picker; =0 restores the
+// extent-greedy picker everywhere (installer and dispatch).
+static inline bool slice_overhead_enabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("AER_TN_SLICE_OVERHEAD");
+    return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
 static inline bool reconf_tree_transactional(py::object &tree,
                                              const char *site) {
   py::object backup;
@@ -1807,6 +1817,102 @@ if not getattr(_aer_core.ContractionTree.contract_stats,
           said = true;
           fprintf(stderr, "[AER_TN_PATH] streaming trial stats disabled "
                           "(AER_TN_STREAM_STATS=0)\n");
+        }
+      }
+    }
+
+    // aer-0104: install the overhead-aware slice picker. The extent-greedy
+    // picker (aer-0089, below at pick_slice_index) is flops-blind: it takes
+    // the largest-extent leg of the peak node and never scores what the cut
+    // multiplies. Slicing extent-d index ix turns total FLOPs F into
+    // d*F - (d-1)*F_ix, where F_ix is the flops of the nodes involving ix,
+    // so the cheap cut is the index carried by the largest share of the
+    // tree's cost. Job 21490486 measured the blind choice at p=9: a 2^59.0
+    // post-reconf tree sliced to 2^76.1 -- a 2^17 tax over 32 cuts. The
+    // helper keeps the aer-0089 candidate set and guarantees (non-output
+    // legs of the peak node, argmax peak by the same traverse/get_size the
+    // envelope reads, deterministic first-seen ties) and scores candidates
+    // by log2(overhead)/log2(d) -- extent-normalized, so mixed-extent
+    // networks compare fairly; exact-integer share arithmetic, no tunable
+    // constants. Same per-node property sweep as the C++ picker, so cache
+    // side effects are unchanged; validated end-to-end on cotengra 0.7.5
+    // (details in the commit).
+    {
+      static bool pick_done = false;
+      if (!pick_done && slice_overhead_enabled()) {
+        try {
+          py::exec(R"AER(
+import cotengra.core as _aer_core
+import math as _aer_math
+if not hasattr(_aer_core, "_aer_pick_slice"):
+    _AER_PICK_SCALE = 1 << 53
+    def _aer_pick_slice(tree):
+        best_node = None
+        best_size = -1.0
+        for node, l, r in tree.traverse():
+            s = _aer_math.log2(tree.get_size(node))
+            if s > best_size:
+                best_size = s
+                best_node = node
+        if best_node is None:
+            return None
+        outset = set(tree.output)
+        legs = tree.get_legs(best_node)
+        cands = [ix for ix in legs
+                 if ix not in outset and tree.size_dict[ix] > 1]
+        if not cands:
+            return None
+        F_tot = 0
+        acc = {ix: 0 for ix in cands}
+        cset = set(cands)
+        for node, l, r in tree.traverse():
+            f = tree.get_flops(node)
+            F_tot += f
+            if f:
+                inv = tree.get_involved(node)
+                if len(inv) < len(cset):
+                    for ix in inv:
+                        if ix in cset:
+                            acc[ix] += f
+                else:
+                    for ix in cset:
+                        if ix in inv:
+                            acc[ix] += f
+        if F_tot == 0:
+            return cands[0]
+        best_ix = None
+        best_score = None
+        for ix in cands:
+            d = tree.size_dict[ix]
+            r = (acc[ix] * _AER_PICK_SCALE) // F_tot
+            score = (_aer_math.log2(
+                         (d * _AER_PICK_SCALE - (d - 1) * r)
+                         / _AER_PICK_SCALE)
+                     / _aer_math.log2(d))
+            if best_score is None or score < best_score:
+                best_score = score
+                best_ix = ix
+        return best_ix
+    _aer_core._aer_pick_slice = _aer_pick_slice
+)AER");
+          pick_done = true;
+          fprintf(stderr,
+                  "[AER_TN_PATH] slice picker: overhead-aware "
+                  "(AER_TN_SLICE_OVERHEAD=0 restores extent-greedy)\n");
+        } catch (py::error_already_set &pk) {
+          fprintf(stderr,
+                  "[AER_TN_PATH] warning: could not install the "
+                  "overhead-aware slice picker: %s -- extent-greedy picker "
+                  "remains\n",
+                  pk.what());
+          pk.discard_as_unraisable("AER_TN_PATH slice picker install");
+        }
+      } else if (!pick_done && !slice_overhead_enabled()) {
+        static bool said = false;
+        if (!said) {
+          said = true;
+          fprintf(stderr, "[AER_TN_PATH] slice picker: extent-greedy "
+                          "(AER_TN_SLICE_OVERHEAD=0)\n");
         }
       }
     }
@@ -2569,6 +2675,25 @@ private:
   // Deterministic and seed-free: argmax in traverse order, ties to the
   // first seen, so identical trees slice identically on every rank.
   static py::object pick_slice_index(py::object &tree) {
+    // aer-0104: overhead-aware pick when the helper is installed; the
+    // extent-greedy body below is the fallback and the opt-out path.
+    if (slice_overhead_enabled()) {
+      try {
+        return py::module_::import("cotengra.core")
+            .attr("_aer_pick_slice")(tree);
+      } catch (py::error_already_set &he) {
+        static bool warned = false;
+        if (!warned) {
+          warned = true;
+          fprintf(stderr,
+                  "[AER_TN_PATH] warning: overhead-aware slice picker "
+                  "unavailable (%s); extent-greedy picker for this "
+                  "process\n",
+                  he.what());
+        }
+        he.discard_as_unraisable("AER_TN_PATH slice pick");
+      }
+    }
     // aer-0090: node sizes are exact Python ints and on degenerate draws
     // dwarf a double (jobs 21474687-691: peaks far beyond 2^1024, where
     // float(size) raises OverflowError -- the 0089 cast<double> here would
