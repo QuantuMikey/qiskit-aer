@@ -14,8 +14,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <map>
@@ -61,6 +63,76 @@ static bool path_verbose() {
     checked = true;
   }
   return enabled;
+}
+
+// aer-0109: opt-in phase timing for the path-search side. Default OFF, so
+// AER_TN_LOG_TIMES unset leaves every verbose line byte-identical. When
+// =1, a small set of true phase-boundary lines (setup/search/reconf/
+// slice/envelope/plan/capture/total -- the fixed vocabulary) gains one
+// bracketed suffix "[t=%.3f dt=%.3f r=%d phase=%s]": t is seconds since a
+// single MPI-broadcast zero (so t is comparable ACROSS ranks in a scaling
+// campaign), dt is seconds since THIS rank's previous stamped line (the
+// per-phase duration, precomputed -- no cross-line subtraction), r is the
+// rank, phase is the vocabulary token. Fixed field order so awk needs no
+// per-line special casing. This is the ONLY timing mechanism the search
+// side needs: the contractor's prof_report already times setup/contract,
+// but those phases live in a different class and cannot see inside
+// find_path, so search/reconf/slice are timed here.
+static bool log_times() {
+  static bool checked = false;
+  static bool enabled = false;
+  if (!checked) {
+    const char *val = std::getenv("AER_TN_LOG_TIMES");
+    enabled = (val != nullptr && std::string(val) == "1");
+    checked = true;
+  }
+  return enabled;
+}
+
+// The broadcast zero and this rank's previous-stamp time. t0 is set once,
+// from rank 0's clock, broadcast to all ranks (MPIParallelPathOptimizer
+// calls stamp_init after it has a communicator; the serial optimizer's
+// t0 is simply its own start -- r=0 there). Both are monotonic.
+inline std::chrono::steady_clock::time_point &stamp_t0() {
+  static std::chrono::steady_clock::time_point t0 =
+      std::chrono::steady_clock::now();
+  return t0;
+}
+inline std::chrono::steady_clock::time_point &stamp_prev() {
+  static std::chrono::steady_clock::time_point prev = stamp_t0();
+  return prev;
+}
+inline int &stamp_rank() {
+  static int r = 0;
+  return r;
+}
+// aer-0109: when the MPI wrapper sets the shared barrier origin, it locks it
+// so the inner serial find_path (called AFTER, on the same rank) does not
+// overwrite the shared origin with its own clock. A standalone 1-rank run
+// has no wrapper, so the lock is false and the serial find_path sets the
+// origin itself -- giving ranks=1 a real t=0 at search entry instead of a
+// lazy t=0 at the first printed line.
+inline bool &stamp_origin_locked() {
+  static bool locked = false;
+  return locked;
+}
+
+// Format the suffix for a phase-boundary line. Returns "" unless
+// AER_TN_LOG_TIMES=1, so call sites append it unconditionally and pay
+// nothing when the feature is off. Not thread-safe by design: the search
+// side is single-threaded per rank (the rust thread pool is INSIDE one
+// cotengra call, not around these stamps).
+inline std::string stamp(const char *phase) {
+  if (!log_times())
+    return std::string();
+  auto now = std::chrono::steady_clock::now();
+  double t = std::chrono::duration<double>(now - stamp_t0()).count();
+  double dt = std::chrono::duration<double>(now - stamp_prev()).count();
+  stamp_prev() = now;
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), " [t=%.3f dt=%.3f r=%d phase=%s]", t, dt,
+                stamp_rank(), phase);
+  return std::string(buf);
 }
 
 // Tiling enable policy. Tiling decomposes an oversized (M>6, N>6, or K>6)
@@ -1530,6 +1602,17 @@ public:
                             uint64_t seed,
                             bool tiling_available) override {
     py::gil_scoped_acquire gil;
+    // aer-0109: a standalone 1-rank run has no MPIParallelPathOptimizer and
+    // thus no barrier origin; set the timing origin at search entry so
+    // ranks=1 gets a real t=0 here rather than a lazy t=0 at the first
+    // printed line. When the MPI wrapper ran, it set AND locked the shared
+    // barrier origin before calling this inner find_path, so skip -- never
+    // overwrite the shared origin with this rank's own clock.
+    if (!stamp_origin_locked()) {
+      stamp_t0() = std::chrono::steady_clock::now();
+      stamp_prev() = stamp_t0();
+      stamp_rank() = 0;
+    }
     auto ctg = py::module_::import("cotengra");
 
     // Build int → string label mapping
@@ -2158,6 +2241,18 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
         ue.discard_as_unraisable("AER_TN_PATH rg upgrade call");
       }
       tree = opt.attr("search")(inputs, output, sizes);
+      // aer-0109: close the search phase on the random-greedy branch. The
+      // hyper branch's always-emitted "search done" line carries
+      // phase=search; this branch's search-best line is path_verbose-gated,
+      // so timing would otherwise fold search into the following reconf's
+      // dt. Emit a phase=search boundary here, unconditionally when timing
+      // is on, so dt separates search from reconf on forges (the common
+      // path since aer-0105). When path_verbose is also on, the richer
+      // "search best" line below still prints; this marker only advances
+      // the phase clock.
+      if (log_times())
+        fprintf(stderr, "[AER_TN_PATH] search done (random-greedy)%s\n",
+                stamp("search").c_str());
       // aer-0108: the winner reconfiguration for THIS preset. aer-0105
       // routed forges through RandomGreedyOptimizer, whose search()
       // returns a bare tree and never reaches the winner-reconf block in
@@ -2191,8 +2286,9 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
         try {
           py::object py_log2 = py::module_::import("math").attr("log2");
           py::dict st = tree.attr("contract_stats")();
-          fprintf(stderr, "[AER_TN_PATH] winner reconf: log2_flops=%.1f\n",
-                  py_log2(st["flops"]).cast<double>());
+          fprintf(stderr, "[AER_TN_PATH] winner reconf: log2_flops=%.1f%s\n",
+                  py_log2(st["flops"]).cast<double>(),
+                  stamp("reconf").c_str());
         } catch (py::error_already_set &pe) {
           pe.discard_as_unraisable("AER_TN_PATH rg winner reconf report");
         }
@@ -2530,8 +2626,8 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
             << e.what();
         throw std::runtime_error(msg.str());
       }
-      fprintf(stderr, "[AER_TN_PATH] search done: %zu trial(s)\n",
-              (size_t)py::len(opt.attr("scores")));
+      fprintf(stderr, "[AER_TN_PATH] search done: %zu trial(s)%s\n",
+              (size_t)py::len(opt.attr("scores")), stamp("search").c_str());
       // aer-0091: name the winner. Job 21476056 showed 64 clean trials at
       // p=8 whose best still needed 2^70 slices, and nothing in the log
       // said which method won or how bad the best was. One unconditional
@@ -2570,8 +2666,9 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
         try {
           py::object py_log2 = py::module_::import("math").attr("log2");
           py::dict st = tree.attr("contract_stats")();
-          fprintf(stderr, "[AER_TN_PATH] winner reconf: log2_flops=%.1f\n",
-                  py_log2(st["flops"]).cast<double>());
+          fprintf(stderr, "[AER_TN_PATH] winner reconf: log2_flops=%.1f%s\n",
+                  py_log2(st["flops"]).cast<double>(),
+                  stamp("reconf").c_str());
         } catch (py::error_already_set &pe) {
           pe.discard_as_unraisable("AER_TN_PATH winner reconf report");
         }
@@ -2717,11 +2814,12 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
       if (path_verbose()) {
         fprintf(stderr,
                 "[AER_TN_PATH] slice envelope enforced: peak %lld <= target "
-                "%llu elements (%zu sliced modes, %llu slices)\n",
+                "%llu elements (%zu sliced modes, %llu slices)%s\n",
                 (long long)tree.attr("max_size")().cast<int64_t>(),
                 (unsigned long long)target_elements,
                 (size_t)py::len(tree.attr("sliced_inds")),
-                (unsigned long long)tree_num_slices(tree));
+                (unsigned long long)tree_num_slices(tree),
+                stamp("envelope").c_str());
       }
     }
 
@@ -2985,10 +3083,11 @@ private:
     if (path_verbose()) {
       fprintf(stderr,
               "[AER_TN_PATH] cotengra plan: %zu steps, %zu sliced modes, "
-              "%lu slices, %.2e total FLOPs, peak intermediate %ld elements\n",
+              "%lu slices, %.2e total FLOPs, peak intermediate %ld "
+              "elements%s\n",
               plan.steps.size(), plan.sliced.size(),
               (unsigned long)plan.num_slices, plan.total_flops,
-              (long)plan.peak_intermediate_elements);
+              (long)plan.peak_intermediate_elements, stamp("plan").c_str());
     }
 
     return plan;
@@ -3012,6 +3111,17 @@ public:
                             uint64_t memory_limit_bytes,
                             uint64_t seed,
                             bool /*tiling_available*/) override {
+    // aer-0109: same origin rule as CotengPathOptimizer::find_path. This
+    // greedy fallback runs only when cotengra fails to import; set the
+    // timing origin at entry so its plan line is not stamped against a
+    // lazy t=0. Skips when the MPI wrapper already locked the shared
+    // origin (nprocs_ is fixed per process, so this path is uniformly
+    // wrapped or standalone -- no stale lock).
+    if (!stamp_origin_locked()) {
+      stamp_t0() = std::chrono::steady_clock::now();
+      stamp_prev() = stamp_t0();
+      stamp_rank() = 0;
+    }
     auto size_dict = network.build_size_dict();
     ContractionPlan best;
     best.total_flops = std::numeric_limits<double>::max();
@@ -3073,9 +3183,10 @@ public:
     if (path_verbose()) {
       fprintf(stderr,
               "[AER_TN_PATH] greedy plan (%d restarts): %zu steps, "
-              "%zu sliced modes, %lu slices, %.2e total FLOPs\n",
+              "%zu sliced modes, %lu slices, %.2e total FLOPs%s\n",
               num_restarts_, best.steps.size(), best.sliced.size(),
-              (unsigned long)best.num_slices, best.total_flops);
+              (unsigned long)best.num_slices, best.total_flops,
+              stamp("plan").c_str());
     }
     return best;
   }
@@ -3258,6 +3369,24 @@ public:
     int rank, size;
     MPI_Comm_rank(comm_, &rank);
     MPI_Comm_size(comm_, &size);
+
+    // aer-0109: establish the timing origin. steady_clock is CLOCK_MONOTONIC,
+    // whose epoch is per-node boot time, so rank 0's raw clock value is
+    // meaningless on another node (t= could go negative across nodes).
+    // Instead every rank takes an MPI_Barrier -- a genuine sync point -- and
+    // sets ITS OWN clock reading at the barrier as the origin. t= is then
+    // "seconds since the shared barrier" on each rank; origins differ only by
+    // the barrier's own skew (microseconds), never by boot time, so t= is
+    // comparable across nodes. dt= is a within-rank delta and is exact
+    // regardless. The barrier and the rank read are UNCONDITIONAL -- outside
+    // any env test -- so all ranks execute the same collectives together
+    // (log_times() gates only the per-line suffix in stamp(), never a
+    // collective), preserving the fail-together contract.
+    MPI_Barrier(comm_);
+    stamp_t0() = std::chrono::steady_clock::now();
+    stamp_prev() = stamp_t0();
+    stamp_rank() = rank;
+    stamp_origin_locked() = true;
 
     // aer-0065: cooperative search. Divide the trial budget across ranks and
     // let the MINLOC below pick the winner -- same total trials, wall / R.
