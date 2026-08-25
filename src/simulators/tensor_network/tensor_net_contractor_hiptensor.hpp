@@ -1501,6 +1501,22 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_prebuild_ms_ = 0.0;
     prof_pool_ms_ = 0.0;
     prof_setup_t0 = std::chrono::steady_clock::now();
+    // aer-0110: establish the SHARED timing origin for both patches at the
+    // true start of the contraction sequence. setup_contraction runs before
+    // find_path (find_path is called from inside this same setup), so setting
+    // stamp_t0() here means the aer-0109 search-side stamps and this patch's
+    // run.* stamps all compute t = now - this origin: one meaning of t
+    // everywhere, monotonic down the log. Lock it so the optimizer's
+    // find_path does not re-origin from its own clock (its if(!locked) guard
+    // defers, exactly as it defers to the MPI wrapper). Reset+set each setup
+    // so a second contraction in the same process re-origins cleanly. Gated
+    // on AER_TN_LOG_TIMES: default-off leaves timing state untouched.
+    if (AER::TensorNetwork::log_times()) {
+      AER::TensorNetwork::stamp_t0() = prof_setup_t0;
+      AER::TensorNetwork::stamp_prev() = prof_setup_t0;
+      AER::TensorNetwork::stamp_rank() = myrank_;
+      AER::TensorNetwork::stamp_origin_locked() = true;
+    }
   }
 
   // Tiling enable policy for THIS setup (AUTO lazy retry).
@@ -3201,6 +3217,60 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           prof_specs_ms_, prof_prebuild_ms_, prof_pool_ms_,
           (unsigned long)prof_graph_replays_,
           (unsigned long)prof_graph_captures_);
+
+  if (AER::TensorNetwork::log_times()) {
+    // aer-0110: emit the run.* phases in the aer-0109 vocabulary, sharing its
+    // origin (set at setup start above). This patch ALSO renames the four
+    // aer-0109 search-side tokens to the dotted scheme
+    // (path.search/path.reconf/slice.envelope/path.plan) in path_optimizer.hpp
+    // -- delivered here as a forward delta because aer-0109 is already pushed
+    // and immutable. The complete dotted vocabulary is then path.search,
+    // path.reconf, slice.envelope, path.plan, run.setup_pre, run.contract,
+    // run.reduce, so a script groups by prefix.
+    //
+    // t is elapsed since the shared origin -- read the SAME way stamp() reads
+    // it, now - stamp_t0() -- so t is a real clock position, monotonic across
+    // BOTH patches down the log, never a running sum; no backwards jump
+    // between the last path stamp and run.setup_pre. dt is each phase's own
+    // duration from the *_ms_ accumulators, disjoint and summable.
+    //
+    // run.setup_pre = prof_setup_ms_ - prof_path_ms_. The setup bracket
+    // CONTAINS the path span aer-0109 itemises (find_path runs inside it), so
+    // subtracting it leaves only the setup work 0109 does not cover (specs,
+    // per-step prebuild, pool/hipMalloc, per-device copy); the dt column is
+    // then additive across both patches with no phase counted twice. A guard
+    // floors setup_pre at 0 for clock granularity, a cache hit, or a REPLAY
+    // (no search ran, prof_path_ms_ ~ 0, so run.setup_pre absorbs the
+    // ms-scale plan load; replay logs show only run.* lines, t and dt still
+    // truthful). entry= is carried so multiple prof_report entry points stay
+    // attributable. run.total is intentionally NOT emitted: the last line's t
+    // already equals the run length, and a summary row only invites a
+    // double-count when a script sums dt.
+    auto now_lt = std::chrono::steady_clock::now();
+    const double t_now =
+        std::chrono::duration<double>(now_lt - AER::TensorNetwork::stamp_t0())
+            .count();
+    double setup_pre_ms = prof_setup_ms_ - prof_path_ms_;
+    if (setup_pre_ms < 0.0)
+      setup_pre_ms = 0.0;
+    const double dt_setup_pre = setup_pre_ms / 1000.0;
+    const double dt_contract = prof_contract_ms_ / 1000.0;
+    const double dt_reduce =
+        (prof_reduce_gpu_ms_ + prof_reduce_mpi_ms_) / 1000.0;
+    const double t_reduce_end = t_now;
+    const double t_contract_end = t_now - dt_reduce;
+    const double t_setup_pre_end = t_now - dt_reduce - dt_contract;
+    fprintf(stderr,
+            "[AER_TN_PROFILE] run-phase entry=%s [t=%.3f dt=%.3f r=%d "
+            "phase=run.setup_pre]\n"
+            "[AER_TN_PROFILE] run-phase entry=%s [t=%.3f dt=%.3f r=%d "
+            "phase=run.contract]\n"
+            "[AER_TN_PROFILE] run-phase entry=%s [t=%.3f dt=%.3f r=%d "
+            "phase=run.reduce]\n",
+            entrypoint, t_setup_pre_end, dt_setup_pre, myrank_,
+            entrypoint, t_contract_end, dt_contract, myrank_,
+            entrypoint, t_reduce_end, dt_reduce, myrank_);
+  }
 }
 
 template <typename data_t>

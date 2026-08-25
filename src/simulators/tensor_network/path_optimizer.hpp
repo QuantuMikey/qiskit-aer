@@ -2252,7 +2252,7 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
       // the phase clock.
       if (log_times())
         fprintf(stderr, "[AER_TN_PATH] search done (random-greedy)%s\n",
-                stamp("search").c_str());
+                stamp("path.search").c_str());
       // aer-0108: the winner reconfiguration for THIS preset. aer-0105
       // routed forges through RandomGreedyOptimizer, whose search()
       // returns a bare tree and never reaches the winner-reconf block in
@@ -2288,7 +2288,7 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
           py::dict st = tree.attr("contract_stats")();
           fprintf(stderr, "[AER_TN_PATH] winner reconf: log2_flops=%.1f%s\n",
                   py_log2(st["flops"]).cast<double>(),
-                  stamp("reconf").c_str());
+                  stamp("path.reconf").c_str());
         } catch (py::error_already_set &pe) {
           pe.discard_as_unraisable("AER_TN_PATH rg winner reconf report");
         }
@@ -2627,7 +2627,7 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
         throw std::runtime_error(msg.str());
       }
       fprintf(stderr, "[AER_TN_PATH] search done: %zu trial(s)%s\n",
-              (size_t)py::len(opt.attr("scores")), stamp("search").c_str());
+              (size_t)py::len(opt.attr("scores")), stamp("path.search").c_str());
       // aer-0091: name the winner. Job 21476056 showed 64 clean trials at
       // p=8 whose best still needed 2^70 slices, and nothing in the log
       // said which method won or how bad the best was. One unconditional
@@ -2668,7 +2668,7 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
           py::dict st = tree.attr("contract_stats")();
           fprintf(stderr, "[AER_TN_PATH] winner reconf: log2_flops=%.1f%s\n",
                   py_log2(st["flops"]).cast<double>(),
-                  stamp("reconf").c_str());
+                  stamp("path.reconf").c_str());
         } catch (py::error_already_set &pe) {
           pe.discard_as_unraisable("AER_TN_PATH winner reconf report");
         }
@@ -2819,7 +2819,7 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
                 (unsigned long long)target_elements,
                 (size_t)py::len(tree.attr("sliced_inds")),
                 (unsigned long long)tree_num_slices(tree),
-                stamp("envelope").c_str());
+                stamp("slice.envelope").c_str());
       }
     }
 
@@ -3087,7 +3087,7 @@ private:
               "elements%s\n",
               plan.steps.size(), plan.sliced.size(),
               (unsigned long)plan.num_slices, plan.total_flops,
-              (long)plan.peak_intermediate_elements, stamp("plan").c_str());
+              (long)plan.peak_intermediate_elements, stamp("path.plan").c_str());
     }
 
     return plan;
@@ -3186,7 +3186,7 @@ public:
               "%zu sliced modes, %lu slices, %.2e total FLOPs%s\n",
               num_restarts_, best.steps.size(), best.sliced.size(),
               (unsigned long)best.num_slices, best.total_flops,
-              stamp("plan").c_str());
+              stamp("path.plan").c_str());
     }
     return best;
   }
