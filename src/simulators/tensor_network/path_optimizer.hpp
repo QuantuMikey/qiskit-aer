@@ -2158,6 +2158,45 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
         ue.discard_as_unraisable("AER_TN_PATH rg upgrade call");
       }
       tree = opt.attr("search")(inputs, output, sizes);
+      // aer-0108: the winner reconfiguration for THIS preset. aer-0105
+      // routed forges through RandomGreedyOptimizer, whose search()
+      // returns a bare tree and never reaches the winner-reconf block in
+      // the hyper branch below (that block reads opt.best / opt.scores,
+      // which only HyperOptimizer exposes) -- so job 21515220 banked RAW
+      // random-greedy trees (winner 2^70.3, four saturated) with no
+      // "winner reconf" line and a plan worse than every reconfigured
+      // forge before it. The reconfiguration is the pipeline's quality
+      // step (raw 2^68 -> 2^51 on real cotengra, the aer-0089 once-on-the-
+      // winner design), and it belongs on both presets. Same transactional
+      // helper as the hyper path (aer-0099); the raw cost is read from
+      // contract_stats, NOT from RandomGreedyOptimizer.best_flops, which
+      // is an internal per-step metric (2^4-class), not total FLOPs.
+      // Slicing (the explicit envelope pass and its per-cut reconf) runs
+      // for BOTH presets after this, unchanged.
+      if (path_verbose()) {
+        try {
+          py::object py_log2 = py::module_::import("math").attr("log2");
+          py::dict st_pre = tree.attr("contract_stats")();
+          fprintf(stderr,
+                  "[AER_TN_PATH] search best: preset=random-greedy "
+                  "log2_flops=%.1f log2_size=%.1f\n",
+                  py_log2(st_pre["flops"]).cast<double>(),
+                  py_log2(st_pre["size"]).cast<double>());
+        } catch (py::error_already_set &pe) {
+          pe.discard_as_unraisable("AER_TN_PATH rg search best");
+        }
+      }
+      if (reconf_tree_transactional(tree, "winner subtree_reconfigure_") &&
+          path_verbose()) {
+        try {
+          py::object py_log2 = py::module_::import("math").attr("log2");
+          py::dict st = tree.attr("contract_stats")();
+          fprintf(stderr, "[AER_TN_PATH] winner reconf: log2_flops=%.1f\n",
+                  py_log2(st["flops"]).cast<double>());
+        } catch (py::error_already_set &pe) {
+          pe.discard_as_unraisable("AER_TN_PATH rg winner reconf report");
+        }
+      }
       // aer-0089: no preset-local slicing. The explicit envelope pass below
       // runs for BOTH presets and is the single place trees are cut to the
       // m6n6k6 budget.
