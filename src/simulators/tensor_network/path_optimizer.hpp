@@ -1917,6 +1917,56 @@ if not hasattr(_aer_core, "_aer_pick_slice"):
       }
     }
 
+    // aer-0105: install the random-greedy backend upgrade. Loads the REAL
+    // cotengrust via PathFinder (bypassing sys.modules, which the aer-0091
+    // cap-time shim owns) and rewires ONE optimizer instance to it with a
+    // thread pool -- the shim's own instance-surgery pattern, in reverse,
+    // scoped to the forge preset. RG footprint is megabytes against the
+    // cap, so the rust-abort exposure the shim guards against does not
+    // apply to this call; everything else stays shimmed.
+    {
+      static bool rg_up_done = false;
+      if (!rg_up_done) {
+        try {
+          py::exec(R"AER(
+import cotengra.core as _aer_core
+if not hasattr(_aer_core, "_aer_rg_upgrade"):
+    def _aer_rg_upgrade(opt, nthreads):
+        import sys
+        import importlib.util
+        import importlib.machinery
+        from concurrent.futures import ThreadPoolExecutor
+        try:
+            spec = importlib.machinery.PathFinder().find_spec(
+                "cotengrust", sys.path)
+        except Exception:
+            spec = None
+        if spec is not None and spec.loader is not None:
+            try:
+                m = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(m)
+                fn = m.optimize_random_greedy_track_flops
+                n = max(1, int(nthreads))
+                opt._optimize_fn = fn
+                opt._pool = ThreadPoolExecutor(max_workers=n)
+                opt._nworkers = n
+                return {"backend": "cotengrust-threads", "threads": n}
+            except Exception:
+                pass
+        return {"backend": "python-serial", "threads": 1}
+    _aer_core._aer_rg_upgrade = _aer_rg_upgrade
+)AER");
+          rg_up_done = true;
+        } catch (py::error_already_set &ru) {
+          fprintf(stderr,
+                  "[AER_TN_PATH] warning: could not install the "
+                  "random-greedy backend upgrade: %s\n",
+                  ru.what());
+          ru.discard_as_unraisable("AER_TN_PATH rg upgrade install");
+        }
+      }
+    }
+
     // aer-0091/0096: while the cap is armed, cotengrust must not run. Rust
     // ABORTS the process on allocation failure ("memory allocation of N
     // bytes failed", SIGABRT) instead of raising -- jobs 21476058/21476059
@@ -2012,12 +2062,45 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
     }
 
     if (preset_ == "random-greedy") {
-      // RandomGreedyOptimizer takes seed as a direct named kwarg — no routing.
+      // aer-0105: the forge-default preset. The old call here was dead code
+      // (preset was hardcoded "hyper" at construction) and carried a latent
+      // TypeError: RandomGreedyOptimizer.__init__ has no max_time or
+      // progbar parameters (path_basic.py:1417-1426); repeats bound this
+      // preset, not wall time. Constructed serial-python for a
+      // deterministic base, then upgraded in place to real cotengrust with
+      // a thread pool sized to this rank's cores. The banked path is a
+      // function of (backend, threads, seed) -- cotengra draws one
+      // sub-seed per pool batch from the seeded rng -- so all three print
+      // below. AER_TN_PATH_PRESET=hyper restores the legacy forge search.
       auto opt = ctg.attr("RandomGreedyOptimizer")(
           py::arg("max_repeats") = effective_max_repeats(),
-          py::arg("max_time") = max_time_,
           py::arg("seed") = seed,
-          py::arg("progbar") = false);
+          py::arg("parallel") = false,
+          py::arg("accel") = false);
+      int rg_threads = 1;
+      try {
+        py::object aff =
+            py::module_::import("os").attr("sched_getaffinity")(0);
+        rg_threads = static_cast<int>(py::len(aff));
+      } catch (py::error_already_set &ae) {
+        ae.discard_as_unraisable("AER_TN_PATH rg threads");
+      }
+      try {
+        py::dict prov = py::module_::import("cotengra.core")
+                            .attr("_aer_rg_upgrade")(opt, rg_threads);
+        fprintf(stderr,
+                "[AER_TN_PATH] preset random-greedy: backend=%s threads=%d "
+                "repeats=%d seed=%llu\n",
+                prov["backend"].cast<std::string>().c_str(),
+                prov["threads"].cast<int>(), effective_max_repeats(),
+                (unsigned long long)seed);
+      } catch (py::error_already_set &ue) {
+        fprintf(stderr,
+                "[AER_TN_PATH] warning: random-greedy backend upgrade "
+                "unavailable (%s); python serial backend\n",
+                ue.what());
+        ue.discard_as_unraisable("AER_TN_PATH rg upgrade call");
+      }
       tree = opt.attr("search")(inputs, output, sizes);
       // aer-0089: no preset-local slicing. The explicit envelope pass below
       // runs for BOTH presets and is the single place trees are cut to the

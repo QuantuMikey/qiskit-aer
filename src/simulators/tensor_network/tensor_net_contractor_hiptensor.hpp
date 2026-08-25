@@ -3440,8 +3440,17 @@ TensorNetContractor_HipTensor<data_t>::create_optimizer() {
     if ((nprocs_ > 1 || tn_plan_forge()) && min_slices_per_rank() > 0)
       min_slices = min_slices_per_rank() *
                    static_cast<uint64_t>(nprocs_ > 1 ? nprocs_ : 1);
+    // aer-0105: forge searches default to the random-greedy preset
+    // (measured license: probe 21499314 -- 64/64 trials, zero errors,
+    // reconf into the kahypar basin). AER_TN_PATH_PRESET overrides for
+    // any run; non-forge runs keep "hyper" exactly as before.
+    const char *aer0105_pp = std::getenv("AER_TN_PATH_PRESET");
+    const std::string aer0105_preset =
+        (aer0105_pp != nullptr && *aer0105_pp != '\0')
+            ? std::string(aer0105_pp)
+            : (tn_plan_forge() ? "random-greedy" : "hyper");
     inner = std::unique_ptr<PathOptimizer>(new CotengPathOptimizer(
-        "combo", -1, -1.0, "hyper", elem_bytes, min_slices));
+        "combo", -1, -1.0, aer0105_preset, elem_bytes, min_slices));
   } catch (...) {
     if (tn_verbose())
       fprintf(stderr, "[AER_TN] cotengra unavailable, using greedy\n");
