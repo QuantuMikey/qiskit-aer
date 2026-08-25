@@ -2111,13 +2111,31 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
           py::arg("seed") = seed,
           py::arg("parallel") = false,
           py::arg("accel") = false);
+      // aer-0107: thread count is operator-controlled and cap-aware. Job
+      // 21514856 measured the auto default wrong: 7 concurrent rust
+      // searches per rank exhausted the 61440 MB RLIMIT and aborted (Rust
+      // cannot raise at the limit), exactly the hazard the aer-0091 shim
+      // documents. AER_TN_RG_THREADS > 0 wins outright; unset or 0 means
+      // 1 thread while the cap is armed (the only count with field
+      // evidence under the cap; serial rust remains the ~100x per-trial
+      // win) and the rank's granted cores when uncapped. Raising the
+      // capped count is a measured ladder via sacct MaxRSS, not a guess.
       int rg_threads = 1;
-      try {
-        py::object aff =
-            py::module_::import("os").attr("sched_getaffinity")(0);
-        rg_threads = static_cast<int>(py::len(aff));
-      } catch (py::error_already_set &ae) {
-        ae.discard_as_unraisable("AER_TN_PATH rg threads");
+      const char *rg_reason = " reason=capped-default";
+      const uint64_t rg_env =
+          TensorNetPathMem::env_u64("AER_TN_RG_THREADS", 0);
+      if (rg_env > 0) {
+        rg_threads = static_cast<int>(rg_env);
+        rg_reason = " reason=env-override";
+      } else if (!search_mem_cap->armed()) {
+        rg_reason = " reason=uncapped-auto";
+        try {
+          py::object aff =
+              py::module_::import("os").attr("sched_getaffinity")(0);
+          rg_threads = static_cast<int>(py::len(aff));
+        } catch (py::error_already_set &ae) {
+          ae.discard_as_unraisable("AER_TN_PATH rg threads");
+        }
       }
       try {
         py::dict prov = py::module_::import("cotengra.core")
@@ -2130,7 +2148,7 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
                 prov["backend"].cast<std::string>().c_str(),
                 prov["threads"].cast<int>(), effective_max_repeats(),
                 (unsigned long long)seed,
-                prov_reason.empty() ? "" : " reason=",
+                prov_reason.empty() ? rg_reason : " reason=",
                 prov_reason.c_str());
       } catch (py::error_already_set &ue) {
         fprintf(stderr,
