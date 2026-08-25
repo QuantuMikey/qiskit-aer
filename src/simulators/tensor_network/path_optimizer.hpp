@@ -1930,30 +1930,62 @@ if not hasattr(_aer_core, "_aer_pick_slice"):
         try {
           py::exec(R"AER(
 import cotengra.core as _aer_core
-if not hasattr(_aer_core, "_aer_rg_upgrade"):
+if not hasattr(_aer_core, "_aer_rg_upgrade") or not getattr(
+        _aer_core._aer_rg_upgrade, "_aer_0106", False):
     def _aer_rg_upgrade(opt, nthreads):
         import sys
-        import importlib.util
-        import importlib.machinery
+        import importlib
         from concurrent.futures import ThreadPoolExecutor
+        n = max(1, int(nthreads))
+        saved = {k: sys.modules.pop(k) for k in list(sys.modules)
+                 if k == "cotengrust" or k.startswith("cotengrust.")}
+        fn = None
+        reason = ""
         try:
-            spec = importlib.machinery.PathFinder().find_spec(
-                "cotengrust", sys.path)
-        except Exception:
-            spec = None
-        if spec is not None and spec.loader is not None:
-            try:
-                m = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(m)
-                fn = m.optimize_random_greedy_track_flops
-                n = max(1, int(nthreads))
-                opt._optimize_fn = fn
-                opt._pool = ThreadPoolExecutor(max_workers=n)
-                opt._nworkers = n
-                return {"backend": "cotengrust-threads", "threads": n}
-            except Exception:
-                pass
-        return {"backend": "python-serial", "threads": 1}
+            fn = importlib.import_module(
+                "cotengrust").optimize_random_greedy_track_flops
+        except Exception as e:
+            reason = "%s: %s" % (type(e).__name__, e)
+        finally:
+            for k in list(sys.modules):
+                if k == "cotengrust" or k.startswith("cotengrust."):
+                    del sys.modules[k]
+            if "cotengrust" in saved:
+                sys.modules["cotengrust"] = saved["cotengrust"]
+        if fn is not None:
+            opt._optimize_fn = fn
+            opt._pool = ThreadPoolExecutor(max_workers=n)
+            opt._nworkers = n
+            return {"backend": "cotengrust-threads", "threads": n,
+                    "reason": ""}
+        base = opt._optimize_fn
+        def _chunked(inputs, output, size_dict, use_ssa=True,
+                     ntrials=None, seed=None, **kw):
+            import random as _r
+            rng = _r.Random(seed)
+            nt = opt.max_repeats if ntrials is None else ntrials
+            best = None
+            failed = 0
+            for c in [nt // n + (i < nt % n) for i in range(n)]:
+                if c == 0:
+                    continue
+                try:
+                    pth, fl = base(inputs, output, size_dict,
+                                   use_ssa=use_ssa, ntrials=c,
+                                   seed=rng.randint(0, 2**32 - 1), **kw)
+                    if best is None or fl < best[1]:
+                        best = (pth, fl)
+                except OverflowError:
+                    failed += 1
+            if best is None:
+                raise OverflowError(
+                    "random-greedy python backend: all %d repeat chunks "
+                    "overflowed at local_score" % n)
+            return best
+        opt._optimize_fn = _chunked
+        return {"backend": "python-serial-chunked", "threads": 1,
+                "reason": reason or "cotengrust not importable"}
+    _aer_rg_upgrade._aer_0106 = True
     _aer_core._aer_rg_upgrade = _aer_rg_upgrade
 )AER");
           rg_up_done = true;
@@ -2045,7 +2077,9 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
           fprintf(stderr,
                   "[AER_TN_PATH] cotengrust disabled for capped searches "
                   "(Rust aborts at the RLIMIT instead of raising); "
-                  "AER_TN_PATH_ALLOW_RUST=1 opts out\n");
+                  "AER_TN_PATH_ALLOW_RUST=1 opts out; the random-greedy "
+                  "forge preset loads the real backend directly and prints "
+                  "its own provenance\n");
         } catch (py::error_already_set &rb) {
           fprintf(stderr,
                   "[AER_TN_PATH] warning: could not disable cotengrust: %s "
@@ -2088,12 +2122,16 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
       try {
         py::dict prov = py::module_::import("cotengra.core")
                             .attr("_aer_rg_upgrade")(opt, rg_threads);
+        const std::string prov_reason =
+            prov["reason"].cast<std::string>();
         fprintf(stderr,
                 "[AER_TN_PATH] preset random-greedy: backend=%s threads=%d "
-                "repeats=%d seed=%llu\n",
+                "repeats=%d seed=%llu%s%s\n",
                 prov["backend"].cast<std::string>().c_str(),
                 prov["threads"].cast<int>(), effective_max_repeats(),
-                (unsigned long long)seed);
+                (unsigned long long)seed,
+                prov_reason.empty() ? "" : " reason=",
+                prov_reason.c_str());
       } catch (py::error_already_set &ue) {
         fprintf(stderr,
                 "[AER_TN_PATH] warning: random-greedy backend upgrade "
