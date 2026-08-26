@@ -170,6 +170,13 @@ tn_ms_since(const std::chrono::steady_clock::time_point &t0) {
       .count();
 }
 
+// aer-0112: milliseconds between two captured steady_clock points (t1 >= t0).
+static inline double
+tn_ms_between(const std::chrono::steady_clock::time_point &t0,
+              const std::chrono::steady_clock::time_point &t1) {
+  return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
 // hipTensor requires every contraction descriptor to have at least one free
 // mode on A (the M group), at least one free mode on B (the N group), and at
 // least one shared mode (the K group). Pairwise contractions that the
@@ -959,6 +966,17 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   //      t_gemm_ms understates the fraction of t_contract_ms the route owns.
   //      Do not read a timing arm that has verification enabled.
   double prof_gemm_ms_ = 0.0;
+  // aer-0112: a disjoint partition of the SAME [prof_g0, end] window
+  // prof_gemm_ms_ already measures -- prof_gemm_ms_ is UNCHANGED (whole routed
+  // step enqueue, so historical t_gemm_ms stays comparable). prof_gemm_only_ms_
+  // is the GEMM dispatch alone ([prof_g1, prof_g2]); prof_pack_ms_ is everything
+  // else in the window (operand pack before + result scatter/deinterleave
+  // after), computed as whole - gemm_only so pack + gemm_only == whole exactly.
+  // Sizes the pack-elimination work (order propagation): pack_ms / gemm_ms is
+  // the movement fraction of routed enqueue. Host enqueue only, like its
+  // parent -- NOT execution time.
+  double prof_pack_ms_ = 0.0;
+  double prof_gemm_only_ms_ = 0.0;
   uint64_t prof_gemm_calls_ = 0;
   uint64_t prof_ht_calls_ = 0;
 
@@ -1491,6 +1509,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_path_ms_ = 0.0;
     prof_contract_ms_ = 0.0;
     prof_gemm_ms_ = 0.0;
+    prof_pack_ms_ = 0.0;
+    prof_gemm_only_ms_ = 0.0;
     prof_gemm_calls_ = 0;
     prof_ht_calls_ = 0;
     prof_reduce_gpu_ms_ = 0.0;
@@ -3201,7 +3221,8 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           "gflops_local=%.3f out_size=%lu "
           "gemm_route=%d t_gemm_ms=%.3f gemm_calls=%lu ht_calls=%lu "
           "t_specs_ms=%.3f t_prebuild_ms=%.3f t_pool_ms=%.3f "
-          "graph_replays=%lu graph_captures=%lu\n",
+          "graph_replays=%lu graph_captures=%lu "
+          "t_pack_ms=%.3f t_gemm_only_ms=%.3f\n",
           entrypoint, myrank_, nprocs_, num_devices_used_,
           (unsigned long)plan_.num_slices, (unsigned long)slices_local,
           plan_.total_flops, local_flops, prof_setup_ms_, prof_path_ms_,
@@ -3216,7 +3237,8 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           (unsigned long)prof_ht_calls_,
           prof_specs_ms_, prof_prebuild_ms_, prof_pool_ms_,
           (unsigned long)prof_graph_replays_,
-          (unsigned long)prof_graph_captures_);
+          (unsigned long)prof_graph_captures_,
+          prof_pack_ms_, prof_gemm_only_ms_);
 
   if (AER::TensorNetwork::log_times()) {
     // aer-0110: emit the run.* phases in the aer-0109 vocabulary, sharing its
@@ -3683,6 +3705,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   // still run, double-counting this visit's t_gemm/gemm_calls. Snapshot and
   // restore so the profile line reports the DIRECT work only.
   const double snap_gemm_ms = prof_gemm_ms_;
+  // aer-0112: the two split accumulators run inside this same double-executed
+  // body and must be snapshotted with their parent, or a captured visit
+  // double-counts them while t_gemm_ms is restored -- breaking the
+  // pack + gemm_only == t_gemm_ms invariant.
+  const double snap_pack_ms = prof_pack_ms_;
+  const double snap_gemm_only_ms = prof_gemm_only_ms_;
   const uint64_t snap_gemm_calls = prof_gemm_calls_;
   const uint64_t snap_ht_calls = prof_ht_calls_;
   hipGraph_t graph = nullptr;
@@ -3696,6 +3724,8 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       body_threw = true;
     }
     prof_gemm_ms_ = snap_gemm_ms;
+    prof_pack_ms_ = snap_pack_ms;
+    prof_gemm_only_ms_ = snap_gemm_only_ms;
     prof_gemm_calls_ = snap_gemm_calls;
     prof_ht_calls_ = snap_ht_calls;
     err = hipStreamEndCapture(dev.stream(), &graph);
@@ -3851,7 +3881,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
 #ifdef AER_HIPBLAS
     if (will_route) {
       routed = true;
-      std::chrono::steady_clock::time_point prof_g0;
+      // aer-0112: prof_g0 opens the routed-step window; prof_g1/prof_g2 bracket
+      // the GEMM dispatch alone so pack (before g1, after g2) and GEMM
+      // ([g1,g2]) split out. Stamped inside each dispatch branch below.
+      std::chrono::steady_clock::time_point prof_g0, prof_g1, prof_g2;
       if (tn_profile())
         prof_g0 = std::chrono::steady_clock::now();
       // aer-0052: a permuted step packs its operands into scratch first (the
@@ -3943,10 +3976,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                   all_planes[right].im, zbase + 2 * pe,
                                   *pr.first, *pr.second);
         }
+        if (tn_profile()) prof_g1 = std::chrono::steady_clock::now();
         dev.execute_contraction_gemm_complex(
             ps.gemm_m, ps.gemm_n, ps.gemm_k, ps.gemm_a_trans,
             ps.gemm_b_trans, step, zbase + 0 * pe, zbase + 2 * pe,
             zbase + 4 * pe, false);
+        if (tn_profile()) prof_g2 = std::chrono::steady_clock::now();
         const int64_t c_nat = ps.gemm_m * ps.gemm_n;
         if (ps.gemm_scatter_c) {
           deinterleave_scatter<data_t>(dev.stream(), zbase + 4 * pe,
@@ -3962,12 +3997,14 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                        lin_ext, lin_str);
         }
       } else {
+      if (tn_profile()) prof_g1 = std::chrono::steady_clock::now();
       dev.execute_contraction_gemm(
           ps.gemm_m, ps.gemm_n, ps.gemm_k, ps.gemm_a_trans, ps.gemm_b_trans,
           step,
           g_a_re, g_a_im,
           g_b_re, g_b_im,
           g_c_re, g_c_im, false);
+      if (tn_profile()) prof_g2 = std::chrono::steady_clock::now();
       }
       // Corder: place the natural-order result into the declared slot. The
       // slot was pre-zeroed above; extent-1 declared modes contribute index
@@ -3985,7 +4022,14 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         // Host-side enqueue cost. Deliberately NOT synchronised: see the note
         // on prof_gemm_ms_ at its declaration for why this is not the same
         // quantity as t_contract_ms and must not be read as a fraction of it.
-        prof_gemm_ms_ += tn_ms_since(prof_g0);
+        // aer-0112: prof_gemm_ms_ stays the whole [prof_g0, here] window
+        // (unchanged); split it into GEMM-only ([prof_g1, prof_g2]) and pack
+        // (the remainder). pack + gemm_only == whole by construction.
+        const double whole = tn_ms_since(prof_g0);
+        const double gemm_only = tn_ms_between(prof_g1, prof_g2);
+        prof_gemm_ms_ += whole;
+        prof_gemm_only_ms_ += gemm_only;
+        prof_pack_ms_ += whole - gemm_only;
         prof_gemm_calls_++;
       }
 
