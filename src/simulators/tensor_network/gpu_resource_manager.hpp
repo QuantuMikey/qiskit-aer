@@ -232,14 +232,22 @@ build_signature(const std::vector<int32_t> &modes_a,
 // by job 20644277 (50/50 cases, worst difference exactly zero), and the
 // interleave -> one-GEMM -> deinterleave equivalence to both the four-GEMM
 // decomposition and a mode-label complex reference is CLAIM Z of
-// audit_aer0054_design.py (110,392 cases, zero mismatches). Default OFF; the
-// A/B against the four-GEMM path gates any default flip.
+// audit_aer0054_design.py (110,392 cases, zero mismatches).
+// aer-0111: that gating A/B ran and passed -- replay of plan
+// plan_fc1318745a1935ac.r8.ctg (p=8, 256 slices) at 8 ranks, job 21540248
+// (this default) vs 21518320 (=0): t_contract_ms/rank 242,401 -> 155,555
+// (-35.8%), gflops_local ~692 -> ~1081, ZZ delta 4e-15, both PASS. Default is
+// now ON; AER_TN_GEMM_COMPLEX=0 is the opt-out. The flip introduces no new
+// dispatch path -- the =1 arm at the 3900 branch was the one under test.
 static bool tn_gemm_complex() {
   static bool checked = false;
-  static bool cached = false;
+  static bool cached = true;
   if (!checked) {
     const char *v = std::getenv("AER_TN_GEMM_COMPLEX");
-    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
+    // aer-0111: default ON; the ONLY opt-out is the exact string "0", which
+    // restores the four-GEMM split-complex path. Any other value -- or unset --
+    // keeps the native complex GEMM.
+    cached = !(v != nullptr && v[0] == '0' && v[1] == '\0');
     checked = true;
   }
   return cached;
