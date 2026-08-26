@@ -3906,7 +3906,18 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
       // scattered into the declared slot.
       data_t *g_c_re = all_planes[result_idx].re;
       data_t *g_c_im = all_planes[result_idx].im;
-      if (ps.gemm_perm_a || ps.gemm_perm_b || ps.gemm_scatter_c) {
+      // aer-0113: skip this operand-staging block when the complex path owns
+      // the step. The complex branch below re-reads the ORIGINAL planes via
+      // interleave_pack into its own scratch (the same buffer, its own resize)
+      // and does its own deinterleave_scatter, so every write this block makes
+      // -- stage_pack of A into pbase+0/1, of B into pbase+2/3, and the
+      // g_c_re/g_c_im reassignment -- is overwritten or unused before anything
+      // reads it. The six g_*_re/g_*_im declarations ABOVE stay outside the
+      // guard: the AER_TN_GEMM_COMPLEX=0 four-GEMM arm consumes them. Dead-work
+      // removal only -- no operand, alpha, beta, stride or order changes -- so
+      // the =0 arm is byte-identical and ZZ is bit-identical on the complex arm.
+      if (!tn_gemm_complex() &&
+          (ps.gemm_perm_a || ps.gemm_perm_b || ps.gemm_scatter_c)) {
         thrust::device_vector<data_t> &pbuf =
             gemm_perm_scratch_[dev.device_id()];
         const uint64_t pe = gemm_perm_scratch_elems_;
