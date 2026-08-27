@@ -253,6 +253,25 @@ static bool tn_gemm_complex() {
   return cached;
 }
 
+// aer-0116: AER_TN_ORDER_PROP=0 disables order propagation (checkpoint §6 item
+// 3b): declaring a single-consumer intermediate in the layout its consumer
+// wants, so the consumer's operand permute disappears. Default ON. Unlike the
+// format change, this alters GEMM blocking and therefore floating-point
+// summation ORDER, so results shift in the last bits (audited worst relative
+// difference 5.2e-16) -- the acceptance gate for a run with this on is a 1e-12
+// tolerance against the reference ZZ, not bit identity. The opt-out exists so
+// that comparison can be made without a rebuild.
+static bool tn_order_prop() {
+  static bool checked = false;
+  static bool cached = true;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_ORDER_PROP");
+    cached = !(v != nullptr && v[0] == '0' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
+}
+
 // aer-0048: AER_TN_GEMM_ATOMICS=1 restores rocBLAS's DEFAULT atomic reductions
 // on the GEMM handle. Default OFF keeps HIPBLAS_ATOMICS_NOT_ALLOWED, which is
 // the aer-0041 setting that the deterministic-reduction capability and the

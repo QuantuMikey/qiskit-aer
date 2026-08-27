@@ -1050,6 +1050,8 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // extra pack per operand per slice and the two populations must be
   // distinguishable in any timing read.
   uint64_t gemm_steps_permuted_ = 0;
+  // aer-0116: intermediates redeclared into their consumer's wanted order.
+  uint64_t gemm_steps_order_propagated_ = 0;
   // aer-0046: plans NOT built in the setup prebuild because the route will take
   // the step. This is the count that should track the setup saving.
   uint64_t gemm_plans_skipped_ = 0;
@@ -2295,6 +2297,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   gemm_steps_declined_corder_ = 0;
   gemm_steps_declined_korder_ = 0;
   gemm_steps_permuted_ = 0;
+  gemm_steps_order_propagated_ = 0;
   gemm_plans_skipped_ = 0;
   gemm_perm_scratch_elems_ = 0;
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
@@ -2387,6 +2390,51 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   };
 
   step_plan_specs_.assign(num_steps, PlanSpec{});
+
+  // aer-0116 (order propagation, checkpoint §6 item 3b). An intermediate is
+  // produced in compute_contraction_result's order, and its consumer then
+  // permutes it into GEMM layout. Instead, redeclare the intermediate's order
+  // to the one its consumer wants -- a stable partition of its natural modes
+  // into (free, contracted) at the consuming step -- and let the producer
+  // scatter its natural GEMM output into that order. gemm_scatter_c already
+  // performs an arbitrary-order scatter, so the producer gains no new pass on
+  // a step that already scattered; the consumer's permute disappears.
+  //
+  // Two constraints, both found by the standalone audit before this code
+  // existed (audit_3b_classic_accept.py, 20,000 cases, 0 wrong):
+  //
+  //  * ONE CONSUMER ONLY. An intermediate read by two steps cannot satisfy
+  //    both orders. last_used computes liveness by overwriting and therefore
+  //    tolerates multiple consumers, so consumers are counted here, not
+  //    inferred from it.
+  //  * THE REORDER MUST PAY OFF. If the other operand is a leaf whose
+  //    contracted modes are not contiguous, the step still cannot take the
+  //    classic accept, so reordering would ADD a producer scatter while the
+  //    consumer still packs -- strictly worse. The reorder is therefore gated
+  //    on the consuming step actually reaching the classic accept, decided
+  //    below with the same gemm_operand_layout predicate the classifier uses.
+  //
+  // The final step is excluded: its C order must stay modes_out_.
+  std::vector<int> consumer_count(num_total, 0);
+  std::vector<int> consumer_step(num_total, -1);
+  std::vector<int> consumer_role(num_total, -1); // 0 = A (left), 1 = B (right)
+  for (size_t step = 0; step < num_steps; step++) {
+    const uint64_t l = plan_.steps[step].left;
+    const uint64_t r = plan_.steps[step].right;
+    consumer_count[l]++;
+    if (consumer_count[l] == 1) {
+      consumer_step[l] = static_cast<int>(step);
+      consumer_role[l] = 0;
+    }
+    consumer_count[r]++;
+    if (consumer_count[r] == 1) {
+      consumer_step[r] = static_cast<int>(step);
+      consumer_role[r] = 1;
+    }
+  }
+  // Desired declared order per intermediate, empty when no reorder applies.
+  std::vector<std::vector<int32_t>> want_order(num_total);
+  std::vector<std::vector<int64_t>> want_extent(num_total);
 
   for (size_t step = 0; step < num_steps; step++) {
     uint64_t left = plan_.steps[step].left;
@@ -2495,6 +2543,137 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         all_specs_[result_idx].extents = final_extents;
       }
     } else {
+      // aer-0116: order propagation. If this intermediate has exactly one
+      // consumer and reordering it makes that consuming step a classic accept,
+      // declare it in the consumer's wanted layout instead of the natural one.
+      // The producer's scatter (gemm_scatter_c) then writes straight into that
+      // layout and the consumer permutes nothing.
+      bool reordered = false;
+      const int cs = consumer_step[result_idx];
+      if (tn_order_prop() && consumer_count[result_idx] == 1 && cs >= 0 &&
+          static_cast<size_t>(cs) != num_steps - 1 &&
+          modes_c.size() <= static_cast<size_t>(kStageMaxRank)) {
+        // The other operand at the consuming step, as it will be seen there.
+        const uint64_t other_idx =
+            (consumer_role[result_idx] == 0)
+                ? plan_.steps[static_cast<size_t>(cs)].right
+                : plan_.steps[static_cast<size_t>(cs)].left;
+        std::vector<int32_t> other_modes = all_specs_[other_idx].modes;
+        std::vector<int64_t> other_extents = all_specs_[other_idx].extents;
+        // The other operand may itself be an intermediate we already
+        // reordered; use that decision, not its natural order.
+        if (!want_order[other_idx].empty()) {
+          other_modes = want_order[other_idx];
+          other_extents = want_extent[other_idx];
+        }
+        std::set<int32_t> other_set(other_modes.begin(), other_modes.end());
+        std::set<int32_t> shared_at_consumer;
+        for (int32_t m : modes_c)
+          if (other_set.count(m))
+            shared_at_consumer.insert(m);
+
+        if (!shared_at_consumer.empty()) {
+          // Canonical contracted sequence: if the other operand is a leaf its
+          // order is fixed, so match it; otherwise sort for a deterministic,
+          // network-global sequence both sides can agree on.
+          const bool other_is_leaf = (other_idx < num_inputs);
+          std::vector<int32_t> k_seq;
+          if (other_is_leaf) {
+            for (int32_t m : other_modes)
+              if (shared_at_consumer.count(m))
+                k_seq.push_back(m);
+          } else {
+            k_seq.assign(shared_at_consumer.begin(), shared_at_consumer.end());
+          }
+          // Stable partition of modes_c into (free, contracted) per role.
+          std::vector<int32_t> nm;
+          std::vector<int64_t> ne;
+          std::map<int32_t, int64_t> ext_of;
+          for (size_t i = 0; i < modes_c.size(); i++)
+            ext_of[modes_c[i]] = extents_c[i];
+          std::vector<int32_t> frees;
+          for (int32_t m : modes_c)
+            if (!shared_at_consumer.count(m))
+              frees.push_back(m);
+          if (consumer_role[result_idx] == 0) {
+            nm = frees;
+            nm.insert(nm.end(), k_seq.begin(), k_seq.end());
+          } else {
+            nm = k_seq;
+            nm.insert(nm.end(), frees.begin(), frees.end());
+          }
+          ne.reserve(nm.size());
+          for (int32_t m : nm)
+            ne.push_back(ext_of[m]);
+
+          // GATE: emit the reorder only if the consuming step then reaches the
+          // classic accept -- both operands contiguous and contracted
+          // sequences equal. Otherwise the producer would pay a scatter for a
+          // consumer that still packs.
+          const std::vector<int32_t> &ma_c =
+              (consumer_role[result_idx] == 0) ? nm : other_modes;
+          const std::vector<int64_t> &ea_c =
+              (consumer_role[result_idx] == 0) ? ne : other_extents;
+          const std::vector<int32_t> &mb_c =
+              (consumer_role[result_idx] == 0) ? other_modes : nm;
+          const std::vector<int64_t> &eb_c =
+              (consumer_role[result_idx] == 0) ? other_extents : ne;
+          bool at_c = false, bt_c = false;
+          int64_t m1 = 1, k1 = 1, n1 = 1, k2 = 1;
+          const bool a_ok_c = gemm_operand_layout(ma_c, ea_c, shared_at_consumer,
+                                                  at_c, m1, k1);
+          const bool b_ok_c = gemm_operand_layout(mb_c, eb_c, shared_at_consumer,
+                                                  bt_c, n1, k2);
+          std::vector<int32_t> ka_c, kb_c;
+          for (size_t i = 0; i < ma_c.size(); i++)
+            if (shared_at_consumer.count(ma_c[i]) && ea_c[i] > 1)
+              ka_c.push_back(ma_c[i]);
+          for (size_t i = 0; i < mb_c.size(); i++)
+            if (shared_at_consumer.count(mb_c[i]) && eb_c[i] > 1)
+              kb_c.push_back(mb_c[i]);
+          // Would the consuming step ALREADY be a classic accept without any
+          // reorder? If so the reorder gains nothing and can only cost: it
+          // makes have_c != want_c at the producer, pushing that step onto the
+          // scatter-only route (aer-0118) for no benefit downstream. The
+          // end-to-end harness measured 1795 of 1992 reorders falling in this
+          // class before this test was added -- 90% pure cost. Requiring
+          // !already_ok keeps the full benefit (permuted steps fell by the same
+          // amount either way) while cutting emitted reorders by an order of
+          // magnitude and nearly halving the added scatters.
+          bool at0 = false, bt0 = false;
+          int64_t m0 = 1, k0 = 1, n0 = 1, k0b = 1;
+          const std::vector<int32_t> &ma0 =
+              (consumer_role[result_idx] == 0) ? modes_c : other_modes;
+          const std::vector<int64_t> &ea0 =
+              (consumer_role[result_idx] == 0) ? extents_c : other_extents;
+          const std::vector<int32_t> &mb0 =
+              (consumer_role[result_idx] == 0) ? other_modes : modes_c;
+          const std::vector<int64_t> &eb0 =
+              (consumer_role[result_idx] == 0) ? other_extents : extents_c;
+          const bool a0 = gemm_operand_layout(ma0, ea0, shared_at_consumer,
+                                              at0, m0, k0);
+          const bool b0 = gemm_operand_layout(mb0, eb0, shared_at_consumer,
+                                              bt0, n0, k0b);
+          std::vector<int32_t> ka0, kb0;
+          for (size_t i = 0; i < ma0.size(); i++)
+            if (shared_at_consumer.count(ma0[i]) && ea0[i] > 1)
+              ka0.push_back(ma0[i]);
+          for (size_t i = 0; i < mb0.size(); i++)
+            if (shared_at_consumer.count(mb0[i]) && eb0[i] > 1)
+              kb0.push_back(mb0[i]);
+          const bool already_ok = (a0 && b0 && ka0 == kb0 && k0 == k0b);
+
+          if (!already_ok && a_ok_c && b_ok_c && ka_c == kb_c && k1 == k2) {
+            modes_c = nm;
+            extents_c = ne;
+            want_order[result_idx] = nm;
+            want_extent[result_idx] = ne;
+            reordered = true;
+            gemm_steps_order_propagated_++;
+          }
+        }
+      }
+      (void)reordered;
       all_specs_[result_idx].modes = modes_c;
       all_specs_[result_idx].extents = extents_c;
     }
@@ -2953,12 +3132,14 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
 #ifdef AER_HIPBLAS
   {
     fprintf(stderr,
-            "[AER_TN_GEMM] steps=%zu routed=%llu permuted=%llu declined: "
+            "[AER_TN_GEMM] steps=%zu routed=%llu permuted=%llu "
+            "order_propagated=%llu declined: "
             "tiled=%llu "
             "strided=%llu layout=%llu corder=%llu korder=%llu sum=%llu "
             "plans_skipped=%llu\n",
             num_steps, (unsigned long long)gemm_steps_routed_,
             (unsigned long long)gemm_steps_permuted_,
+            (unsigned long long)gemm_steps_order_propagated_,
             (unsigned long long)gemm_steps_declined_tiled_,
             (unsigned long long)gemm_steps_declined_strided_,
             (unsigned long long)gemm_steps_declined_layout_,
