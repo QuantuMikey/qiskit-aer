@@ -406,6 +406,29 @@ void dump_device_tensor(const char *label, void *dev_ptr, int64_t num_elements,
 // not derivable from the projected element count. Prints leading elements of
 // each plane; for strided views these are the parent's leading elements — a
 // debug aid for pointer placement, not a strided gather.
+// aer-0116: interleaved-slot variant. A slot aer-0114 stores interleaved has
+// no imaginary plane -- dump_device_planes would read `im` from
+// base + plane_bytes(N), INSIDE the interleaved payload, and print live data
+// as an imag plane. This reads adjacent (re, im) pairs from the one buffer.
+// The per-step dump branches on the slot's il flag to pick between the two.
+template <typename data_t>
+void dump_device_interleaved(const char *label, const data_t *iv,
+                             int64_t num_elements, int max_print = 8) {
+  if (!tn_debug()) return;
+  int n_print = (int)std::min<int64_t>(num_elements, max_print);
+  std::vector<data_t> host(static_cast<size_t>(2) * n_print);
+  hipMemcpy(host.data(), iv, static_cast<size_t>(2) * n_print * sizeof(data_t),
+            hipMemcpyDeviceToHost);
+  fprintf(stderr, "[AER_TN_DEBUG] %s [%ld elements, interleaved]:", label,
+          (long)num_elements);
+  for (int i = 0; i < n_print; i++) {
+    fprintf(stderr, " (%.3f,%.3fi)", static_cast<double>(host[2 * i]),
+            static_cast<double>(host[2 * i + 1]));
+  }
+  if (num_elements > max_print) fprintf(stderr, " ...");
+  fprintf(stderr, "\n");
+}
+
 template <typename data_t>
 void dump_device_planes(const char *label, const data_t *re, const data_t *im,
                         int64_t num_elements, int max_print = 8) {
@@ -754,6 +777,95 @@ static void deinterleave_scatter(hipStream_t stream, const data_t *src,
   thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
 }
 
+// aer-0114: interleaved-SOURCE twin of interleave_pack. Reads an interleaved
+// complex source through (extents, strides) and writes interleaved. The index
+// math and the stride VALUES are identical to interleave_pack's: a split plane
+// stores complex element j at re[j]/im[j] and an interleaved buffer stores it
+// at src[2j]/src[2j+1], so the per-element offset `off` is the same complex
+// index either way. Used when a consumed operand is an interleaved
+// intermediate, replacing interleave_pack with no split round-trip. For an
+// identity read (str={1}) this is a straight interleaved copy; for a permuted
+// read it fuses the permute exactly as interleave_pack did.
+template <typename data_t> struct interleave_repack_func_hip {
+  const data_t *src; // interleaved complex source
+  data_t *dst;       // interleaved complex scratch
+  int rank;
+  int64_t ext[kStageMaxRank];
+  int64_t str[kStageMaxRank];
+  __host__ __device__ void operator()(const uint_t &i) const {
+    uint_t rem = i;
+    int64_t off = 0;
+    for (int k = 0; k < rank; ++k) {
+      uint_t e = static_cast<uint_t>(ext[k]);
+      off += static_cast<int64_t>(rem % e) * str[k];
+      rem /= e;
+    }
+    dst[2 * i] = src[2 * off];
+    dst[2 * i + 1] = src[2 * off + 1];
+  }
+};
+
+template <typename data_t>
+static void interleave_repack(hipStream_t stream, const data_t *src,
+                              data_t *dst, const std::vector<int64_t> &extents,
+                              const std::vector<int64_t> &strides) {
+  const uint64_t n = stage_block_elems(extents);
+  interleave_repack_func_hip<data_t> f;
+  const int rank = static_cast<int>(extents.size());
+  f.rank = rank < kStageMaxRank ? rank : kStageMaxRank;
+  for (int k = 0; k < f.rank; ++k) {
+    f.ext[k] = extents[k];
+    f.str[k] = strides[k];
+  }
+  f.src = src;
+  f.dst = dst;
+  auto ci = thrust::counting_iterator<uint_t>(0);
+  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+}
+
+// aer-0114: interleaved-DESTINATION twin of deinterleave_scatter. Places an
+// interleaved GEMM result into an interleaved slot through the SAME corder
+// (extents, strides) deinterleave_scatter used for the split slot, so the
+// declared-order scatter is preserved but the split conversion is dropped.
+// Used for a non-final corder step whose consumer is the complex GEMM.
+template <typename data_t> struct interleaved_scatter_func_hip {
+  const data_t *src; // interleaved complex source
+  data_t *dst;       // interleaved complex slot
+  int rank;
+  int64_t ext[kStageMaxRank];
+  int64_t str[kStageMaxRank];
+  __host__ __device__ void operator()(const uint_t &i) const {
+    uint_t rem = i;
+    int64_t off = 0;
+    for (int k = 0; k < rank; ++k) {
+      uint_t e = static_cast<uint_t>(ext[k]);
+      off += static_cast<int64_t>(rem % e) * str[k];
+      rem /= e;
+    }
+    dst[2 * off] = src[2 * i];
+    dst[2 * off + 1] = src[2 * i + 1];
+  }
+};
+
+template <typename data_t>
+static void interleaved_scatter(hipStream_t stream, const data_t *src,
+                                data_t *dst,
+                                const std::vector<int64_t> &extents,
+                                const std::vector<int64_t> &strides) {
+  const uint64_t n = stage_block_elems(extents);
+  interleaved_scatter_func_hip<data_t> f;
+  const int rank = static_cast<int>(extents.size());
+  f.rank = rank < kStageMaxRank ? rank : kStageMaxRank;
+  for (int k = 0; k < f.rank; ++k) {
+    f.ext[k] = extents[k];
+    f.str[k] = strides[k];
+  }
+  f.src = src;
+  f.dst = dst;
+  auto ci = thrust::counting_iterator<uint_t>(0);
+  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+}
+
 // Pack a strided parent operand (both split-complex planes) into packed
 // scratch, on the given stream. src planes are already base-shifted to the tile
 // origin; parent_strides index the parent's packed layout.
@@ -975,6 +1087,13 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // Sizes the pack-elimination work (order propagation): pack_ms / gemm_ms is
   // the movement fraction of routed enqueue. Host enqueue only, like its
   // parent -- NOT execution time.
+  // aer-0116: aer-0114/0115 remove pack kernels from the window itself -- a
+  // direct-read step (interleaved operand, identity order) enqueues NO pack,
+  // and an interleaved store replaces a split scatter with a memcpy. The
+  // partition identity (pack + gemm_only == whole) still holds, but t_pack_ms
+  // now covers a DIFFERENT population of steps than pre-0114, so it is not
+  // comparable across that boundary. Gate item 6 on t_gemm_only_ms against
+  // t_contract_ms (execution), never against t_gemm_ms.
   double prof_pack_ms_ = 0.0;
   double prof_gemm_only_ms_ = 0.0;
   uint64_t prof_gemm_calls_ = 0;
@@ -989,6 +1108,19 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   struct PlanePtrs {
     data_t *re;
     data_t *im;
+    // true when this slot holds ONE interleaved complex buffer (re/imag
+    // adjacent) at `re`, with `im` null, rather than two split planes. An
+    // intermediate whose consumer is the native-complex GEMM is stored this
+    // way so the producer's deinterleave-to-split and the consumer's
+    // interleave-from-split cancel: the round-trip disappears. Leaves
+    // (slice-projected inputs) and the final output stay split.
+    //
+    // Deliberately NOT a default member initializer: an NSDMI would make this
+    // struct a non-aggregate under C++11, breaking the brace initialisation at
+    // both construction sites. Every site below passes all three members
+    // explicitly, so no initializer is needed and the struct stays an
+    // aggregate under every standard.
+    bool il;
   };
 
   // Column-major strides of each input tensor's REMAINING (unsliced) modes
@@ -1043,6 +1175,19 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
     // declared order of a 3-mode output exhaustively.
     bool gemm_scatter_c = false;
     std::vector<int64_t> scat_ext, scat_str;
+
+    // aer-0114 (§6 note): the complex dispatch used to build four small
+    // std::vectors PER DISPATCH -- id_ext/id_str for a classic-accept operand
+    // read and lin_ext/lin_str for the non-scatter result store. At ~194,500
+    // dispatches per rank that is roughly 390,000-450,000 malloc/free pairs,
+    // about 20-40 ms against 155,555 ms: far too small to confirm as its own
+    // patch, which is why the checkpoint folds it in here rather than giving it
+    // one. Both are per-step invariant -- lin_ext derives from
+    // gemm_m * gemm_n, id_ext/id_str from extents_a/extents_b -- so they are
+    // computed once at classification and simply referenced at dispatch.
+    std::vector<int64_t> lin_ext, lin_str;
+    std::vector<int64_t> id_ext_a, id_str_a;
+    std::vector<int64_t> id_ext_b, id_str_b;
 
     // WS-3 mode tiling. Empty `tiles` => in-envelope step, executed exactly as
     // before via the descriptor above (zero behavior change). Non-empty =>
@@ -2341,6 +2486,35 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     } else {
       all_specs_[result_idx].modes = modes_c;
       all_specs_[result_idx].extents = extents_c;
+    }
+
+    // aer-0114 (§6 note): hoist the per-dispatch identity/linear vectors. They
+    // depend only on this step's descriptor shapes and its C element count,
+    // both fixed here, so the dispatch path reads them instead of rebuilding
+    // them on every slice.
+    {
+      PlanSpec &hp = step_plan_specs_[step];
+      const int64_t c_nat_step = all_specs_[result_idx].num_elements();
+      hp.lin_ext.assign(1, c_nat_step);
+      hp.lin_str.assign(1, 1);
+      hp.id_ext_a = extents_a;
+      hp.id_str_a.assign(extents_a.size(), 0);
+      {
+        int64_t acc = 1;
+        for (size_t q = 0; q < extents_a.size(); q++) {
+          hp.id_str_a[q] = acc;
+          acc *= (extents_a[q] > 0 ? extents_a[q] : 1);
+        }
+      }
+      hp.id_ext_b = extents_b;
+      hp.id_str_b.assign(extents_b.size(), 0);
+      {
+        int64_t acc = 1;
+        for (size_t q = 0; q < extents_b.size(); q++) {
+          hp.id_str_b[q] = acc;
+          acc *= (extents_b[q] > 0 ? extents_b[q] : 1);
+        }
+      }
     }
 
     // Record the exact per-plan descriptor shape for contract_single_slice.
@@ -3805,7 +3979,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
   // intermediates are packed pool slots whose imag plane is at
   // plane_bytes(N) from the slot base.
   std::vector<PlanePtrs> all_planes(num_inputs + num_steps,
-                                    PlanePtrs{nullptr, nullptr});
+                                    PlanePtrs{nullptr, nullptr, false});
   project_slice(slice_index, device_idx, all_planes);
 
   if (tn_debug()) {
@@ -3958,54 +4132,112 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         if (zbuf.size() < 6 * pe)
           zbuf.resize(6 * pe);
         data_t *zbase = thrust::raw_pointer_cast(zbuf.data());
-        std::vector<int64_t> id_ext, id_str;
-        auto pick = [&](const std::vector<int64_t> &pext,
-                        const std::vector<int64_t> &pstr,
-                        const std::vector<int64_t> &full_ext)
+        // aer-0114 (§6 note): no allocation here any more. A permuted operand
+        // uses the plan's perm vectors; an identity read uses the identity
+        // vectors hoisted onto PlanSpec at classification. Same values, built
+        // once per step instead of once per dispatch.
+        auto pick = [](const std::vector<int64_t> &pext,
+                       const std::vector<int64_t> &pstr,
+                       const std::vector<int64_t> &idext,
+                       const std::vector<int64_t> &idstr)
             -> std::pair<const std::vector<int64_t> *,
                          const std::vector<int64_t> *> {
           if (!pext.empty())
             return {&pext, &pstr};
-          id_ext = full_ext;
-          id_str.assign(full_ext.size(), 0);
-          int64_t acc = 1;
-          for (size_t q = 0; q < full_ext.size(); q++) {
-            id_str[q] = acc;
-            acc *= (full_ext[q] > 0 ? full_ext[q] : 1);
-          }
-          return {&id_ext, &id_str};
+          return {&idext, &idstr};
         };
-        {
-          auto pr = pick(ps.perm_ext_a, ps.perm_str_a, ps.extents_a);
-          interleave_pack<data_t>(dev.stream(), all_planes[left].re,
-                                  all_planes[left].im, zbase + 0 * pe,
-                                  *pr.first, *pr.second);
+        const data_t *a_in = zbase + 0 * pe;
+        const data_t *b_in = zbase + 2 * pe;
+        // aer-0115: an interleaved intermediate read in identity order already
+        // sits in the exact layout the GEMM wants, so point the GEMM at the
+        // slot and skip the pack entirely -- this removes the SECOND of the two
+        // round-trip passes (aer-0114 removed the first). A permuted read still
+        // needs interleave_repack to reorder; a split leaf still needs
+        // interleave_pack. Reading the slot in place is bit-identical to
+        // repacking it with identity strides and reading that copy, and the
+        // GEMM's A/B inputs are read-only so no pool aliasing is introduced.
+        if (all_planes[left].il && ps.perm_ext_a.empty()) {
+          a_in = all_planes[left].re;
+        } else {
+          auto pr = pick(ps.perm_ext_a, ps.perm_str_a, ps.id_ext_a, ps.id_str_a);
+          if (all_planes[left].il)
+            interleave_repack<data_t>(dev.stream(), all_planes[left].re,
+                                      zbase + 0 * pe, *pr.first, *pr.second);
+          else
+            interleave_pack<data_t>(dev.stream(), all_planes[left].re,
+                                    all_planes[left].im, zbase + 0 * pe,
+                                    *pr.first, *pr.second);
         }
-        {
-          auto pr = pick(ps.perm_ext_b, ps.perm_str_b, ps.extents_b);
-          interleave_pack<data_t>(dev.stream(), all_planes[right].re,
-                                  all_planes[right].im, zbase + 2 * pe,
-                                  *pr.first, *pr.second);
+        if (all_planes[right].il && ps.perm_ext_b.empty()) {
+          b_in = all_planes[right].re;
+        } else {
+          auto pr = pick(ps.perm_ext_b, ps.perm_str_b, ps.id_ext_b, ps.id_str_b);
+          if (all_planes[right].il)
+            interleave_repack<data_t>(dev.stream(), all_planes[right].re,
+                                      zbase + 2 * pe, *pr.first, *pr.second);
+          else
+            interleave_pack<data_t>(dev.stream(), all_planes[right].re,
+                                    all_planes[right].im, zbase + 2 * pe,
+                                    *pr.first, *pr.second);
         }
         if (tn_profile()) prof_g1 = std::chrono::steady_clock::now();
         dev.execute_contraction_gemm_complex(
             ps.gemm_m, ps.gemm_n, ps.gemm_k, ps.gemm_a_trans,
-            ps.gemm_b_trans, step, zbase + 0 * pe, zbase + 2 * pe,
+            ps.gemm_b_trans, step, a_in, b_in,
             zbase + 4 * pe, false);
         if (tn_profile()) prof_g2 = std::chrono::steady_clock::now();
         const int64_t c_nat = ps.gemm_m * ps.gemm_n;
+        // aer-0114: the final output slot is read as split planes by the
+        // reduction (accumulate_planar_to_output), so it MUST stay split.
+        // Every earlier intermediate can be stored interleaved because under
+        // tn_gemm_complex() its only readers are other complex-arm steps, and
+        // each read branches on the slot's il flag -- correct whether the slot
+        // has one consumer or several. (aer-0116: last_used computes liveness
+        // by overwriting, so it TOLERATES multiple consumers; single
+        // consumption is the tree-plan norm, not something this path requires.)
+        // The layout change reorders the same complex values, so ZZ stays
+        // bit-identical.
+        const bool il_store = (result_idx != num_inputs + num_steps - 1);
         if (ps.gemm_scatter_c) {
-          deinterleave_scatter<data_t>(dev.stream(), zbase + 4 * pe,
-                                       all_planes[result_idx].re,
-                                       all_planes[result_idx].im,
-                                       ps.scat_ext, ps.scat_str);
+          if (il_store) {
+            interleaved_scatter<data_t>(dev.stream(), zbase + 4 * pe,
+                                        all_planes[result_idx].re,
+                                        ps.scat_ext, ps.scat_str);
+          } else {
+            deinterleave_scatter<data_t>(dev.stream(), zbase + 4 * pe,
+                                         all_planes[result_idx].re,
+                                         all_planes[result_idx].im,
+                                         ps.scat_ext, ps.scat_str);
+          }
+        } else if (il_store) {
+          // Non-corder: the GEMM result is already in declared (C) order, so
+          // the interleaved slot is a straight copy of the interleaved result
+          // -- one coalesced device-to-device transfer in place of the strided
+          // split scatter. aer-0116: classification enforces
+          // gemm_m*gemm_n == num_elements on both accept branches
+          // (c_elems_expected), so 2*c_nat data_t is the whole logical buffer
+          // -- there is no pad tail, and MNK padding adds only extent-1 dummies
+          // that do not change the element count.
+          check_hip(hipMemcpyAsync(all_planes[result_idx].re, zbase + 4 * pe,
+                                   static_cast<size_t>(2 * c_nat) *
+                                       sizeof(data_t),
+                                   hipMemcpyDeviceToDevice, dev.stream()),
+                    "hipMemcpyAsync(C interleaved store)", dev.device_id());
         } else {
-          const std::vector<int64_t> lin_ext(1, c_nat);
-          const std::vector<int64_t> lin_str(1, 1);
+          // aer-0114 (§6 note): ps.lin_ext/lin_str are {c_nat} and {1}, computed
+          // once per step at classification instead of allocated per dispatch.
           deinterleave_scatter<data_t>(dev.stream(), zbase + 4 * pe,
                                        all_planes[result_idx].re,
                                        all_planes[result_idx].im,
-                                       lin_ext, lin_str);
+                                       ps.lin_ext, ps.lin_str);
+        }
+        if (il_store) {
+          all_planes[result_idx].il = true;
+          // aer-0116: an interleaved slot has no imaginary plane -- the split
+          // .im offset (base + plane_bytes) lands INSIDE the interleaved
+          // payload. Null it so any reader that forgets to branch on il faults
+          // immediately instead of silently consuming live data as a plane.
+          all_planes[result_idx].im = nullptr;
         }
       } else {
       if (tn_profile()) prof_g1 = std::chrono::steady_clock::now();
@@ -4061,9 +4293,16 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
       hipStreamSynchronize(dev.stream());
       char label[64];
       snprintf(label, sizeof(label), "  after step %zu (T%zu)", step, result_idx);
-      dump_device_planes<data_t>(label, all_planes[result_idx].re,
-                                 all_planes[result_idx].im,
-                                 all_specs_[result_idx].num_elements(), 32);
+      // aer-0116: an interleaved slot (aer-0114) has no separate imag plane,
+      // and its .im was nulled below, so it must be dumped as interleaved.
+      if (all_planes[result_idx].il)
+        dump_device_interleaved<data_t>(label, all_planes[result_idx].re,
+                                        all_specs_[result_idx].num_elements(),
+                                        32);
+      else
+        dump_device_planes<data_t>(label, all_planes[result_idx].re,
+                                   all_planes[result_idx].im,
+                                   all_specs_[result_idx].num_elements(), 32);
     }
   }
 
@@ -4130,7 +4369,7 @@ void TensorNetContractor_HipTensor<data_t>::project_slice(
   // Fill the input prefix; intermediates (slots after num_inputs) belong to
   // the caller. Grow if needed, never shrink.
   if (projected.size() < num_inputs)
-    projected.resize(num_inputs, PlanePtrs{nullptr, nullptr});
+    projected.resize(num_inputs, PlanePtrs{nullptr, nullptr, false});
 
   // Inputs are replicated per device as a slab copy: rebase each primary
   // pointer onto this device's slab before applying slice offsets.
