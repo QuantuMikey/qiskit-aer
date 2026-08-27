@@ -1052,6 +1052,9 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   uint64_t gemm_steps_permuted_ = 0;
   // aer-0116: intermediates redeclared into their consumer's wanted order.
   uint64_t gemm_steps_order_propagated_ = 0;
+  // aer-0118: steps taking the GEMM with UNPERMUTED operands plus a corder
+  // scatter of the result -- the route order propagation depends on.
+  uint64_t gemm_steps_scatter_only_ = 0;
   // aer-0046: plans NOT built in the setup prebuild because the route will take
   // the step. This is the count that should track the setup saving.
   uint64_t gemm_plans_skipped_ = 0;
@@ -2298,6 +2301,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   gemm_steps_declined_korder_ = 0;
   gemm_steps_permuted_ = 0;
   gemm_steps_order_propagated_ = 0;
+  gemm_steps_scatter_only_ = 0;
   gemm_plans_skipped_ = 0;
   gemm_perm_scratch_elems_ = 0;
   GPUDevice<data_t> &dev = gpu_mgr_.device(device_idx);
@@ -2831,8 +2835,27 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         // The classic (no-copy) accept now states what the early declines
         // used to imply: packed operands, untiled. A tiled or strided step
         // reaching this point can only be rescued below.
+        //
+        // aer-0118: c_ok is NOT required here. It was, and that silently
+        // defeated aer-0116: order propagation deliberately rewrites modes_c
+        // into the consumer's order, which makes have_c != want_c and so
+        // c_ok false. The step then fell through to the rescue branch, which
+        // sets gemm_perm_a = gemm_perm_b = true UNCONDITIONALLY -- adding two
+        // operand packs at the producer to remove two at the consumer. Net
+        // zero at best, and it gave up bit-identity for nothing.
+        //
+        // Operand layout and C order are independent facts: a_ok/b_ok/k_ok say
+        // the operands need no permutation, c_ok says the GEMM's natural
+        // [M][N] result already matches the declared slot. When the operands
+        // are clean but C is not, the correct route is the GEMM with
+        // UNPERMUTED operands plus a corder scatter of the result -- exactly
+        // the combination the execution path already supports (the staging
+        // block tests gemm_perm_a, gemm_perm_b and gemm_scatter_c separately,
+        // and the complex arm's pick() returns identity extents when
+        // perm_ext_a is empty). Classification simply never emitted it.
+        const bool scatter_only = !c_ok;
         if (strides_a.empty() && strides_b.empty() &&
-            a_ok && b_ok && c_ok && k_ok && ka_ext == kb_ext &&
+            a_ok && b_ok && k_ok && ka_ext == kb_ext &&
             m_ext * n_ext == c_elems_expected) {
           step_plan_specs_[step].gemm_ok = true;
           // A is (M x K) when its order is [free][contracted] -- OP_N, lda = M
@@ -2863,6 +2886,40 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                 static_cast<uint64_t>(c_elems_expected));
           }
           gemm_steps_routed_++;
+          // aer-0118: operands are clean but C is not in [M][N] order (order
+          // propagation put it in the consumer's order). Scatter the natural
+          // GEMM result into the declared slot. This is the SAME CLAIM C
+          // mapping the rescue branch uses -- declared column-major strides
+          // reordered into the natural want_c sequence -- built here without
+          // touching the operands.
+          if (scatter_only) {
+            PlanSpec &pss = step_plan_specs_[step];
+            pss.gemm_scatter_c = true;
+            std::vector<int64_t> cstr(extents_c.size());
+            int64_t cacc = 1;
+            for (size_t i = 0; i < extents_c.size(); i++) {
+              cstr[i] = cacc;
+              cacc *= (extents_c[i] > 0 ? extents_c[i] : 1);
+            }
+            std::map<int32_t, size_t> pos_c;
+            for (size_t i = 0; i < modes_c.size(); i++)
+              if (extents_c[i] > 1)
+                pos_c[modes_c[i]] = i;
+            pss.scat_ext.clear();
+            pss.scat_str.clear();
+            for (size_t j = 0; j < want_c.size(); j++) {
+              const size_t ci = pos_c[want_c[j]];
+              pss.scat_ext.push_back(extents_c[ci]);
+              pss.scat_str.push_back(cstr[ci]);
+            }
+            // The GEMM result now lands in scratch before the scatter, so the
+            // C size joins the scratch maximum on the real path too, not only
+            // under the complex sub-path.
+            gemm_perm_scratch_elems_ = std::max<uint64_t>(
+                gemm_perm_scratch_elems_,
+                static_cast<uint64_t>(c_elems_expected));
+            gemm_steps_scatter_only_++;
+          }
         } else if (ka_ext == kb_ext &&
                    m_ext * n_ext == c_elems_expected &&
                    modes_a.size() <= static_cast<size_t>(kStageMaxRank) &&
@@ -3133,13 +3190,14 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   {
     fprintf(stderr,
             "[AER_TN_GEMM] steps=%zu routed=%llu permuted=%llu "
-            "order_propagated=%llu declined: "
+            "order_propagated=%llu scatter_only=%llu declined: "
             "tiled=%llu "
             "strided=%llu layout=%llu corder=%llu korder=%llu sum=%llu "
             "plans_skipped=%llu\n",
             num_steps, (unsigned long long)gemm_steps_routed_,
             (unsigned long long)gemm_steps_permuted_,
             (unsigned long long)gemm_steps_order_propagated_,
+            (unsigned long long)gemm_steps_scatter_only_,
             (unsigned long long)gemm_steps_declined_tiled_,
             (unsigned long long)gemm_steps_declined_strided_,
             (unsigned long long)gemm_steps_declined_layout_,
