@@ -4144,7 +4144,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
       // count over the device count, independent of how the split rounds.
       // The sync adds no work: these kernels must complete regardless.
       if (idev == 0 && s == dev_slice_begin) {
-        hipStreamSynchronize(gpu_mgr_.device(0).stream(stream_slot));
+        hipStreamSynchronize(gpu_mgr_.device(0).stream(slot));
         const double t1_s = tn_ms_since(gate_t0) / 1000.0;
         const uint64_t max_share =
             ((uint64_t)(slice_end_ - slice_begin_) +
