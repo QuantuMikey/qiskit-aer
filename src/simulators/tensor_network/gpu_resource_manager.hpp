@@ -293,10 +293,18 @@ static int tn_streams() {
 // that comparison can be made without a rebuild.
 static bool tn_order_prop() {
   static bool checked = false;
-  static bool cached = true;
+  static bool cached = false;
   if (!checked) {
     const char *v = std::getenv("AER_TN_ORDER_PROP");
-    cached = !(v != nullptr && v[0] == '0' && v[1] == '\0');
+    // DEFAULT OFF. This is the only knob in the contractor that changes
+    // results: it alters GEMM blocking and the k-loop order, so floating-point
+    // summation order changes and ZZ moves in the last bits (audited worst
+    // relative difference 5.2e-16 -- correct, but not bit-identical). Accuracy
+    // is never traded for speed implicitly, so it is opt-in: AER_TN_ORDER_PROP=1
+    // enables it, and the run that uses it is a deliberate choice accepted on a
+    // 1e-12 tolerance rather than on bit identity. Every other patch in this
+    // series is bit-preserving and needs no lever.
+    cached = (v != nullptr && v[0] == '1' && v[1] == '\0');
     checked = true;
   }
   return cached;
@@ -541,6 +549,19 @@ private:
 //=============================================================================
 // AccumulatePlanarFunctor
 //=============================================================================
+// aer-0118: adds one output slot's partial into slot 0. Explicit functor for
+// the same reason AccumulatePlanarFunctor is one.
+template <typename data_t> struct SlotReduceFunctor {
+  thrust::complex<data_t> *dst;
+  const thrust::complex<data_t> *src;
+  SlotReduceFunctor(thrust::complex<data_t> *d,
+                    const thrust::complex<data_t> *s)
+      : dst(d), src(s) {}
+  __host__ __device__ void operator()(const size_t &i) const {
+    dst[i] += src[i];
+  }
+};
+
 // Adds a split-complex tensor into an interleaved thrust::complex output
 // buffer. Used by GPUDevice::accumulate_planar_to_output. We use an
 // explicit functor rather than a device lambda to match the Aer build's
@@ -700,7 +721,6 @@ template <typename data_t> class GPUDevice {
   std::vector<hipblasHandle_t> extra_bl_handles_;
 #endif
   int slots_ = 1;          // number of live stream slots (1 == legacy)
-  size_t pool_stride_ = 0; // bytes between one slot's pool region and the next
   size_t out_stride_ = 0;  // elements between one slot's output region and next
 
   // aer-0028: when shared-plan-cache mode is on this points at the process-wide
@@ -1117,11 +1137,17 @@ public:
   void reduce_output_slots(size_t num_elements, int slots) {
     if (slots <= 1) return;
     hipSetDevice(device_id_);
+    // for_each_n with an explicit functor -- the idiom this file already
+    // establishes for AccumulatePlanarFunctor. thrust::transform and
+    // thrust::plus are NOT used: this translation unit carries no explicit
+    // thrust algorithm includes, so only the algorithms it already exercises
+    // are known available here.
     thrust::complex<data_t> *base = thrust::raw_pointer_cast(dev_out_.data());
     for (int s = 1; s < slots; s++) {
-      thrust::complex<data_t> *src = base + (size_t)s * num_elements;
-      thrust::transform(thrust_gpu::par.on(stream_), base, base + num_elements,
-                        src, base, thrust::plus<thrust::complex<data_t>>());
+      SlotReduceFunctor<data_t> fn(base, base + (size_t)s * num_elements);
+      thrust::for_each_n(thrust_gpu::par.on(stream_),
+                         thrust::counting_iterator<size_t>(0), num_elements,
+                         fn);
     }
     hipStreamSynchronize(stream_);
   }

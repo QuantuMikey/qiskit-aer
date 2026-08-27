@@ -2776,8 +2776,14 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
       // and the rank still reports a finite cost -- it never becomes a
       // no-plan rank) but stops paying for reconfiguration.
       //
-      // DEFAULT 16, and it is safe to leave on because the one case that could
-      // cost plan quality is detected and undone.
+      // DEFAULT 0 (OFF). The bound never costs plan QUALITY -- see the
+      // detect-and-undo below -- but it can change WHICH plan a forge banks,
+      // and a different contraction order changes floating-point summation
+      // order, so a forge run with the bound is not bit-reproducible against
+      // one without it. Anything that changes results is opt-in here, the same
+      // rule AER_TN_ORDER_PROP follows, so this is a lever and not a default.
+      // Set AER_TN_SLICE_RECONF_MAX_CUTS=16 on a forge to buy the wall-time
+      // saving described below as a deliberate choice.
       //
       // The bound never touches a rank needing at most MAX_CUTS cuts, and a
       // rank needing fewer cuts yields fewer slices and therefore lower
@@ -2799,7 +2805,7 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
       // 22 cuts and pulls the slowest arrival from 146.9 s to about 111 s --
       // roughly 68 s of the ~70 s collective wait. 0 disables the mechanism.
       uint64_t reconf_max_cuts =
-          TensorNetPathMem::env_u64("AER_TN_SLICE_RECONF_MAX_CUTS", 16);
+          TensorNetPathMem::env_u64("AER_TN_SLICE_RECONF_MAX_CUTS", 0);
       // aer-0119: the one-shot unbounded re-plan disables the bound outright,
       // so the retry is bit-for-bit the pre-0119 loop.
       if (slice_reconf_bound_forced_off())
