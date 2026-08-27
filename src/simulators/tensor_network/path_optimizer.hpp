@@ -106,6 +106,21 @@ inline int &stamp_rank() {
   static int r = 0;
   return r;
 }
+// aer-0119: set by the slice-envelope loop when it stopped reconfiguring
+// because AER_TN_SLICE_RECONF_MAX_CUTS was exceeded, and cleared at the top of
+// every envelope pass. The MPI wrapper reduces it to decide whether the bound
+// could have touched the WINNER; see slice_reconf_bound_forced_off().
+inline bool &slice_reconf_bound_hit() {
+  static bool hit = false;
+  return hit;
+}
+// aer-0119: set by the MPI wrapper for the one-shot unbounded re-plan taken
+// when EVERY rank hit the bound. While true the envelope loop ignores the
+// bound entirely, so the retry reproduces the unbounded behaviour exactly.
+inline bool &slice_reconf_bound_forced_off() {
+  static bool off = false;
+  return off;
+}
 // aer-0109: when the MPI wrapper sets the shared barrier origin, it locks it
 // so the inner serial find_path (called AFTER, on the same rank) does not
 // overwrite the shared origin with its own clock. A standalone 1-rank run
@@ -2738,6 +2753,60 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
           std::log2(static_cast<double>(target_elements));
       const uint64_t reconf_every =
           TensorNetPathMem::env_u64("AER_TN_SLICE_RECONF_EVERY", 4);
+      // aer-0119: bound the reconfiguration spend on a runaway candidate.
+      //
+      // Every rank runs this loop to completion before ANY of them reaches the
+      // winner-selection collective, so the whole job waits on the rank whose
+      // tree needs the most cuts. Job 21543086 (8 ranks, p=8) measured the
+      // per-rank envelope dt at 31.6 / 32.1 / 38.6 / 89.5 / 111.7 / 129.3 /
+      // 133.6 / 146.9 s against cut counts of 5 / 5 / 6 / 13 / 16 / 19 / 20 /
+      // 22 -- a smooth continuum at ~6.5 s per cut, not an outlier. Rank 0
+      // finished its own phases at t=111.3 and left the collective at
+      // t=180.2: ~70 s with eight GCDs idle, ~29% of that job's wall.
+      //
+      // With AER_TN_SLICE_RECONF_EVERY=1 (what the campaign runner sets) each
+      // cut pays one subtree_reconfigure_, so that cost IS the spread. The cut
+      // that matters: the winner is chosen by MINLOC(total_flops) and every
+      // additional sliced mode multiplies total_flops, so a candidate that has
+      // already taken far more cuts than the eventual winner CANNOT win. In
+      // 21543086 the winner took 5 cuts (32 slices) while the straggler took
+      // 22 (4,194,304 slices) -- reconfiguring that tree bought nothing.
+      //
+      // So past this many cuts the loop keeps SLICING (the plan stays valid
+      // and the rank still reports a finite cost -- it never becomes a
+      // no-plan rank) but stops paying for reconfiguration.
+      //
+      // DEFAULT 16, and it is safe to leave on because the one case that could
+      // cost plan quality is detected and undone.
+      //
+      // The bound never touches a rank needing at most MAX_CUTS cuts, and a
+      // rank needing fewer cuts yields fewer slices and therefore lower
+      // total_flops. So a bounded rank can only be the MINLOC winner when
+      // EVERY rank was bounded. The MPI wrapper reduces the per-rank flag with
+      // MPI_MIN and, in exactly that case, re-plans all ranks once with the
+      // bound disabled -- reproducing the unbounded search. Quality is
+      // therefore never worse than the unbounded ensemble; the price in that
+      // case is one extra envelope pass, paid only when the bound would
+      // otherwise have mattered.
+      //
+      // This is why a fixed ceiling is admissible here where aer-0094's was
+      // not: that one REFUSED a plan outright (it "twice blocked legitimate
+      // physics"), whereas this one only withholds optional refinement and
+      // self-reverses when it would bite. Slicing continues either way, so a
+      // valid plan is always produced and no rank becomes a no-plan rank.
+      //
+      // On 21543086's distribution a bound of 16 caps the ranks at 19, 20 and
+      // 22 cuts and pulls the slowest arrival from 146.9 s to about 111 s --
+      // roughly 68 s of the ~70 s collective wait. 0 disables the mechanism.
+      uint64_t reconf_max_cuts =
+          TensorNetPathMem::env_u64("AER_TN_SLICE_RECONF_MAX_CUTS", 16);
+      // aer-0119: the one-shot unbounded re-plan disables the bound outright,
+      // so the retry is bit-for-bit the pre-0119 loop.
+      if (slice_reconf_bound_forced_off())
+        reconf_max_cuts = 0;
+      slice_reconf_bound_hit() = false;
+      uint64_t cuts_taken = 0;
+      bool reconf_bound_hit = false;
       uint64_t since_reconf = 0;
       bool reconf_pending = false;
       for (int guard = 0; guard < 4096; ++guard) {
@@ -2765,7 +2834,24 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
         if (ix.is_none())
           break; // no summed bond left to slice: residual peak is output-bound
         tree.attr("remove_ind_")(ix);
-        if (reconf_every > 0) {
+        ++cuts_taken;
+        // aer-0119: past the bound, keep slicing but stop reconfiguring. Note
+        // reconf_pending is deliberately NOT set here, so the flush-and-
+        // re-check at the top of the loop cannot resurrect the cost either.
+        if (reconf_max_cuts > 0 && cuts_taken > reconf_max_cuts) {
+          if (!reconf_bound_hit) {
+            reconf_bound_hit = true;
+            slice_reconf_bound_hit() = true;
+            if (path_verbose())
+              fprintf(stderr,
+                      "[AER_TN_PATH] slice reconfiguration bound reached after "
+                      "%llu cuts on rank %d; continuing to slice without "
+                      "reconfiguration (this candidate is already far past the "
+                      "competitive cut count and cannot win the MINLOC). "
+                      "AER_TN_SLICE_RECONF_MAX_CUTS=0 disables the bound.\n",
+                      (unsigned long long)cuts_taken, stamp_rank());
+          }
+        } else if (reconf_every > 0) {
           reconf_pending = true;
           if (++since_reconf >= reconf_every) {
             since_reconf = 0;
@@ -3468,6 +3554,68 @@ public:
     // Tiling stays a MAX-collective decision: if ANY rank needs tiling,
     // EVERY rank throws together and the driver's one-shot retry re-plans
     // all ranks -- searchless ranks included -- with tiling engaged.
+    // aer-0119: decide, collectively, whether the reconfiguration bound could
+    // have degraded the WINNER -- and if so, undo it.
+    //
+    // The bound never touches a rank that needed at most MAX_CUTS cuts, and a
+    // rank needing fewer cuts produces fewer slices and therefore lower
+    // total_flops. So if even ONE rank finished unbounded, the MINLOC winner's
+    // cost is at most that rank's full-quality cost and the ensemble has lost
+    // nothing. The winner can only be degraded when EVERY rank hit the bound.
+    //
+    // That is exactly MIN over the per-rank flags. It rides the same region as
+    // the tiling reduction, which every rank already reaches under the
+    // fail-together contract, and the decision is taken from a reduced value
+    // that is identical on every rank -- the aer-0102 pattern -- so no rank can
+    // branch differently and strand a sibling in a collective.
+    //
+    // When it fires, all ranks re-plan once with the bound forced off, which
+    // reproduces the pre-0119 search exactly. The cost is one extra envelope
+    // pass in precisely the case where the bound would otherwise have cost
+    // plan quality; the common case pays one int.
+    {
+      int local_bounded = slice_reconf_bound_hit() ? 1 : 0;
+      if (!local_ok)
+        local_bounded = 1; // a rank with no plan must not veto the retry
+      int all_bounded = 0;
+      MPI_Allreduce(&local_bounded, &all_bounded, 1, MPI_INT, MPI_MIN, comm_);
+      if (all_bounded == 1 && !slice_reconf_bound_forced_off()) {
+        if (path_verbose() && rank == 0)
+          fprintf(stderr,
+                  "[AER_TN_PATH] every rank hit the slice reconfiguration "
+                  "bound, so the winner would have been degraded; re-planning "
+                  "all ranks once with the bound disabled (this reproduces the "
+                  "unbounded search exactly)\n");
+        slice_reconf_bound_forced_off() = true;
+        ContractionPlan retry;
+        int retry_status = 0;
+        bool retry_ok = true;
+        std::string retry_msg;
+        try {
+          retry = inner_->find_path(network, memory_limit_bytes, seed + rank,
+                                    tiling_available);
+        } catch (const NeedsTilingException &) {
+          retry_status = 1;
+        } catch (const std::exception &e) {
+          retry_ok = false;
+          retry_msg = e.what();
+        } catch (...) {
+          retry_ok = false;
+          retry_msg = "[AER_TN] unbounded re-plan raised an unknown exception.";
+        }
+        slice_reconf_bound_forced_off() = false;
+        local = retry;
+        local_status = retry_status;
+        local_ok = retry_ok;
+        local_msg = retry_msg;
+        if (!local_ok)
+          fprintf(stderr,
+                  "[AER_TN_PATH] rank %d: unbounded re-plan produced no plan; "
+                  "this rank will adopt the winning rank's plan. Cause: %s\n",
+                  rank, local_msg.c_str());
+      }
+    }
+
     int global_status = 0;
     MPI_Allreduce(&local_status, &global_status, 1, MPI_INT, MPI_MAX, comm_);
     if (global_status == 1) {
