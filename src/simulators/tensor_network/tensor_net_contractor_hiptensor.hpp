@@ -2478,26 +2478,38 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   //    below with the same gemm_operand_layout predicate the classifier uses.
   //
   // The final step is excluded: its C order must stay modes_out_.
-  std::vector<int> consumer_count(num_total, 0);
-  std::vector<int> consumer_step(num_total, -1);
-  std::vector<int> consumer_role(num_total, -1); // 0 = A (left), 1 = B (right)
-  for (size_t step = 0; step < num_steps; step++) {
-    const uint64_t l = plan_.steps[step].left;
-    const uint64_t r = plan_.steps[step].right;
-    consumer_count[l]++;
-    if (consumer_count[l] == 1) {
-      consumer_step[l] = static_cast<int>(step);
-      consumer_role[l] = 0;
+  // aer-0122: this pre-pass exists ONLY for order propagation, so it is built
+  // only when order propagation is enabled. It previously ran unconditionally,
+  // allocating and filling five vectors of num_total entries on every
+  // contraction even with AER_TN_ORDER_PROP off -- an always-on cost for a
+  // feature that is off by default. The reorder site below tests
+  // tn_order_prop() FIRST, so short-circuit evaluation guarantees these are
+  // never indexed while empty.
+  std::vector<int> consumer_count, consumer_step, consumer_role;
+  std::vector<std::vector<int32_t>> want_order;
+  std::vector<std::vector<int64_t>> want_extent;
+  if (tn_order_prop()) {
+    consumer_count.assign(num_total, 0);
+    consumer_step.assign(num_total, -1);
+    consumer_role.assign(num_total, -1); // 0 = A (left), 1 = B (right)
+    for (size_t step = 0; step < num_steps; step++) {
+      const uint64_t l = plan_.steps[step].left;
+      const uint64_t r = plan_.steps[step].right;
+      consumer_count[l]++;
+      if (consumer_count[l] == 1) {
+        consumer_step[l] = static_cast<int>(step);
+        consumer_role[l] = 0;
+      }
+      consumer_count[r]++;
+      if (consumer_count[r] == 1) {
+        consumer_step[r] = static_cast<int>(step);
+        consumer_role[r] = 1;
+      }
     }
-    consumer_count[r]++;
-    if (consumer_count[r] == 1) {
-      consumer_step[r] = static_cast<int>(step);
-      consumer_role[r] = 1;
-    }
+    // Desired declared order per intermediate, empty when no reorder applies.
+    want_order.resize(num_total);
+    want_extent.resize(num_total);
   }
-  // Desired declared order per intermediate, empty when no reorder applies.
-  std::vector<std::vector<int32_t>> want_order(num_total);
-  std::vector<std::vector<int64_t>> want_extent(num_total);
 
   for (size_t step = 0; step < num_steps; step++) {
     uint64_t left = plan_.steps[step].left;
@@ -2612,8 +2624,13 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
       // The producer's scatter (gemm_scatter_c) then writes straight into that
       // layout and the consumer permutes nothing.
       bool reordered = false;
-      const int cs = consumer_step[result_idx];
-      if (tn_order_prop() && consumer_count[result_idx] == 1 && cs >= 0 &&
+      // aer-0122: nothing may be READ from the pre-pass vectors before
+      // tn_order_prop() has been tested -- they are empty when the lever is
+      // off. The consumer_step load therefore lives inside the guard, not
+      // above it. (An earlier revision hoisted it, and the sanitised
+      // end-to-end run segfaulted on the empty vector.)
+      const int cs = tn_order_prop() ? consumer_step[result_idx] : -1;
+      if (tn_order_prop() && cs >= 0 && consumer_count[result_idx] == 1 &&
           static_cast<size_t>(cs) != num_steps - 1 &&
           modes_c.size() <= static_cast<size_t>(kStageMaxRank)) {
         // The other operand at the consuming step, as it will be seen there.
