@@ -253,6 +253,36 @@ static bool tn_gemm_complex() {
   return cached;
 }
 
+// aer-0117: AER_TN_STREAMS sets the number of concurrent slice streams per
+// device (checkpoint §6 item 5). DEFAULT 1, which is exactly today's behaviour:
+// one stream, a strictly sequential slice loop, byte-identical output.
+//
+// Values above 1 are NOT yet safe and the contractor refuses them loudly. The
+// checkpoint identified gemm_perm_scratch_ (keyed by device id) as the
+// prerequisite, but a source trace found a larger one: the intermediate pool
+// is also per-device (MemoryPool pool_), and every step writes
+// pool().get_tensor_ptr(result_idx), so two slices in flight on two streams
+// would write the SAME intermediate slots. Overlap therefore needs per-stream
+// pools as well as per-stream scratch -- N times the intermediate memory,
+// which is in direct opposition to what slicing exists to achieve. That cost
+// is the reason this is a knob with a refusal rather than an enabled path: the
+// decision needs the memory headroom measured on the target allocation, not an
+// assumption. The surviving rationale (overlapping pack against pack) is also
+// much weaker after aer-0116, which removes the packs on the majority of steps.
+static int tn_streams() {
+  static bool checked = false;
+  static int cached = 1;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_STREAMS");
+    if (v != nullptr) {
+      const int n = std::atoi(v);
+      cached = (n > 0) ? n : 1;
+    }
+    checked = true;
+  }
+  return cached;
+}
+
 // aer-0116: AER_TN_ORDER_PROP=0 disables order propagation (checkpoint §6 item
 // 3b): declaring a single-consumer intermediate in the layout its consumer
 // wants, so the consumer's operand permute disappears. Default ON. Unlike the
@@ -421,19 +451,23 @@ public:
     return cached;
   }
 
-  void allocate(int device_id) {
+  // aer-0118: `slots` copies of the layout are allocated back to back. slots=1
+  // is exactly the pre-0119 allocation.
+  void allocate(int device_id, int slots = 1) {
     device_id_ = device_id;
     if (pool_size_ == 0) return;
+    if (slots < 1) slots = 1;
+    const size_t need = pool_size_ * (size_t)slots;
     if (allocated_ && pool_ptr_ != nullptr && arena_enabled() &&
-        pool_size_ <= capacity_)
+        need <= capacity_)
       return;
     hipSetDevice(device_id_);
     if (allocated_ && pool_ptr_ != nullptr) {
       hipFree(pool_ptr_);
       pool_ptr_ = nullptr;
     }
-    check_hip(hipMalloc(&pool_ptr_, pool_size_), "hipMalloc(pool)", device_id_);
-    capacity_ = pool_size_;
+    check_hip(hipMalloc(&pool_ptr_, need), "hipMalloc(pool)", device_id_);
+    capacity_ = need;
     epoch_++;
     allocated_ = true;
   }
@@ -442,6 +476,19 @@ public:
   // (captured graphs) compare this before trusting them.
   uint64_t epoch() const { return epoch_; }
 
+  // aer-0118: slot-aware. Each stream slot gets its own contiguous copy of the
+  // whole intermediate layout, so two slices in flight never write the same
+  // slot. Slot 0 is offset 0, which is byte-identical to the pre-0119 pointer.
+  size_t slot_stride() const { return pool_size_; }
+  void *get_tensor_ptr(int tensor_index, int slot) const {
+    for (size_t i = 0; i < allocations_.size(); i++)
+      if (allocations_[i].tensor_index == tensor_index)
+        return static_cast<char *>(pool_ptr_) +
+               (size_t)slot * pool_size_ + allocations_[i].offset;
+    std::stringstream ss;
+    ss << "MemoryPool: tensor index " << tensor_index << " not found";
+    throw std::runtime_error(ss.str());
+  }
   void *get_tensor_ptr(int tensor_index) const {
     for (size_t i = 0; i < allocations_.size(); i++)
       if (allocations_[i].tensor_index == tensor_index)
@@ -636,13 +683,25 @@ template <typename data_t> class GPUDevice {
   size_t free_memory_;
   hipStream_t stream_;
   bool handle_valid_;
+  // aer-0118: extra stream slots for multi-stream slice overlap. Slot 0 is
+  // stream_ itself, so a single-slot configuration is byte-identical to the
+  // pre-0119 device. Slots 1..N-1 live here and are created on demand by
+  // ensure_slots(); each carries its OWN hipBLAS handle, because a handle is
+  // bound to one stream (hipblasSetStream) and owns a rocBLAS workspace --
+  // sharing one across concurrent slices would serialise the GEMMs on that
+  // handle's stream at best, and race on handle state at worst.
+  std::vector<hipStream_t> extra_streams_;
 #ifdef AER_HIPBLAS
   // aer-0040: the device's GEMM handle, destroyed in release() alongside
   // the stream. Never shared across contractors: a hipBLAS handle owns no
   // plans, so there is nothing to keep alive.
   hipblasHandle_t bl_handle_;
   bool bl_handle_valid_;
+  std::vector<hipblasHandle_t> extra_bl_handles_;
 #endif
+  int slots_ = 1;          // number of live stream slots (1 == legacy)
+  size_t pool_stride_ = 0; // bytes between one slot's pool region and the next
+  size_t out_stride_ = 0;  // elements between one slot's output region and next
 
   // aer-0028: when shared-plan-cache mode is on this points at the process-wide
   // slot for this device and plan_cache_ above goes unused. The pool, the
@@ -1027,6 +1086,46 @@ public:
   // thrust complex output buffer dev_out_. Used at the end of each slice
   // contraction to add the final slice's contribution to the running
   // total.
+  // aer-0118: per-slot accumulation. accumulate_planar_to_output does a
+  // read-modify-write into dev_out_, so two slices accumulating concurrently
+  // would race. Each slot accumulates into its OWN region of dev_out_ and
+  // reduce_output_slots() sums them into region 0 once the streams have
+  // joined. slot 0 with slots=1 is byte-identical to the pre-0119 path.
+  void resize_output_slots(size_t num_elements, int slots) {
+    hipSetDevice(device_id_);
+    if (slots < 1) slots = 1;
+    out_stride_ = num_elements;
+    dev_out_.resize(num_elements * (size_t)slots);
+  }
+  void accumulate_planar_to_output_slot(void *planar_tensor_ptr,
+                                        size_t num_elements, int slot) {
+    hipSetDevice(device_id_);
+    const size_t pb = plane_bytes(
+        static_cast<int64_t>(num_elements), sizeof(data_t));
+    const data_t *re = reinterpret_cast<const data_t *>(planar_tensor_ptr);
+    const data_t *im = reinterpret_cast<const data_t *>(
+        reinterpret_cast<const char *>(planar_tensor_ptr) + pb);
+    thrust::complex<data_t> *out =
+        thrust::raw_pointer_cast(dev_out_.data()) +
+        (size_t)(slot > 0 ? slot : 0) * (out_stride_ ? out_stride_ : num_elements);
+    AccumulatePlanarFunctor<data_t> fn(out, re, im);
+    thrust::for_each_n(
+        thrust_gpu::par.on(stream(slot)),
+        thrust::counting_iterator<size_t>(0), num_elements, fn);
+  }
+  // Sum slots 1..slots-1 into slot 0. Call only after sync_all_slots().
+  void reduce_output_slots(size_t num_elements, int slots) {
+    if (slots <= 1) return;
+    hipSetDevice(device_id_);
+    thrust::complex<data_t> *base = thrust::raw_pointer_cast(dev_out_.data());
+    for (int s = 1; s < slots; s++) {
+      thrust::complex<data_t> *src = base + (size_t)s * num_elements;
+      thrust::transform(thrust_gpu::par.on(stream_), base, base + num_elements,
+                        src, base, thrust::plus<thrust::complex<data_t>>());
+    }
+    hipStreamSynchronize(stream_);
+  }
+
   void accumulate_planar_to_output(void *planar_tensor_ptr,
                                    size_t num_elements) {
     hipSetDevice(device_id_);
@@ -1085,6 +1184,60 @@ public:
   // every later async op with "previous error during capture". Recreating
   // the stream is the only reliable reset; callers hold no cached
   // references to the raw handle (stream() is re-read at every use).
+  // aer-0118: slot accessors. slot 0 is the legacy stream/handle, so every
+  // existing call site (which passes no slot) is unchanged.
+  int slots() const { return slots_; }
+  hipStream_t stream(int slot) const {
+    if (slot <= 0) return stream_;
+    return extra_streams_[(size_t)(slot - 1)];
+  }
+#ifdef AER_HIPBLAS
+  hipblasHandle_t bl_handle_slot(int slot) const {
+    if (slot <= 0) return bl_handle_;
+    return extra_bl_handles_[(size_t)(slot - 1)];
+  }
+#endif
+  // Create slots up to n. Idempotent; safe to call every contraction.
+  void ensure_slots(int n) {
+    if (n < 1) n = 1;
+    if (n <= slots_) return;
+    hipSetDevice(device_id_);
+    while ((int)extra_streams_.size() < n - 1) {
+      hipStream_t st = nullptr;
+      check_hip(hipStreamCreateWithFlags(&st, hipStreamNonBlocking),
+                "hipStreamCreateWithFlags(slot)", device_id_);
+      extra_streams_.push_back(st);
+#ifdef AER_HIPBLAS
+      hipblasHandle_t h = nullptr;
+      check_hipblas(hipblasCreate(&h), "hipblasCreate(slot)", device_id_);
+      check_hipblas(hipblasSetStream(h, st), "hipblasSetStream(slot)",
+                    device_id_);
+      check_hipblas(hipblasSetAtomicsMode(h, HIPBLAS_ATOMICS_NOT_ALLOWED),
+                    "hipblasSetAtomicsMode(slot)", device_id_);
+      extra_bl_handles_.push_back(h);
+#endif
+    }
+    slots_ = n;
+  }
+  void destroy_slots() {
+    hipSetDevice(device_id_);
+#ifdef AER_HIPBLAS
+    for (size_t i = 0; i < extra_bl_handles_.size(); i++)
+      if (extra_bl_handles_[i]) hipblasDestroy(extra_bl_handles_[i]);
+    extra_bl_handles_.clear();
+#endif
+    for (size_t i = 0; i < extra_streams_.size(); i++)
+      if (extra_streams_[i]) hipStreamDestroy(extra_streams_[i]);
+    extra_streams_.clear();
+    slots_ = 1;
+  }
+  void sync_all_slots() {
+    hipSetDevice(device_id_);
+    hipStreamSynchronize(stream_);
+    for (size_t i = 0; i < extra_streams_.size(); i++)
+      hipStreamSynchronize(extra_streams_[i]);
+  }
+
   void recreate_stream() {
     hipSetDevice(device_id_);
     if (stream_) {

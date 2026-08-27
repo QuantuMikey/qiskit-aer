@@ -688,6 +688,10 @@ static uint64_t stage_block_elems(const std::vector<int64_t> &ext) {
   return n;
 }
 
+// aer-0118: hard ceiling on concurrent slice slots. Bounds the scratch key
+// space and the pool/output memory multiplier; AER_TN_STREAMS is clamped here.
+static const int kMaxStreamSlots = 8;
+
 // aer-0115: shared index decomposition for the complex-path pack/scatter
 // functors. A GPU has no hardware integer divide, so the per-mode rem%e and
 // rem/e in the offset walk compile to a multi-instruction sequence per mode
@@ -1294,8 +1298,8 @@ private:
   void setup_pool_and_cache(int device_idx, bool tiling_available);
   bool topology_matches_previous() const;
   void cache_topology();
-  void contract_single_slice(uint_t slice_index, int device_idx);
-  void contract_single_slice_direct(uint_t slice_index, int device_idx);
+  void contract_single_slice(uint_t slice_index, int device_idx, int slot = 0);
+  void contract_single_slice_direct(uint_t slice_index, int device_idx, int slot = 0);
   void destroy_step_graphs();
   void project_slice(uint_t slice_index, int device_idx,
                      std::vector<PlanePtrs> &projected);
@@ -2638,7 +2642,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
           // Would the consuming step ALREADY be a classic accept without any
           // reorder? If so the reorder gains nothing and can only cost: it
           // makes have_c != want_c at the producer, pushing that step onto the
-          // scatter-only route (aer-0118) for no benefit downstream. The
+          // scatter-only route (aer-0117) for no benefit downstream. The
           // end-to-end harness measured 1795 of 1992 reorders falling in this
           // class before this test was added -- 90% pure cost. Requiring
           // !already_ok keeps the full benefit (permuted steps fell by the same
@@ -2836,7 +2840,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
         // used to imply: packed operands, untiled. A tiled or strided step
         // reaching this point can only be rescued below.
         //
-        // aer-0118: c_ok is NOT required here. It was, and that silently
+        // aer-0117: c_ok is NOT required here. It was, and that silently
         // defeated aer-0116: order propagation deliberately rewrites modes_c
         // into the consumer's order, which makes have_c != want_c and so
         // c_ok false. The step then fell through to the rescue branch, which
@@ -2886,7 +2890,7 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
                 static_cast<uint64_t>(c_elems_expected));
           }
           gemm_steps_routed_++;
-          // aer-0118: operands are clean but C is not in [M][N] order (order
+          // aer-0117: operands are clean but C is not in [M][N] order (order
           // propagation put it in the consumer's order). Scatter the natural
           // GEMM result into the declared slot. This is the SAME CLAIM C
           // mapping the rescue branch uses -- declared column-major strides
@@ -3245,7 +3249,14 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   if (tn_verbose())
     fprintf(stderr, "[AER_TN] pool layout done; allocating\n");
 
-  dev.pool().allocate(dev.device_id());
+  {
+    // aer-0118: reserve one pool region per stream slot. tn_streams()==1
+    // reserves exactly one, i.e. the pre-0119 allocation.
+    int ps = tn_streams();
+    if (ps > kMaxStreamSlots) ps = kMaxStreamSlots;
+    if (ps < 1) ps = 1;
+    dev.pool().allocate(dev.device_id(), ps);
+  }
   if (tn_profile())
     prof_pool_ms_ += tn_ms_since(prof_pool_t0);
 
@@ -4003,6 +4014,20 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
   // slice's true cost including its share of buffer setup on this call.
   const std::chrono::steady_clock::time_point gate_t0 =
       std::chrono::steady_clock::now();
+  // aer-0118: multi-stream slice overlap (§6 item 5). nslots == 1 is the
+  // pre-0119 path exactly: one stream, one pool region, one output region,
+  // sequential slices, byte-identical output. Above 1, each slot owns a
+  // stream, a hipBLAS handle, a full copy of the intermediate pool layout, a
+  // scratch region and an output region, so slices in flight share nothing
+  // writable. Inputs are the one exception and are safe: project_slice points
+  // at the read-only input slab.
+  //
+  // The memory cost is real and is why this is opt-in: N copies of the
+  // intermediate pool, which is the term slicing exists to shrink. Size it
+  // against measured headroom, not by assumption.
+  int nslots = tn_streams();
+  if (nslots > kMaxStreamSlots) nslots = kMaxStreamSlots;
+  if (nslots < 1) nslots = 1;
   for (int idev = 0; idev < num_devices_used_; idev++) {
     uint_t dev_slice_begin =
         slice_begin_ + (slice_end_ - slice_begin_) * idev / num_devices_used_;
@@ -4010,14 +4035,27 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
         slice_begin_ + (slice_end_ - slice_begin_) * (idev + 1) / num_devices_used_;
 
     hipSetDevice(gpu_mgr_.device(idev).device_id());
+    // More slots than slices on this device is pure memory waste.
+    int dev_slots = nslots;
+    const uint_t dev_count = dev_slice_end - dev_slice_begin;
+    if ((uint_t)dev_slots > dev_count) dev_slots = (int)(dev_count ? dev_count : 1);
+    if (dev_slots > 1) {
+      gpu_mgr_.device(idev).ensure_slots(dev_slots);
+      gpu_mgr_.device(idev).resize_output_slots(out_size_, dev_slots);
+    }
 
     auto &out_buf = gpu_mgr_.device(idev).output_buffer();
     thrust::fill(thrust_gpu::par.on(gpu_mgr_.device(idev).stream()),
-                 out_buf.begin(), out_buf.begin() + out_size_,
+                 out_buf.begin(),
+                 out_buf.begin() + (size_t)out_size_ * (size_t)dev_slots,
                  thrust::complex<data_t>(0.0, 0.0));
+    if (dev_slots > 1)
+      hipStreamSynchronize(gpu_mgr_.device(idev).stream());
 
     for (uint_t s = dev_slice_begin; s < dev_slice_end; s++) {
-      contract_single_slice(s, idev);
+      const int slot =
+          (dev_slots > 1) ? (int)((s - dev_slice_begin) % (uint_t)dev_slots) : 0;
+      contract_single_slice(s, idev, slot);
       // aer-0095: after the very first slice of the call, synchronize the
       // stream so the elapsed time is the slice's true cost, then gate the
       // remainder against the allocation's remaining wall. Devices run
@@ -4026,7 +4064,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
       // count over the device count, independent of how the split rounds.
       // The sync adds no work: these kernels must complete regardless.
       if (idev == 0 && s == dev_slice_begin) {
-        hipStreamSynchronize(gpu_mgr_.device(0).stream());
+        hipStreamSynchronize(gpu_mgr_.device(0).stream(slot));
         const double t1_s = tn_ms_since(gate_t0) / 1000.0;
         const uint64_t max_share =
             ((uint64_t)(slice_end_ - slice_begin_) +
@@ -4034,6 +4072,14 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
             (uint64_t)num_devices_used_;
         tn_wall_gate_check(t1_s, max_share, myrank_);
       }
+    }
+    // aer-0118: join every slot before the partials are summed -- the
+    // reduction reads regions other streams are still writing otherwise --
+    // then fold slots 1..n-1 into region 0, which is what the cross-device
+    // and cross-rank reductions consume.
+    if (dev_slots > 1) {
+      gpu_mgr_.device(idev).sync_all_slots();
+      gpu_mgr_.device(idev).reduce_output_slots(out_size_, dev_slots);
     }
   }
 }
@@ -4059,10 +4105,10 @@ void TensorNetContractor_HipTensor<data_t>::destroy_step_graphs() {
 // dumps belong on the direct path.
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
-    uint_t slice_index, int device_idx) {
+    uint_t slice_index, int device_idx, int slot) {
   if (!tn_hip_graph() || graphs_.disabled || tn_debug() ||
       graph_topo_key_.empty()) {
-    contract_single_slice_direct(slice_index, device_idx);
+    contract_single_slice_direct(slice_index, device_idx, slot);
     return;
   }
   if (graphs_.maps.size() <= (size_t)device_idx) {
@@ -4087,7 +4133,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
       graphs_.maps[(size_t)device_idx][{graph_topo_key_, slice_index}];
 
   if (slot.exec != nullptr) {
-    if (hipGraphLaunch(slot.exec, dev.stream()) == hipSuccess) {
+    if (hipGraphLaunch(slot.exec, dev.stream(slot)) == hipSuccess) {
       prof_graph_replays_++;
       return;
     }
@@ -4098,13 +4144,13 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
             "disabled for this process, continuing on the direct dispatch "
             "path (results unaffected)\n",
             myrank_);
-    contract_single_slice_direct(slice_index, device_idx);
+    contract_single_slice_direct(slice_index, device_idx, slot);
     return;
   }
 
   slot.visits++;
   if (slot.visits < 2) {
-    contract_single_slice_direct(slice_index, device_idx);
+    contract_single_slice_direct(slice_index, device_idx, slot);
     return;
   }
 
@@ -4123,7 +4169,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   // and if anything still fails, the result already exists, graphs
   // disable loudly, and the stream is RECREATED so a failed capture can
   // never poison subsequent work again.
-  contract_single_slice_direct(slice_index, device_idx);
+  contract_single_slice_direct(slice_index, device_idx, slot);
 
   // aer-0074: the captured pass enqueues nothing but its host-side timers
   // still run, double-counting this visit's t_gemm/gemm_calls. Snapshot and
@@ -4139,11 +4185,11 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   const uint64_t snap_ht_calls = prof_ht_calls_;
   hipGraph_t graph = nullptr;
   hipError_t err =
-      hipStreamBeginCapture(dev.stream(), hipStreamCaptureModeThreadLocal);
+      hipStreamBeginCapture(dev.stream(slot), hipStreamCaptureModeThreadLocal);
   if (err == hipSuccess) {
     bool body_threw = false;
     try {
-      contract_single_slice_direct(slice_index, device_idx);
+      contract_single_slice_direct(slice_index, device_idx, slot);
     } catch (...) {
       body_threw = true;
     }
@@ -4152,7 +4198,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     prof_gemm_only_ms_ = snap_gemm_only_ms;
     prof_gemm_calls_ = snap_gemm_calls;
     prof_ht_calls_ = snap_ht_calls;
-    err = hipStreamEndCapture(dev.stream(), &graph);
+    err = hipStreamEndCapture(dev.stream(slot), &graph);
     if (body_threw) {
       if (graph != nullptr)
         hipGraphDestroy(graph);
@@ -4193,7 +4239,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
 
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
-    uint_t slice_index, int device_idx) {
+    uint_t slice_index, int device_idx, int slot) {
   if (plan_.steps.empty()) return;
 
   // Fault-injection hook (inert unless set; never a drop-in default, like
@@ -4256,7 +4302,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
     // construction (§8.3).
     const PlanSpec &ps = step_plan_specs_[step];
 
-    void *c_slot = dev.pool().get_tensor_ptr(static_cast<int>(result_idx));
+    void *c_slot = dev.pool().get_tensor_ptr(static_cast<int>(result_idx), slot);
     const size_t c_plane = plane_bytes(
         all_specs_[result_idx].num_elements(), sizeof(data_t));
     all_planes[result_idx].re = reinterpret_cast<data_t *>(c_slot);
@@ -4277,7 +4323,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
     {
       size_t c_bytes = tensor_slot_bytes(
           all_specs_[result_idx].num_elements(), sizeof(data_t));
-      check_hip(hipMemsetAsync(c_slot, 0, c_bytes, dev.stream()),
+      check_hip(hipMemsetAsync(c_slot, 0, c_bytes, dev.stream(slot)),
                 "hipMemsetAsync(C pre-zero)", dev.device_id());
     }
 
@@ -4343,19 +4389,19 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
       if (!tn_gemm_complex() &&
           (ps.gemm_perm_a || ps.gemm_perm_b || ps.gemm_scatter_c)) {
         thrust::device_vector<data_t> &pbuf =
-            gemm_perm_scratch_[dev.device_id()];
+            gemm_perm_scratch_[dev.device_id() * kMaxStreamSlots + slot];
         const uint64_t pe = gemm_perm_scratch_elems_;
         if (pbuf.size() < 6 * pe)
           pbuf.resize(6 * pe);
         data_t *pbase = thrust::raw_pointer_cast(pbuf.data());
         if (ps.gemm_perm_a) {
-          stage_pack<data_t>(dev.stream(), g_a_re, g_a_im, pbase + 0 * pe,
+          stage_pack<data_t>(dev.stream(slot), g_a_re, g_a_im, pbase + 0 * pe,
                              pbase + 1 * pe, ps.perm_ext_a, ps.perm_str_a);
           g_a_re = pbase + 0 * pe;
           g_a_im = pbase + 1 * pe;
         }
         if (ps.gemm_perm_b) {
-          stage_pack<data_t>(dev.stream(), g_b_re, g_b_im, pbase + 2 * pe,
+          stage_pack<data_t>(dev.stream(slot), g_b_re, g_b_im, pbase + 2 * pe,
                              pbase + 3 * pe, ps.perm_ext_b, ps.perm_str_b);
           g_b_re = pbase + 2 * pe;
           g_b_im = pbase + 3 * pe;
@@ -4377,7 +4423,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         // deinterleave (ext={c_elems}, str={1}) otherwise -- one pass either
         // way. Verify compares the declared slot afterwards, unchanged.
         thrust::device_vector<data_t> &zbuf =
-            gemm_perm_scratch_[dev.device_id()];
+            gemm_perm_scratch_[dev.device_id() * kMaxStreamSlots + slot];
         const uint64_t pe = gemm_perm_scratch_elems_;
         if (zbuf.size() < 6 * pe)
           zbuf.resize(6 * pe);
@@ -4411,10 +4457,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         } else {
           auto pr = pick(ps.perm_ext_a, ps.perm_str_a, ps.id_ext_a, ps.id_str_a);
           if (all_planes[left].il)
-            interleave_repack<data_t>(dev.stream(), all_planes[left].re,
+            interleave_repack<data_t>(dev.stream(slot), all_planes[left].re,
                                       zbase + 0 * pe, *pr.first, *pr.second);
           else
-            interleave_pack<data_t>(dev.stream(), all_planes[left].re,
+            interleave_pack<data_t>(dev.stream(slot), all_planes[left].re,
                                     all_planes[left].im, zbase + 0 * pe,
                                     *pr.first, *pr.second);
         }
@@ -4423,10 +4469,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         } else {
           auto pr = pick(ps.perm_ext_b, ps.perm_str_b, ps.id_ext_b, ps.id_str_b);
           if (all_planes[right].il)
-            interleave_repack<data_t>(dev.stream(), all_planes[right].re,
+            interleave_repack<data_t>(dev.stream(slot), all_planes[right].re,
                                       zbase + 2 * pe, *pr.first, *pr.second);
           else
-            interleave_pack<data_t>(dev.stream(), all_planes[right].re,
+            interleave_pack<data_t>(dev.stream(slot), all_planes[right].re,
                                     all_planes[right].im, zbase + 2 * pe,
                                     *pr.first, *pr.second);
         }
@@ -4450,11 +4496,11 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         const bool il_store = (result_idx != num_inputs + num_steps - 1);
         if (ps.gemm_scatter_c) {
           if (il_store) {
-            interleaved_scatter<data_t>(dev.stream(), zbase + 4 * pe,
+            interleaved_scatter<data_t>(dev.stream(slot), zbase + 4 * pe,
                                         all_planes[result_idx].re,
                                         ps.scat_ext, ps.scat_str);
           } else {
-            deinterleave_scatter<data_t>(dev.stream(), zbase + 4 * pe,
+            deinterleave_scatter<data_t>(dev.stream(slot), zbase + 4 * pe,
                                          all_planes[result_idx].re,
                                          all_planes[result_idx].im,
                                          ps.scat_ext, ps.scat_str);
@@ -4471,12 +4517,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           check_hip(hipMemcpyAsync(all_planes[result_idx].re, zbase + 4 * pe,
                                    static_cast<size_t>(2 * c_nat) *
                                        sizeof(data_t),
-                                   hipMemcpyDeviceToDevice, dev.stream()),
+                                   hipMemcpyDeviceToDevice, dev.stream(slot)),
                     "hipMemcpyAsync(C interleaved store)", dev.device_id());
         } else {
           // aer-0114 (§6 note): ps.lin_ext/lin_str are {c_nat} and {1}, computed
           // once per step at classification instead of allocated per dispatch.
-          deinterleave_scatter<data_t>(dev.stream(), zbase + 4 * pe,
+          deinterleave_scatter<data_t>(dev.stream(slot), zbase + 4 * pe,
                                        all_planes[result_idx].re,
                                        all_planes[result_idx].im,
                                        ps.lin_ext, ps.lin_str);
@@ -4506,7 +4552,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
       // slot exactly. Runs BEFORE the verify read-back, which compares the
       // declared slot -- so corder steps verify like any other.
       if (ps.gemm_scatter_c && !tn_gemm_complex()) {
-        stage_scatter<data_t>(dev.stream(), g_c_re, g_c_im,
+        stage_scatter<data_t>(dev.stream(slot), g_c_re, g_c_im,
                               all_planes[result_idx].re,
                               all_planes[result_idx].im,
                               ps.scat_ext, ps.scat_str, false);
@@ -4540,7 +4586,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
     }
 
     if (tn_debug()) {
-      hipStreamSynchronize(dev.stream());
+      hipStreamSynchronize(dev.stream(slot));
       char label[64];
       snprintf(label, sizeof(label), "  after step %zu (T%zu)", step, result_idx);
       // aer-0116: an interleaved slot (aer-0114) has no separate imag plane,
@@ -4585,7 +4631,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
   dev.accumulate_planar_to_output(all_planes[final_idx].re, out_size_);
 
   if (tn_debug()) {
-    hipStreamSynchronize(dev.stream());
+    hipStreamSynchronize(dev.stream(slot));
     std::vector<std::complex<data_t>> host(out_size_);
     hipMemcpy(host.data(),
               thrust::raw_pointer_cast(dev.output_buffer().data()),
