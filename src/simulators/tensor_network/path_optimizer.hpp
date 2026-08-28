@@ -2420,8 +2420,10 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
 # HyperOptimizer. Executed once via py::exec, only when AER_TN_PATH_METHODS
 # names "mt-kahypar". Self-contained by design: the only cotengra API this
 # touches is register_hyper_function; the trial builds the ssa_path itself
-# by recursive bisection, calling Mt-KaHyPar for every cut, so no cotengra
-# internals beyond the registry are depended on. Binding signatures vary
+# by recursive bisection, calling Mt-KaHyPar for every cut, and returns
+# ContractionTree.from_path(..., ssa_path=...) -- the contract
+# register_hyper_function documents and base_trial_fn wraps as the
+# trial's tree (hyper.py:102-130, path_greedy.py:34-36 pattern). Binding signatures vary
 # across mtkahypar releases, so construction is a probe ladder; any failure
 # raises and the compiled layer drops the method from the trial mix.
 import os as _os
@@ -2529,8 +2531,10 @@ def _aer_mtk_bipartition(m, mtk, group, cur, size_dict, eps, seed):
 def _aer_mtkahypar_trial(inputs, output, size_dict,
                          imbalance=0.05, cutoff=12, seed=None, **kwargs):
     n = len(inputs)
+    from cotengra.core import ContractionTree
     if n <= 1:
-        return []
+        return ContractionTree.from_path(
+            inputs, output, size_dict, ssa_path=[])
     rng = _random.Random(seed)
     m, mtk = _aer_mtk_module()
     cur = {}
@@ -2585,7 +2589,8 @@ def _aer_mtkahypar_trial(inputs, output, size_dict,
         return emit(solve(left), solve(right))
 
     solve(list(range(n)))
-    return ssa
+    return ContractionTree.from_path(
+        inputs, output, size_dict, ssa_path=ssa)
 
 
 def _aer_register_mtkahypar():
