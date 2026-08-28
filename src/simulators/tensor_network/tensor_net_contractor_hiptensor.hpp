@@ -1515,12 +1515,23 @@ void TensorNetContractor_HipTensor<data_t>::set_network(
   }
   num_base_tensors_ = input_tensors_.size();
 
-  if (gpu_mgr_.num_devices() == 0) {
-    std::vector<uint64_t> targets(target_gpus_.begin(), target_gpus_.end());
-    gpu_mgr_.discover(targets);
+  // aer-0123: a FORGE-ONLY run on a GPU-less node (AER_TN_FORGE_ONLY=1 and
+  // zero visible devices) skips discovery and the device upload -- the
+  // search and the plan capture need only the host-side network
+  // description built below. On any node WITH a GPU, and in every default
+  // run, this block is byte-identical to before.
+  const bool forge_only_cpu = tn_forge_only() && tn_gpu_device_count() == 0;
+  if (!forge_only_cpu) {
+    if (gpu_mgr_.num_devices() == 0) {
+      std::vector<uint64_t> targets(target_gpus_.begin(), target_gpus_.end());
+      gpu_mgr_.discover(targets);
+    }
+    tensor_device_ptrs_ =
+        gpu_mgr_.primary().copy_tensor_data(input_tensors_, true);
+  } else if (tn_verbose()) {
+    fprintf(stderr, "[TN FORGE-ONLY] no GPU present: skipping device "
+                    "discovery and tensor upload (search-only setup)\n");
   }
-
-  tensor_device_ptrs_ = gpu_mgr_.primary().copy_tensor_data(input_tensors_, true);
   build_network_description();
   // aer-0024: do NOT invalidate the pool here. The pool holds only
   // plan-derived intermediates and the shape-keyed hipTensor plan cache;
@@ -1661,11 +1672,19 @@ void TensorNetContractor_HipTensor<data_t>::set_output(
   // happens in set_network(); replicate the guard here so primary() is valid
   // and allocate_output() does not dereference an empty devices_ vector when
   // set_output() runs first.
-  if (gpu_mgr_.num_devices() == 0) {
-    std::vector<uint64_t> targets(target_gpus_.begin(), target_gpus_.end());
-    gpu_mgr_.discover(targets);
+  // aer-0123: same GPU-less forge-only skip as set_network(); the output
+  // buffer is only ever touched by contraction, which a forge-only run
+  // never reaches.
+  if (!(tn_forge_only() && tn_gpu_device_count() == 0)) {
+    if (gpu_mgr_.num_devices() == 0) {
+      std::vector<uint64_t> targets(target_gpus_.begin(), target_gpus_.end());
+      gpu_mgr_.discover(targets);
+    }
+    gpu_mgr_.primary().allocate_output(out_size_);
+  } else if (tn_verbose()) {
+    fprintf(stderr, "[TN FORGE-ONLY] no GPU present: skipping output "
+                    "allocation (search-only setup)\n");
   }
-  gpu_mgr_.primary().allocate_output(out_size_);
 
   if (tn_verbose())
     fprintf(stderr, "[AER_TN] set_output: modes=%s extents=%s size=%zu\n",
@@ -2097,6 +2116,21 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           graph_topo_key_ =
               plan_file_network_key(network_desc_, engaged,
                                     2 * sizeof(data_t));
+          // aer-0123: FORGE-ONLY exit. The plan is valid, every refusal
+          // gate above has passed unchanged, and window 3b below is the
+          // first GPU work in setup (pool hipMalloc, hipTensor plans). A
+          // forge-only run banks here through the same capture path as
+          // the ordinary end-of-setup capture and raises a tagged error
+          // instead of contracting -- so the run never needs a device,
+          // and the launcher's PASS criterion is the banked line plus
+          // this tag. Default OFF: unset, this line costs one getenv.
+          if (tn_forge_only()) {
+            maybe_write_plan_file(engaged);
+            throw std::runtime_error(
+                "[TN FORGE-ONLY] plan capture complete at setup; "
+                "contraction skipped (AER_TN_FORGE_ONLY=1). Replay on a "
+                "GPU allocation via AER_TN_PLAN_FILE.");
+          }
         } catch (const NeedsTilingException &) {
           // Nothing in 3a raises this today -- the slice ceiling is a
           // runtime_error and cache_topology only copies vectors. It is handled

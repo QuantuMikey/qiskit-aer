@@ -725,6 +725,18 @@ static bool tn_plan_forge() {
   return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
+// aer-0123: FORGE-ONLY mode. AER_TN_FORGE_ONLY=1 (meant to be paired with
+// AER_TN_PLAN_FORGE=1) declares that this run's ONLY product is the banked
+// plan: setup runs the search, captures through the normal plan-file path,
+// and raises a tagged error before window 3b -- the first GPU work in
+// setup -- so a forge can run on a CPU-only allocation (e.g. LUMI
+// largemem, where the whole node's memory backs one search). Default OFF:
+// unset, every run is byte-identical to today.
+static bool tn_forge_only() {
+  const char *v = std::getenv("AER_TN_FORGE_ONLY");
+  return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
 static uint64_t min_slices_per_rank() {
   // aer-0062: default raised 0 -> 1, paired with the slice-target raise
   // above. A big fence lets moderately hard circuits draw 4-16-slice
@@ -2379,6 +2391,50 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
                 break;
             } else {
               cur.push_back(*c);
+            }
+          }
+          // aer-0124: "mt-kahypar" is not a method cotengra 0.7.x
+          // registers, so naming it in AER_TN_PATH_METHODS registers our
+          // own divisive driver on first use: recursive bisection with
+          // Mt-KaHyPar (shared-memory; threads cooperate on ONE
+          // hypergraph, so thread count divides wall instead of
+          // multiplying trial memory). The only cotengra API touched is
+          // register_hyper_function; the trial builds its ssa_path
+          // itself. FAIL-SOFT by construction: if the mtkahypar wheel is
+          // absent or registration raises, the name is dropped from the
+          // list with one stderr line and the remaining methods carry
+          // the search -- never a crashed forge. Unset, or without the
+          // name, this block never runs and behavior is byte-identical.
+          bool want_mtk = false;
+          for (auto h : mlist)
+            if (std::string(py::str(h)) == "mt-kahypar") {
+              want_mtk = true;
+              break;
+            }
+          if (want_mtk) {
+            static bool mtk_registered = false;
+            static bool mtk_failed = false;
+            if (!mtk_registered && !mtk_failed) {
+              static const char kMtkSrc[] = R"AERPY(@@AER0124_DRIVER@@)AERPY";
+              try {
+                py::exec(kMtkSrc);
+                mtk_registered = true;
+                fprintf(stderr,
+                        "[AER_TN_PATH] mt-kahypar method registered\n");
+              } catch (const std::exception &e) {
+                mtk_failed = true;
+                fprintf(stderr,
+                        "[AER_TN_PATH] mt-kahypar registration failed; "
+                        "dropping it from AER_TN_PATH_METHODS: %s\n",
+                        e.what());
+              }
+            }
+            if (!mtk_registered) {
+              py::list filtered;
+              for (auto h : mlist)
+                if (std::string(py::str(h)) != "mt-kahypar")
+                  filtered.append(h);
+              mlist = filtered;
             }
           }
           if (py::len(mlist) > 0)

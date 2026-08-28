@@ -452,7 +452,12 @@ def available_methods(methods, devices):
     valid_methods = []
     for method in methods:
         if method == "tensor_network":
-            if "GPU" in devices:
+            # aer-0123: a FORGE-ONLY run (AER_TN_FORGE_ONLY=1) banks a
+            # contraction plan on a CPU-only node (e.g. LUMI largemem);
+            # admit the method so the contractor's own forge-only path can
+            # run the search and capture. Unset keeps the GPU gate exactly
+            # as before.
+            if "GPU" in devices or os.getenv("AER_TN_FORGE_ONLY", "") == "1":
                 valid_methods.append(method)
         else:
             valid_methods.append(method)
