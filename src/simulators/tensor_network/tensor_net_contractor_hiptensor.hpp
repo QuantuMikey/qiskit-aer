@@ -1867,8 +1867,33 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           int w1_status = 0;
           std::string w1_msg;
           try {
-            gpu_mgr_.primary().refresh_free_memory();
-            free_bytes = gpu_mgr_.primary().free_memory();
+            // aer-0128: a GPU-less forge has no device to read. The budget
+            // is the REPLAY device's, stated via AER_TN_FORGE_BUDGET_MB;
+            // without it the setup REFUSES here rather than let a zero
+            // budget clamp target_elements to the output size and bank a
+            // poisoned plan (the slice envelope is a function of this
+            // number -- see find_path's target_elements clamp). On a GPU
+            // node, forge-only or not, the read is byte-identical to
+            // before.
+            if (tn_forge_only() && tn_gpu_device_count() == 0) {
+              free_bytes = tn_forge_budget_bytes();
+              if (free_bytes == 0)
+                throw std::runtime_error(
+                    "[TN FORGE-ONLY] AER_TN_FORGE_BUDGET_MB is required for "
+                    "a forge on a node with no GPU: the slice envelope is "
+                    "computed against the replay device's memory, which "
+                    "cannot be read here. Set it to the replay GPU's "
+                    "free-at-setup budget in MB (a LUMI MI250X GCD measured "
+                    "65226 in job 21585231).");
+              if (myrank_ == 0)
+                fprintf(stderr,
+                        "[TN FORGE-ONLY] replay-device budget %.1f MB from "
+                        "AER_TN_FORGE_BUDGET_MB\n",
+                        free_bytes / (1024.0 * 1024.0));
+            } else {
+              gpu_mgr_.primary().refresh_free_memory();
+              free_bytes = gpu_mgr_.primary().free_memory();
+            }
 
           } catch (const std::exception &e) {
             w1_status = 2;

@@ -737,6 +737,26 @@ static bool tn_forge_only() {
   return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
+// aer-0128: AER_TN_FORGE_BUDGET_MB -- the REPLAY-TARGET device budget for a
+// GPU-less forge, in MB. A plan's slice envelope is a function of the device
+// memory it will be contracted on; a largemem node has no device to read, and
+// a zero budget clamps target_elements to the output size, which forces the
+// slicer toward the poisoned-plan shape (astronomical slice counts). So the
+// budget must be stated by the operator: set it to the replay GPU's
+// free-at-setup figure (a LUMI MI250X GCD measured 65226 MB in job 21585231).
+// Returns bytes; 0 means unset/invalid, and the forge-only setup REFUSES
+// loudly on 0 rather than banking a meaningless plan.
+static uint64_t tn_forge_budget_bytes() {
+  const char *v = std::getenv("AER_TN_FORGE_BUDGET_MB");
+  if (v == nullptr || v[0] == '\0')
+    return 0;
+  char *end = nullptr;
+  unsigned long long mb = std::strtoull(v, &end, 10);
+  if (end == v || mb == 0)
+    return 0;
+  return static_cast<uint64_t>(mb) << 20;
+}
+
 static uint64_t min_slices_per_rank() {
   // aer-0062: default raised 0 -> 1, paired with the slice-target raise
   // above. A big fence lets moderately hard circuits draw 4-16-slice
