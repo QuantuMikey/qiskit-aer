@@ -1380,7 +1380,24 @@ public:
   size_t num_devices() const { return devices_.size(); }
   GPUDevice<data_t> &device(size_t i) { return *devices_[i]; }
   const GPUDevice<data_t> &device(size_t i) const { return *devices_[i]; }
-  GPUDevice<data_t> &primary() { return *devices_[0]; }
+  GPUDevice<data_t> &primary() {
+    // aer-0127: devices_[0] on an empty vector is undefined behavior -- in
+    // practice a segfault the try/catch layers cannot see. Job 21585380's
+    // rerun would have died here (set_additional_tensors upload) rather
+    // than reaching the forge-only exit. Cost, stated precisely (audit
+    // D6): the highest-frequency caller is project_slice -- once per
+    // slice per device, e.g. 256 evaluations for the p=8 plan -- a
+    // predicted load-and-compare against the thousands of GEMM
+    // dispatches in the same contraction. Nothing on the per-STEP
+    // dispatch path calls primary().
+    if (devices_.empty())
+      throw std::runtime_error(
+          "[AER_TN_GPU] primary() called with zero discovered devices -- "
+          "device work was requested before/without discover(). On a "
+          "CPU-only node this is a path AER_TN_FORGE_ONLY must skip; "
+          "please report the call site.");
+    return *devices_[0];
+  }
   const std::vector<int> &device_ids() const { return device_ids_; }
 };
 

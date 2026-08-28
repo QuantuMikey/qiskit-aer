@@ -1612,7 +1612,19 @@ void TensorNetContractor_HipTensor<data_t>::set_additional_tensors(
   // which keeps the per-device slab rebase in the contraction path valid —
   // and update_additional_tensors()' indexing via num_base_tensors_ now
   // points at real, dedicated slots.
-  tensor_device_ptrs_ = gpu_mgr_.primary().copy_tensor_data(input_tensors_, true);
+  // aer-0127: same GPU-less forge-only skip as set_network() (aer-0123).
+  // This is the call that killed the largemem rerun's path: the save_expval
+  // loop calls set_additional_tensors FIRST (tensor_net.hpp save_expval
+  // loop), before set_output and setup_contraction, so the unguarded
+  // upload dereferenced primary() on an empty device list. Host-side
+  // bookkeeping (the input list and the network description) must still
+  // run -- the search consumes it; only the device upload is skipped.
+  if (!(tn_forge_only() && tn_gpu_device_count() == 0)) {
+    tensor_device_ptrs_ = gpu_mgr_.primary().copy_tensor_data(input_tensors_, true);
+  } else if (tn_verbose()) {
+    fprintf(stderr, "[TN FORGE-ONLY] no GPU present: skipping "
+                    "additional-tensor upload (search-only setup)\n");
+  }
   build_network_description();
   // aer-0024: same reasoning as set_network(). The Pauli leaves of a
   // save_expval batch differ only in their VALUES; their modes and extents are
@@ -1631,6 +1643,14 @@ void TensorNetContractor_HipTensor<data_t>::set_additional_tensors(
 template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::update_additional_tensors(
     const std::vector<std::shared_ptr<Tensor<data_t>>> &tensors) {
+  // aer-0127: pure device upload -- nothing host-side to maintain. A
+  // GPU-less forge-only run must not reach primary()/hipSetDevice here.
+  if (tn_forge_only() && tn_gpu_device_count() == 0) {
+    if (tn_verbose())
+      fprintf(stderr, "[TN FORGE-ONLY] no GPU present: skipping "
+                      "additional-tensor update (search-only setup)\n");
+    return;
+  }
   hipSetDevice(gpu_mgr_.primary().device_id());
   hipStream_t stream = gpu_mgr_.primary().stream();
   int dev_id = gpu_mgr_.primary().device_id();
