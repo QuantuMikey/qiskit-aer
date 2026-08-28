@@ -2170,7 +2170,25 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
           // and the launcher's PASS criterion is the banked line plus
           // this tag. Default OFF: unset, this line costs one getenv.
           if (tn_forge_only()) {
+            // aer-0129 (F4): the AER_TN_PLAN_FILE_MAX_TILES capture-quality
+            // gate reads tiles_built_, which is counted during window 3b's
+            // prebuild -- skipped by this exit. The gate is therefore inert
+            // for forge-only captures; say so rather than filter silently.
+            if (tn_plan_file_max_tiles() > 0 && myrank_ == 0)
+              fprintf(stderr,
+                      "[TN FORGE-ONLY] note: AER_TN_PLAN_FILE_MAX_TILES "
+                      "does not apply to a forge-only capture (tiles are "
+                      "counted at prebuild, which forge-only skips)\n");
             maybe_write_plan_file(engaged);
+            // aer-0129 (F5): the ONLY line that proves this exit ran. The
+            // '[TN FORGE-ONLY]' tag alone is over-permissive as a PASS
+            // criterion -- the skip lines print it under AER_TN_VERBOSE=1
+            // without the exit ever firing -- so the launcher greps for
+            // this exact phrase instead.
+            if (myrank_ == 0)
+              fprintf(stderr,
+                      "[TN FORGE-ONLY] forge complete: plan capture ran; "
+                      "exiting before GPU work\n");
             throw std::runtime_error(
                 "[TN FORGE-ONLY] plan capture complete at setup; "
                 "contraction skipped (AER_TN_FORGE_ONLY=1). Replay on a "
