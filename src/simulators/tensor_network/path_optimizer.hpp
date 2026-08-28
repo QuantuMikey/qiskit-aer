@@ -2415,7 +2415,194 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
             static bool mtk_registered = false;
             static bool mtk_failed = false;
             if (!mtk_registered && !mtk_failed) {
-              static const char kMtkSrc[] = R"AERPY(@@AER0124_DRIVER@@)AERPY";
+              static const char kMtkSrc[] = R"AERPY(
+# aer-0124: mt-kahypar divisive contraction-order method for cotengra's
+# HyperOptimizer. Executed once via py::exec, only when AER_TN_PATH_METHODS
+# names "mt-kahypar". Self-contained by design: the only cotengra API this
+# touches is register_hyper_function; the trial builds the ssa_path itself
+# by recursive bisection, calling Mt-KaHyPar for every cut, so no cotengra
+# internals beyond the registry are depended on. Binding signatures vary
+# across mtkahypar releases, so construction is a probe ladder; any failure
+# raises and the compiled layer drops the method from the trial mix.
+import os as _os
+import math as _math
+import random as _random
+
+_AER_MTK_STATE = {"mod": None, "init": None}
+
+
+def _aer_mtk_module():
+    if _AER_MTK_STATE["mod"] is None:
+        import mtkahypar as _m
+        _nthreads = int(_os.environ.get("AER_TN_MTKAHYPAR_THREADS")
+                        or _os.environ.get("AER_TN_RG_THREADS") or "1")
+        _init = _m.initialize(_nthreads) if hasattr(_m, "initialize") else None
+        _AER_MTK_STATE["mod"] = _m
+        _AER_MTK_STATE["init"] = _init
+    return _AER_MTK_STATE["mod"], _AER_MTK_STATE["init"]
+
+
+def _aer_mtk_context(m, mtk, k, eps, seed):
+    ctx = None
+    if mtk is not None and hasattr(mtk, "context_from_preset"):
+        ctx = mtk.context_from_preset(m.PresetType.DEFAULT)
+    elif hasattr(m, "Context"):
+        try:
+            ctx = m.Context(m.PresetType.DEFAULT)
+        except Exception:
+            ctx = m.Context()
+    if ctx is None:
+        raise RuntimeError("mtkahypar context construction failed")
+    try:
+        ctx.logging = False
+    except Exception:
+        pass
+    if hasattr(m, "set_seed"):
+        m.set_seed(int(seed) & 0x7FFFFFFF)
+    ctx.set_partitioning_parameters(int(k), float(eps), m.Objective.KM1)
+    return ctx
+
+
+def _aer_mtk_hypergraph(m, mtk, ctx, nnodes, edges, eweights, nweights):
+    attempts = []
+    if mtk is not None and hasattr(mtk, "create_hypergraph"):
+        attempts.append(lambda: mtk.create_hypergraph(
+            ctx, nnodes, len(edges), edges, nweights, eweights))
+        attempts.append(lambda: mtk.create_hypergraph(
+            ctx, nnodes, len(edges), edges))
+    if hasattr(m, "Hypergraph"):
+        attempts.append(lambda: m.Hypergraph(
+            nnodes, len(edges), edges, nweights, eweights))
+        attempts.append(lambda: m.Hypergraph(nnodes, len(edges), edges))
+    last = None
+    for a in attempts:
+        try:
+            return a()
+        except Exception as e:
+            last = e
+    raise RuntimeError("mtkahypar hypergraph construction failed: %r" % (last,))
+
+
+def _aer_mtk_bipartition(m, mtk, group, cur, size_dict, eps, seed):
+    local = {}
+    for i, g in enumerate(group):
+        local[g] = i
+    adjacency = {}
+    for t in group:
+        for ix in cur[t]:
+            adjacency.setdefault(ix, []).append(local[t])
+    edges = []
+    eweights = []
+    for ix, members in adjacency.items():
+        if len(members) >= 2:
+            edges.append(sorted(set(members)))
+            w = size_dict.get(ix, 2)
+            eweights.append(max(1, int(round(_math.log2(max(2, w))))))
+    if not edges:
+        half = max(1, len(group) // 2)
+        return group[:half], group[half:]
+    nweights = [1] * len(group)
+    ctx = _aer_mtk_context(m, mtk, 2, eps, seed)
+    hg = _aer_mtk_hypergraph(m, mtk, ctx, len(group), edges, eweights,
+                             nweights)
+    phg = hg.partition(ctx)
+    getter = None
+    for name in ("block_id", "blockID", "part_id", "block"):
+        if hasattr(phg, name):
+            getter = getattr(phg, name)
+            break
+    if getter is None:
+        raise RuntimeError("mtkahypar partition exposes no block getter")
+    left = []
+    right = []
+    for g in group:
+        if int(getter(local[g])) == 0:
+            left.append(g)
+        else:
+            right.append(g)
+    if not left or not right:
+        half = max(1, len(group) // 2)
+        return group[:half], group[half:]
+    return left, right
+
+
+def _aer_mtkahypar_trial(inputs, output, size_dict,
+                         imbalance=0.05, cutoff=12, seed=None, **kwargs):
+    n = len(inputs)
+    if n <= 1:
+        return []
+    rng = _random.Random(seed)
+    m, mtk = _aer_mtk_module()
+    cur = {}
+    for i, ix in enumerate(inputs):
+        cur[i] = set(ix)
+    ssa = []
+    nxt = [n]
+
+    def emit(a, b):
+        sa = cur.pop(a)
+        sb = cur.pop(b)
+        nid = nxt[0]
+        nxt[0] += 1
+        cur[nid] = sa | sb
+        ssa.append((a, b))
+        return nid
+
+    def contract_small(ids):
+        ids = list(ids)
+        while len(ids) > 1:
+            best = None
+            for x in range(len(ids)):
+                for y in range(x + 1, len(ids)):
+                    a = ids[x]
+                    b = ids[y]
+                    score = 0.0
+                    for ix in cur[a] & cur[b]:
+                        score += _math.log2(max(2, size_dict.get(ix, 2)))
+                    if best is None or score > best[0]:
+                        best = (score, a, b)
+            _, a, b = best
+            nid = emit(a, b)
+            ids = [t for t in ids if t != a and t != b]
+            ids.append(nid)
+        return ids[0]
+
+    def solve(members):
+        if len(members) == 1:
+            return members[0]
+        if len(members) <= int(cutoff):
+            return contract_small(members)
+        try:
+            left, right = _aer_mtk_bipartition(
+                m, mtk, list(members), cur, size_dict, float(imbalance),
+                rng.randrange(1 << 30))
+        except Exception:
+            ms = list(members)
+            rng.shuffle(ms)
+            half = max(1, len(ms) // 2)
+            left = ms[:half]
+            right = ms[half:]
+        return emit(solve(left), solve(right))
+
+    solve(list(range(n)))
+    return ssa
+
+
+def _aer_register_mtkahypar():
+    try:
+        from cotengra.hyperoptimizers.hyper import register_hyper_function
+    except Exception:
+        import cotengra
+        register_hyper_function = getattr(cotengra, "register_hyper_function")
+    space = {
+        "imbalance": {"type": "FLOAT", "min": 0.01, "max": 0.30},
+        "cutoff": {"type": "INT", "min": 8, "max": 24},
+    }
+    register_hyper_function("mt-kahypar", _aer_mtkahypar_trial, space)
+
+
+_aer_register_mtkahypar()
+)AERPY";
               try {
                 py::exec(kMtkSrc);
                 mtk_registered = true;
