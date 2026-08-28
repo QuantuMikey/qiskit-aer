@@ -757,6 +757,25 @@ static uint64_t tn_forge_budget_bytes() {
   return static_cast<uint64_t>(mb) << 20;
 }
 
+// aer-0130: mt-kahypar registration outcome, shared by the methods block and
+// the parallel decision (two separate lexical blocks of find_path's kwargs
+// construction). Audit D4: a namespace-scope `static` here is PER-TU, and an
+// ODR-merged inline member function referencing per-TU state means which
+// copy runs depends on which definition the linker keeps. An `inline`
+// function's local static is merged to ONE program-wide instance instead --
+// the plan_cache_instance() pattern. The struct carries a constructor rather
+// than NSDMI so the header stays C++11-clean (the aggregate_cxx_standard
+// audit exists because an NSDMI-in-aggregate broke a container build once).
+struct TnMtkState {
+  bool registered;
+  bool failed;
+  TnMtkState() : registered(false), failed(false) {}
+};
+inline TnMtkState &tn_mtk_state() {
+  static TnMtkState s;
+  return s;
+}
+
 static uint64_t min_slices_per_rank() {
   // aer-0062: default raised 0 -> 1, paired with the slice-target raise
   // above. A big fence lets moderately hard circuits draw 4-16-slice
@@ -2432,9 +2451,7 @@ for _aer_mod in (_aer_presets, _aer_pb, _aer_pg):
               break;
             }
           if (want_mtk) {
-            static bool mtk_registered = false;
-            static bool mtk_failed = false;
-            if (!mtk_registered && !mtk_failed) {
+            if (!tn_mtk_state().registered && !tn_mtk_state().failed) {
               static const char kMtkSrc[] = R"AERPY(
 # aer-0124: mt-kahypar divisive contraction-order method for cotengra's
 # HyperOptimizer. Executed once via py::exec, only when AER_TN_PATH_METHODS
@@ -2630,23 +2647,52 @@ _aer_register_mtkahypar()
 )AERPY";
               try {
                 py::exec(kMtkSrc);
-                mtk_registered = true;
+                tn_mtk_state().registered = true;
                 fprintf(stderr,
                         "[AER_TN_PATH] mt-kahypar method registered\n");
               } catch (const std::exception &e) {
-                mtk_failed = true;
+                tn_mtk_state().failed = true;
                 fprintf(stderr,
                         "[AER_TN_PATH] mt-kahypar registration failed; "
                         "dropping it from AER_TN_PATH_METHODS: %s\n",
                         e.what());
               }
             }
-            if (!mtk_registered) {
+            if (!tn_mtk_state().registered) {
               py::list filtered;
               for (auto h : mlist)
                 if (std::string(py::str(h)) != "mt-kahypar")
                   filtered.append(h);
               mlist = filtered;
+              // aer-0130 (F10): the operator asked for mt-kahypar and
+              // NOTHING else. Running cotengra's default method mix in
+              // its place would be a silently different experiment;
+              // refuse instead. With other methods named, the warn-and-
+              // continue above is the right fail-soft and stands.
+              //
+              // MPI semantics, deliberate (audit D3, second pass): this
+              // throw is PER-RANK. The MPI wrapper's aer-0100 catch
+              // absorbs it, the rank reports no plan and adopts the
+              // MINLOC winner, and only the all-ranks-failed case is
+              // fatal -- carrying this message as that rank's own cause.
+              // A registration-verdict collective was added here once
+              // and REMOVED by audit: a collective inside the wrapper's
+              // per-rank-catchable region breaks the aer-0037/0100
+              // contract -- a sibling that throws earlier in find_path
+              // (cotengra import, mode mapping, list building) unwinds
+              // to the wrapper and enters the reconf-bound Allreduce,
+              // whose signature (1 x MPI_INT on MPI_COMM_WORLD) MATCHES
+              // a verdict Allreduce here, cross-matching the two into a
+              // silent wrong reduction. Divergent per-rank method mixes
+              // are a QUALITY difference only: the winning plan is
+              // broadcast, so every rank contracts the identical plan.
+              if (py::len(mlist) == 0)
+                throw std::runtime_error(
+                    "[AER_TN_PATH] AER_TN_PATH_METHODS requested only "
+                    "mt-kahypar and its registration failed (see the "
+                    "stderr line above); refusing to fall back to "
+                    "cotengra's default method mix silently. Fix the "
+                    "mtkahypar install or name additional methods.");
             }
           }
           if (py::len(mlist) > 0)
@@ -2725,6 +2771,24 @@ _aer_register_mtkahypar()
         eff_par = -1;
         fprintf(stderr, "[AER_TN_PATH] forge: serial search\n");
       }
+      // aer-0130 (F9): mt-kahypar trials must run SERIALLY. The container's
+      // cotengra parallel backend is loky (joblib vendors it; verified
+      // in-image: parse_parallel_arg(2) -> _ReusablePoolExecutor), and loky
+      // SPAWNS fresh interpreters: base_trial_fn resolves _PATH_FNS[method]
+      // inside the worker (hyper.py:128-130), where the py::exec
+      // registration never ran, so every parallel mt-kahypar trial dies on
+      // KeyError. Depth-parallelism replaces trial-parallelism here:
+      // AER_TN_MTKAHYPAR_THREADS puts the cores INSIDE each trial, where
+      // Mt-KaHyPar's threads cooperate on one hypergraph instead of
+      // multiplying trial memory. Runs after the forge check so a forge
+      // prints one serial line, not two.
+      if (eff_par != -1 && tn_mtk_state().registered) {
+        eff_par = -1;
+        fprintf(stderr,
+                "[AER_TN_PATH] mt-kahypar active: forcing serial trials "
+                "(loky workers cannot see the in-process registration); "
+                "set AER_TN_MTKAHYPAR_THREADS to use the cores per trial\n");
+      }
       // aer-0085: the probe is switchable, bounded, and never silent.
       // AER_TN_PATH_PROBE=0 disables it outright (a flag read: "0"
       // means off, unlike the value knobs where 0 falls to a default).
@@ -2736,8 +2800,12 @@ _aer_register_mtkahypar()
       if (probe_off && !tn_plan_forge())
         fprintf(stderr, "[AER_TN_PATH] probe: disabled by "
                         "AER_TN_PATH_PROBE=0 [skipped]\n");
+      // aer-0130 (audit D1): gate the probe on eff_par, not par. When
+      // mt-kahypar forced serial above, probing for a worker count that
+      // will not be used wastes a full trial and prints a nonsense
+      // '-1 worker(s)' line. Forge already skips via !tn_plan_forge().
       if (!tn_plan_forge() && !probe_off &&
-          std::getenv("AER_TN_PATH_PARALLEL") == nullptr && par >= 2) {
+          std::getenv("AER_TN_PATH_PARALLEL") == nullptr && eff_par >= 2) {
         uint64_t pb_budget = TensorNetPathMem::node_mem_budget_bytes(
             "/sys/fs/cgroup", "/sys/fs/cgroup/memory", "/proc/self/cgroup",
             "/proc/meminfo");
