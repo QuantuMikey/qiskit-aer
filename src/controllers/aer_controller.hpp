@@ -306,7 +306,22 @@ void Controller::set_config(const Config &config) {
     int nDev;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess) {
       cudaGetLastError();
-      throw std::runtime_error("No CUDA device available!");
+      // aer-0126: a FORGE-ONLY run (AER_TN_FORGE_ONLY=1, aer-0123) may
+      // proceed with zero devices -- the tensor-network contractor banks
+      // its plan at setup and exits before any GPU work, and every
+      // downstream consumer of the empty device list is no-op-safe:
+      // target_gpus_ stays empty, get_gpu_memory_mb() returns 0, and the
+      // executor's memory validation falls back to host memory. Every
+      // other method and configuration keeps the stock throw.
+      const char *fo = std::getenv("AER_TN_FORGE_ONLY");
+      const bool forge_only_tn = (method_ == Method::tensor_network) &&
+                                 fo != nullptr && fo[0] == '1' &&
+                                 fo[1] == '\0';
+      if (!forge_only_tn)
+        throw std::runtime_error("No CUDA device available!");
+      nDev = 0;
+      fprintf(stderr, "[TN FORGE-ONLY] no GPU visible to the controller; "
+                      "continuing for plan forge (aer-0126)\n");
     }
     if (config.target_gpus.has_value()) {
       target_gpus_ = config.target_gpus.value();
