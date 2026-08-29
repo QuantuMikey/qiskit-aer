@@ -757,6 +757,16 @@ static uint64_t tn_forge_budget_bytes() {
   return static_cast<uint64_t>(mb) << 20;
 }
 
+// aer-0131: escape hatch restoring the pre-0131 capture semantics
+// (capture-once: an existing key file is never touched, and no
+// provenance-named copy is written). Default OFF = the new keep-best
+// behavior. Directory mode only; single-file AER_TN_PLAN_FILE mode always
+// keeps the legacy semantics because the operator named one exact path.
+static bool tn_plan_capture_once() {
+  const char *v = std::getenv("AER_TN_PLAN_CAPTURE_ONCE");
+  return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
 // aer-0130: mt-kahypar registration outcome, shared by the methods block and
 // the parallel decision (two separate lexical blocks of find_path's kwargs
 // construction). Audit D4: a namespace-scope `static` here is PER-TU, and an

@@ -2029,8 +2029,20 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
         // below and the tile ceiling in the prebuild, so a stale file that
         // violates a ceiling refuses loudly rather than grinding.
         bool plan_from_file = false;
-        if (!plan_from_cache)
+        // aer-0131: a FORGE-ONLY run's product IS a fresh plan; replaying
+        // the key slot made every sweep require a manual move-aside of the
+        // banked file first (and a forgotten move silently voided the
+        // search). Forge-only now always searches; the capture leg below
+        // keeps the best plan, so a losing draw cannot displace the
+        // champion. Ordinary runs keep replay-on-hit untouched.
+        if (!plan_from_cache && tn_forge_only()) {
+          if (myrank_ == 0)
+            fprintf(stderr,
+                    "[TN FORGE-ONLY] plan-file replay skipped: forging a "
+                    "fresh plan (capture keeps best-so-far)\n");
+        } else if (!plan_from_cache) {
           plan_from_file = try_load_plan_file(engaged);
+        }
 
         std::chrono::steady_clock::time_point prof_path_t0;
         if (tn_profile())
@@ -3694,15 +3706,26 @@ void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
       tn_plan_path_for_key(key, nprocs_ > 1 ? nprocs_ : 0);
   if (path.empty())
     return;
-  {
+  // aer-0131: two capture modes. LEGACY (single-file AER_TN_PLAN_FILE mode,
+  // or AER_TN_PLAN_CAPTURE_ONCE=1): the pre-0131 capture-once semantics --
+  // probe, and never touch an existing file. DEFAULT (directory mode):
+  // every successful forge writes a PROVENANCE-NAMED file next to the key
+  // slot -- <key>[.rN].s<seed>.t<envelope>.f<flops>.j<jobid>.ctg -- so
+  // concurrent forges never discard a result and a plan's forging levers
+  // are readable from its name; then the key slot itself is PROMOTED only
+  // if this plan's total_flops beats what the slot holds (decode of the
+  // existing file gives its flops; an undecodable slot is replaced). The
+  // key slot therefore always holds the best known plan for the network,
+  // which is exactly what replay-on-hit should find. Two concurrent
+  // promoters can both beat the old slot and race the rename; rename is
+  // atomic on Lustre, so the slot ends holding one of the two winners,
+  // never a torn file, and both provenance copies persist regardless.
+  const bool legacy_capture = tn_plan_dir().empty() || tn_plan_capture_once();
+  if (legacy_capture) {
     std::ifstream probe(path.c_str());
     if (probe)
       return;
   }
-  // aer-0051: capture-quality gate. Checked against tiles_built_, the same
-  // counter the (now-deleted) hard tile ceiling read, so the two verdicts
-  // cannot drift. Refusing to WRITE (not to run) makes re-submission a
-  // retry-until-quality loop with no wasted result: this run's answer stands.
   if (tn_plan_file_max_tiles() > 0 && tiles_built_ > tn_plan_file_max_tiles()) {
     fprintf(stderr,
             "[AER_TN_PLAN_FILE] plan prebuilt %llu tiles, above the "
@@ -3722,15 +3745,55 @@ void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
             path.c_str());
     return;
   }
-  // aer-0064: the temp name carries the pid so that concurrent processes
-  // capturing the SAME topology (e.g. two array shards racing on first
-  // contact) never interleave writes into one temp file. Each writes its own
-  // self-consistent temp; rename is atomic within a directory on Lustre, so
-  // last rename wins with a valid file either way. The previous fixed
-  // "path.tmp" name was safe only because AER_TN_PLAN_FILE launchers happened
-  // to serialize captures; a shared plan directory removes that accident.
+  // aer-0131: the provenance descriptor. Seed and envelope are the two
+  // levers this session showed decide the outcome; flops is the outcome;
+  // epoch+pid disambiguates concurrent forges of one config on any host.
+  std::string capture_path = path;
+  if (!legacy_capture) {
+    char flops_buf[32];
+    snprintf(flops_buf, sizeof(flops_buf), "%.3e", plan_.total_flops);
+    std::string fdesc;
+    for (const char *c = flops_buf; *c; ++c) {
+      if (*c == '.' || *c == '+')
+        continue;
+      fdesc.push_back(*c);
+    }
+    const char *tenv = std::getenv("AER_TN_SLICE_TARGET_BYTES");
+    std::ostringstream desc;
+    desc << ".s" << (unsigned long long)tn_path_seed();
+    if (tenv != nullptr && tenv[0] != '\0') {
+      char *tend = nullptr;
+      unsigned long long tb = std::strtoull(tenv, &tend, 10);
+      if (tend != tenv && tb > 0)
+        desc << ".t" << (tb >> 30) << "g";
+      else
+        desc << ".td";
+    } else {
+      desc << ".td";
+    }
+    desc << ".f" << fdesc;
+    // aer-0131: scheduler-agnostic uniqueness. Epoch seconds + pid behaves
+    // identically on a laptop AMD GPU and on LUMI -- no SLURM assumption in
+    // a name a desktop user will read -- and epoch-first keeps siblings of
+    // one config chronologically sortable. Cross-node collision would need
+    // the same pid in the same second; provenance copies are additionally
+    // write-once (unique temp + rename), so a collision cannot tear a file.
+    desc << ".d"
+         << (unsigned long long)std::chrono::duration_cast<
+                std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count()
+         << ".p" << (unsigned long)getpid();
+    const std::string suffix = ".ctg";
+    if (capture_path.size() > suffix.size() &&
+        capture_path.compare(capture_path.size() - suffix.size(),
+                             suffix.size(), suffix) == 0)
+      capture_path.insert(capture_path.size() - suffix.size(), desc.str());
+    else
+      capture_path += desc.str();
+  }
   std::ostringstream tmpname;
-  tmpname << path << ".tmp." << (unsigned long)getpid();
+  tmpname << capture_path << ".tmp." << (unsigned long)getpid();
   const std::string tmp = tmpname.str();
   {
     std::ofstream f(tmp.c_str(), std::ios::trunc);
@@ -3752,19 +3815,74 @@ void TensorNetContractor_HipTensor<data_t>::maybe_write_plan_file(
       return;
     }
   }
-  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+  if (std::rename(tmp.c_str(), capture_path.c_str()) != 0) {
     fprintf(stderr,
             "[AER_TN_PLAN_FILE] rename %s -> %s failed; plan not captured\n",
-            tmp.c_str(), path.c_str());
+            tmp.c_str(), capture_path.c_str());
     std::remove(tmp.c_str());
     return;
   }
   fprintf(stderr,
           "[AER_TN_PLAN_FILE] captured plan to %s (steps=%zu slices=%llu "
           "tiles_prebuilt=%llu flops=%.3e)\n",
-          path.c_str(), plan_.steps.size(),
+          capture_path.c_str(), plan_.steps.size(),
           (unsigned long long)plan_.num_slices,
           (unsigned long long)tiles_built_, plan_.total_flops);
+  if (legacy_capture)
+    return;
+  // aer-0131: keep-best promotion of the key slot.
+  double existing_flops = -1.0;
+  bool have_existing = false;
+  {
+    std::ifstream f(path.c_str());
+    if (f) {
+      std::ostringstream ss;
+      ss << f.rdbuf();
+      const std::string existing_text = ss.str();
+      std::string why;
+      ContractionPlan existing;
+      if (plan_file_decode(existing_text, network_desc_, key, existing,
+                          why)) {
+        existing_flops = existing.total_flops;
+        have_existing = true;
+      }
+    }
+  }
+  if (have_existing && existing_flops <= plan_.total_flops) {
+    fprintf(stderr,
+            "[AER_TN_PLAN_FILE] kept existing %s (%.3e <= this run's %.3e); "
+            "best-so-far stands\n",
+            path.c_str(), existing_flops, plan_.total_flops);
+    return;
+  }
+  std::ostringstream ptmpname;
+  ptmpname << path << ".tmp." << (unsigned long)getpid();
+  const std::string ptmp = ptmpname.str();
+  {
+    std::ofstream f(ptmp.c_str(), std::ios::trunc);
+    if (!f)
+      return;
+    f << text;
+    f.flush();
+    if (!f) {
+      f.close();
+      std::remove(ptmp.c_str());
+      return;
+    }
+  }
+  if (std::rename(ptmp.c_str(), path.c_str()) != 0) {
+    std::remove(ptmp.c_str());
+    return;
+  }
+  if (have_existing)
+    fprintf(stderr,
+            "[AER_TN_PLAN_FILE] promoted to %s (%.3e beats existing %.3e)\n",
+            path.c_str(), plan_.total_flops, existing_flops);
+  else
+    fprintf(stderr,
+            "[AER_TN_PLAN_FILE] promoted to %s (slot was empty or "
+            "undecodable)\n",
+            path.c_str());
 }
 
 // aer-0037: agree the outcome of a setup phase across ranks.
