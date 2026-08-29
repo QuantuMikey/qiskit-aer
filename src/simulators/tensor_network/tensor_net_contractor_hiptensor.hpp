@@ -386,6 +386,9 @@ void dump_device_tensor(const char *label, void *dev_ptr, int64_t num_elements,
   std::vector<data_t> host_re(num_elements);
   std::vector<data_t> host_im(num_elements);
   const size_t pb = plane_bytes(num_elements, sizeof(data_t));
+  // syncorder: caller-synced. Every call site of this helper drains its
+  // stream first -- enforced by checks/syncorder.py, which fails if a dump
+  // call appears without a preceding hipStreamSynchronize.
   hipMemcpy(host_re.data(), dev_ptr,
             num_elements * sizeof(data_t), hipMemcpyDeviceToHost);
   hipMemcpy(host_im.data(),
@@ -417,6 +420,7 @@ void dump_device_interleaved(const char *label, const data_t *iv,
   if (!tn_debug()) return;
   int n_print = (int)std::min<int64_t>(num_elements, max_print);
   std::vector<data_t> host(static_cast<size_t>(2) * n_print);
+  // syncorder: caller-synced; see dump_device_planes above.
   hipMemcpy(host.data(), iv, static_cast<size_t>(2) * n_print * sizeof(data_t),
             hipMemcpyDeviceToHost);
   fprintf(stderr, "[AER_TN_DEBUG] %s [%ld elements, interleaved]:", label,
@@ -436,6 +440,7 @@ void dump_device_planes(const char *label, const data_t *re, const data_t *im,
   int n_print = (int)std::min<int64_t>(num_elements, max_print);
   std::vector<data_t> host_re(n_print);
   std::vector<data_t> host_im(n_print);
+  // syncorder: caller-synced; see dump_device_planes above.
   hipMemcpy(host_re.data(), re, n_print * sizeof(data_t),
             hipMemcpyDeviceToHost);
   hipMemcpy(host_im.data(), im, n_print * sizeof(data_t),
@@ -715,31 +720,16 @@ struct StageIdx {
   int64_t str[kStageMaxRank];
   int8_t shift[kStageMaxRank];
   bool pow2;
-  // aer-0133: length of the leading CONTIGUOUS RUN, in elements.
-  //
-  // The structural fact this rests on. The walk below decomposes i in mixed
-  // radix over (ext, str). If the first m modes carry exactly the natural
-  // packed strides 1, ext[0], ext[0]*ext[1], ... then writing i = q*run + r
-  // with run = ext[0]*...*ext[m-1] gives
-  //
-  //     offset(q * run + r) == h(q) + r        for every r in [0, run)
-  //
-  // because those m modes contribute precisely the low-order part of i and
-  // the remaining modes contribute a term h(q) that does not depend on r. So
-  // each aligned block of `run` consecutive DESTINATION elements reads from
-  // `run` consecutive SOURCE elements. run == 1 means the very first mode is
-  // already out of natural order and every element needs its own address.
-  //
-  // THE CONDITION IS DIVISIBILITY, NOT MAGNITUDE, and getting that wrong is a
-  // silent wrong-answer bug rather than a crash. A thread group starts at
-  // g*VEC and spans VEC elements; it stays inside ONE run-block only when VEC
-  // divides run. With run == 6 and VEC == 4, group 1 covers destination
-  // elements 4..7, whose true offsets are 4, 5, h(1)+0, h(1)+1 -- not four
-  // consecutive addresses. So the kernels test `run % VEC == 0`, which also
-  // subsumes run < VEC since run >= 1 always. These networks carry extent-2
-  // modes throughout, so run is a power of two and the test is satisfied
-  // whenever run >= VEC; the general form is what keeps the kernels correct on
-  // a network where extents are not all powers of two.
+  // aer-0133: length of the leading CONTIGUOUS RUN, in elements: the number
+  // of leading modes carrying the natural packed strides 1, ext[0],
+  // ext[0]*ext[1], ...  Writing i = q*run + r gives
+  //     offset(q * run + r) == h(q) + r      for every r in [0, run)
+  // so run measures how much of each destination block reads consecutive
+  // source addresses. Kept after the grouped kernels were deleted (aer-0135)
+  // because the RUN HISTOGRAM it feeds is the measurement that killed them:
+  // 55% of p=8 pack volume sits at run >= 128 (already coalesced by the
+  // scalar kernels), 36% at run == 1 (the only genuinely scattered part, and
+  // the sole legitimate target for any future kernel work).
   int64_t run;
   void fill(const std::vector<int64_t> &extents,
             const std::vector<int64_t> &strides) {
@@ -866,162 +856,6 @@ template <typename data_t> struct interleaved_scatter_func_hip {
 
 
 
-// aer-0133: the GROUPED forms of the four pack-region kernels. Each thread
-// handles VEC complex elements instead of one. Two independent wins, carried
-// by the same code:
-//
-//   MEMORY-LEVEL PARALLELISM. The scalar kernels run up to kStageMaxRank
-//   dependent integer operations to build ONE address and then issue ONE
-//   load, so a thread holds a single request in flight and the device waits
-//   on address latency. VEC independent addresses give VEC concurrent
-//   requests per thread. This applies whether or not anything is contiguous.
-//
-//   COALESCING. When StageIdx::run >= VEC the VEC addresses are consecutive
-//   (see the run derivation at its declaration), so ONE address computation
-//   covers the group and the accesses fall in one or two cache lines instead
-//   of VEC scattered ones. The test reads a kernel argument that is uniform
-//   across the wavefront, so the branch never diverges.
-//
-// CORRECTNESS. This changes WHICH THREAD MOVES WHICH ELEMENT and nothing
-// else: every element is read from the same source address and written to the
-// same destination address as before, so the destination buffer is
-// bit-identical to the scalar kernels' -- byte for byte, not approximately.
-// There is no floating-point arithmetic anywhere in these kernels to reorder.
-// The launcher picks VEC only when it divides the element count, so no tail
-// case exists.
-template <typename data_t, int VEC> struct interleave_pack_vec_hip {
-  const data_t *src_re;
-  const data_t *src_im;
-  data_t *dst;
-  StageIdx idx;
-  __host__ __device__ void operator()(const uint_t &g) const {
-    const uint_t base = g * static_cast<uint_t>(VEC);
-    if (idx.run % static_cast<int64_t>(VEC) == 0) {
-      const int64_t o = idx.offset(base);
-      for (int v = 0; v < VEC; ++v) {
-        dst[2 * (base + v)] = src_re[o + v];
-        dst[2 * (base + v) + 1] = src_im[o + v];
-      }
-    } else {
-      for (int v = 0; v < VEC; ++v) {
-        const int64_t o = idx.offset(base + v);
-        dst[2 * (base + v)] = src_re[o];
-        dst[2 * (base + v) + 1] = src_im[o];
-      }
-    }
-  }
-};
-
-template <typename data_t, int VEC> struct deinterleave_scatter_vec_hip {
-  const data_t *src;
-  data_t *dst_re;
-  data_t *dst_im;
-  StageIdx idx;
-  __host__ __device__ void operator()(const uint_t &g) const {
-    const uint_t base = g * static_cast<uint_t>(VEC);
-    if (idx.run % static_cast<int64_t>(VEC) == 0) {
-      const int64_t o = idx.offset(base);
-      for (int v = 0; v < VEC; ++v) {
-        dst_re[o + v] = src[2 * (base + v)];
-        dst_im[o + v] = src[2 * (base + v) + 1];
-      }
-    } else {
-      for (int v = 0; v < VEC; ++v) {
-        const int64_t o = idx.offset(base + v);
-        dst_re[o] = src[2 * (base + v)];
-        dst_im[o] = src[2 * (base + v) + 1];
-      }
-    }
-  }
-};
-
-template <typename data_t, int VEC> struct interleave_repack_vec_hip {
-  const data_t *src;
-  data_t *dst;
-  StageIdx idx;
-  __host__ __device__ void operator()(const uint_t &g) const {
-    const uint_t base = g * static_cast<uint_t>(VEC);
-    if (idx.run % static_cast<int64_t>(VEC) == 0) {
-      const int64_t o = idx.offset(base);
-      for (int v = 0; v < VEC; ++v) {
-        dst[2 * (base + v)] = src[2 * (o + v)];
-        dst[2 * (base + v) + 1] = src[2 * (o + v) + 1];
-      }
-    } else {
-      for (int v = 0; v < VEC; ++v) {
-        const int64_t o = idx.offset(base + v);
-        dst[2 * (base + v)] = src[2 * o];
-        dst[2 * (base + v) + 1] = src[2 * o + 1];
-      }
-    }
-  }
-};
-
-template <typename data_t, int VEC> struct interleaved_scatter_vec_hip {
-  const data_t *src;
-  data_t *dst;
-  StageIdx idx;
-  __host__ __device__ void operator()(const uint_t &g) const {
-    const uint_t base = g * static_cast<uint_t>(VEC);
-    if (idx.run % static_cast<int64_t>(VEC) == 0) {
-      const int64_t o = idx.offset(base);
-      for (int v = 0; v < VEC; ++v) {
-        dst[2 * (o + v)] = src[2 * (base + v)];
-        dst[2 * (o + v) + 1] = src[2 * (base + v) + 1];
-      }
-    } else {
-      for (int v = 0; v < VEC; ++v) {
-        const int64_t o = idx.offset(base + v);
-        dst[2 * o] = src[2 * (base + v)];
-        dst[2 * o + 1] = src[2 * (base + v) + 1];
-      }
-    }
-  }
-};
-
-// aer-0133: the widest group a thread may take. Four complex elements is 64 B
-// on the contiguous side -- one cache line -- past which widening stops buying
-// transactions and starts costing occupancy and registers. Raising it is a
-// measured ladder against pack_gbps_enqueue, not a guess, so it is a named
-// constant rather than a literal.
-static const int kPackVecMax = 4;
-
-// aer-0133: AER_TN_PACK_VEC overrides the group width (1 restores the exact
-// pre-0133 scalar kernels for an A/B without a rebuild; the default is
-// kPackVecMax). The kernels are bit-identical at every width, so this lever
-// changes throughput only -- it is a measurement knob, not an accuracy one,
-// and that is why it may default ON.
-static int tn_pack_vec() {
-  static bool checked = false;
-  static int cached = kPackVecMax;
-  if (!checked) {
-    const char *v = std::getenv("AER_TN_PACK_VEC");
-    if (v != nullptr && v[0] != '\0') {
-      const long got = std::strtol(v, nullptr, 10);
-      if (got == 1 || got == 2 || got == 4)
-        cached = static_cast<int>(got);
-      else
-        fprintf(stderr,
-                "[AER_TN] warning: AER_TN_PACK_VEC='%s' is not 1, 2 or 4; "
-                "using %d\n",
-                v, cached);
-    }
-    checked = true;
-  }
-  return cached;
-}
-
-// aer-0133: VEC must divide the element count exactly so the kernels need no
-// tail branch. These networks carry extent-2 modes throughout, so n is a power
-// of two and this lands on the requested width; the divisibility test is what
-// keeps the kernels correct on a network where it is not.
-static int pack_vec_width(uint64_t n) {
-  int v = tn_pack_vec();
-  while (v > 1 && (n % static_cast<uint64_t>(v)) != 0)
-    v /= 2;
-  return v;
-}
-
 // aer-0133: shape census for the pack region, filled by the launchers below.
 // Bucket b holds the element count whose leading contiguous run was in
 // [2^b, 2^(b+1)); bucket 0 is run == 1, the fully scattered case. This is the
@@ -1042,88 +876,60 @@ inline void pack_note_run(int64_t run, uint64_t n) {
 
 // aer-0115: prebuilt-index overloads. No fill, no element-count loop -- the
 // launch does nothing but copy the functor and enqueue.
-// aer-0133: each now selects the grouped kernel. VEC is a compile-time
-// parameter, so the three instantiations are separate kernels and the group
-// loop unrolls; VEC == 1 dispatches the original scalar functor unchanged, so
-// AER_TN_PACK_VEC=1 is exactly the pre-0133 code path.
+//
+// aer-0135: enqueue is now the RIGHT word for the first time. rocThrust's
+// plain `par` policy ends every algorithm in synchronize_optional
+// (parallel_for.h:146 -> util.h:127-147 -> hipStreamSynchronize on this
+// rocThrust, probed in-container, job 21614xxx), so every launch in this
+// fork's history blocked the host until the device finished -- ~750k
+// round-trips per rank on the p=8 reference. par_nosync (par.h:133/:283)
+// exists precisely to skip that tail sync. Stream order still serializes
+// every kernel and the aer-0116 memcpy against each other, so results are
+// bit-identical; the ONE completion point the host actually needs is the
+// unconditional barrier at the end of contract_all(), where the audit put
+// it. aer-0133's grouped kernels are deleted outright rather than levered
+// off: the run histogram they shipped showed 55% of pack volume already
+// contiguous, refuting the approach, and a dead capability is removed, not
+// preserved (matrix rule). The scalar functors below are byte-identical to
+// pre-0133.
 template <typename data_t>
 static void interleave_pack(hipStream_t stream, const data_t *src_re, const data_t *src_im, data_t *dst,
                             const StageIdx &idx, uint64_t n) {
+  interleave_pack_func_hip<data_t> f;
+  f.idx = idx;
+  f.src_re = src_re; f.src_im = src_im; f.dst = dst;
   auto ci = thrust::counting_iterator<uint_t>(0);
-  const int vec = pack_vec_width(n);
-  if (vec == 4) {
-    interleave_pack_vec_hip<data_t, 4> f;
-    f.idx = idx; f.src_re = src_re; f.src_im = src_im; f.dst = dst;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 4, f);
-  } else if (vec == 2) {
-    interleave_pack_vec_hip<data_t, 2> f;
-    f.idx = idx; f.src_re = src_re; f.src_im = src_im; f.dst = dst;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 2, f);
-  } else {
-    interleave_pack_func_hip<data_t> f;
-    f.idx = idx; f.src_re = src_re; f.src_im = src_im; f.dst = dst;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
-  }
+  thrust::for_each_n(thrust_gpu::par_nosync.on(stream), ci, n, f);
 }
 
 template <typename data_t>
 static void deinterleave_scatter(hipStream_t stream, const data_t *src, data_t *dst_re, data_t *dst_im,
                             const StageIdx &idx, uint64_t n) {
+  deinterleave_scatter_func_hip<data_t> f;
+  f.idx = idx;
+  f.src = src; f.dst_re = dst_re; f.dst_im = dst_im;
   auto ci = thrust::counting_iterator<uint_t>(0);
-  const int vec = pack_vec_width(n);
-  if (vec == 4) {
-    deinterleave_scatter_vec_hip<data_t, 4> f;
-    f.idx = idx; f.src = src; f.dst_re = dst_re; f.dst_im = dst_im;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 4, f);
-  } else if (vec == 2) {
-    deinterleave_scatter_vec_hip<data_t, 2> f;
-    f.idx = idx; f.src = src; f.dst_re = dst_re; f.dst_im = dst_im;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 2, f);
-  } else {
-    deinterleave_scatter_func_hip<data_t> f;
-    f.idx = idx; f.src = src; f.dst_re = dst_re; f.dst_im = dst_im;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
-  }
+  thrust::for_each_n(thrust_gpu::par_nosync.on(stream), ci, n, f);
 }
 
 template <typename data_t>
 static void interleave_repack(hipStream_t stream, const data_t *src, data_t *dst,
                             const StageIdx &idx, uint64_t n) {
+  interleave_repack_func_hip<data_t> f;
+  f.idx = idx;
+  f.src = src; f.dst = dst;
   auto ci = thrust::counting_iterator<uint_t>(0);
-  const int vec = pack_vec_width(n);
-  if (vec == 4) {
-    interleave_repack_vec_hip<data_t, 4> f;
-    f.idx = idx; f.src = src; f.dst = dst;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 4, f);
-  } else if (vec == 2) {
-    interleave_repack_vec_hip<data_t, 2> f;
-    f.idx = idx; f.src = src; f.dst = dst;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 2, f);
-  } else {
-    interleave_repack_func_hip<data_t> f;
-    f.idx = idx; f.src = src; f.dst = dst;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
-  }
+  thrust::for_each_n(thrust_gpu::par_nosync.on(stream), ci, n, f);
 }
 
 template <typename data_t>
 static void interleaved_scatter(hipStream_t stream, const data_t *src, data_t *dst,
                             const StageIdx &idx, uint64_t n) {
+  interleaved_scatter_func_hip<data_t> f;
+  f.idx = idx;
+  f.src = src; f.dst = dst;
   auto ci = thrust::counting_iterator<uint_t>(0);
-  const int vec = pack_vec_width(n);
-  if (vec == 4) {
-    interleaved_scatter_vec_hip<data_t, 4> f;
-    f.idx = idx; f.src = src; f.dst = dst;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 4, f);
-  } else if (vec == 2) {
-    interleaved_scatter_vec_hip<data_t, 2> f;
-    f.idx = idx; f.src = src; f.dst = dst;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 2, f);
-  } else {
-    interleaved_scatter_func_hip<data_t> f;
-    f.idx = idx; f.src = src; f.dst = dst;
-    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
-  }
+  thrust::for_each_n(thrust_gpu::par_nosync.on(stream), ci, n, f);
 }
 
 // aer-0133: the extents-based entry points now DELEGATE to the
@@ -1192,10 +998,10 @@ static void stage_pack(hipStream_t stream, const data_t *src_re,
   auto ci = thrust::counting_iterator<uint_t>(0);
   f.src = src_re;
   f.dst = dst_re;
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  thrust::for_each_n(thrust_gpu::par_nosync.on(stream), ci, n, f);
   f.src = src_im;
   f.dst = dst_im;
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  thrust::for_each_n(thrust_gpu::par_nosync.on(stream), ci, n, f);
 }
 
 // Scatter a packed scratch result (both planes) back into the strided parent.
@@ -1217,10 +1023,10 @@ static void stage_scatter(hipStream_t stream, const data_t *src_re,
   auto ci = thrust::counting_iterator<uint_t>(0);
   f.src = src_re;
   f.dst = dst_re;
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  thrust::for_each_n(thrust_gpu::par_nosync.on(stream), ci, n, f);
   f.src = src_im;
   f.dst = dst_im;
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  thrust::for_each_n(thrust_gpu::par_nosync.on(stream), ci, n, f);
 }
 
 //=============================================================================
@@ -1424,21 +1230,6 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // constant between the counter and the printed figure.
   uint64_t prof_pack_rw_elems_ = 0;
   uint64_t prof_pack_calls_ = 0;
-  // aer-0133: the same volume split by ROLE -- operand gathers (A and B)
-  // versus result stores (C). The two are not symmetric on hardware even at
-  // equal volume: a gather reads scattered and writes contiguous, while
-  // deinterleave_scatter writes 8 scattered bytes per element, a PARTIAL
-  // cache line, which forces a read-modify-write of the whole line. If the
-  // store side turns out to cost materially more per byte, the next patch is
-  // to stop storing split-complex at all (extending aer-0114's interleaved
-  // store to the final output slot), not to sharpen the gather further. That
-  // is a different patch, and this counter is what chooses between them.
-  // t_pack_ms remains the whole region, so operand + store here sum to
-  // prof_pack_rw_elems_ exactly.
-  uint64_t prof_pack_operand_elems_ = 0;
-  uint64_t prof_pack_store_elems_ = 0;
-  double prof_pack_operand_ms_ = 0.0;
-  double prof_pack_store_ms_ = 0.0;
 
   // Split-complex plane pointers for one tensor: re/im are independent
   // because slice projection advances both planes by the slice's element
@@ -2053,10 +1844,6 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_gemm_only_ms_ = 0.0;
     prof_pack_rw_elems_ = 0;
     prof_pack_calls_ = 0;
-    prof_pack_operand_elems_ = 0;
-    prof_pack_store_elems_ = 0;
-    prof_pack_operand_ms_ = 0.0;
-    prof_pack_store_ms_ = 0.0;
     // aer-0133: the run histogram resets with every other profile counter.
     // Without this, a process running several contractions (or a setup retry
     // after output-bound corruption, aer-0025) accumulates distributions from
@@ -2742,7 +2529,7 @@ template <typename data_t>
 void TensorNetContractor_HipTensor<data_t>::report_slice_invariance() {
   if (myrank_ != 0 || !tn_profile())
     return;
-  const size_t num_inputs = sliced_input_specs_.size();
+  const size_t num_inputs = network_desc_.tensors.size();
   const size_t num_steps = plan_.steps.size();
   if (num_steps == 0 || all_specs_.size() < num_inputs + num_steps)
     return;
@@ -2757,9 +2544,16 @@ void TensorNetContractor_HipTensor<data_t>::report_slice_invariance() {
   // touched[i] is true when a sliced mode appears anywhere beneath tensor i.
   // Inputs are leaves; steps inherit from both children. plan_.steps is in
   // execution order, so one forward pass suffices.
+  // aer-0135: the FULL network modes, not sliced_input_specs_. The first
+  // build shipped with the projected specs here, and build_sliced_specs
+  // only pushes modes that are NOT sliced -- so the census tested
+  // already-stripped specs for sliced modes, found none anywhere, and
+  // reported 100% invariant on a plan whose true answer it had erased
+  // before looking (field run 21613620). network_desc_.tensors is the
+  // pre-projection truth build_sliced_specs itself reads from.
   std::vector<char> touched(num_inputs + num_steps, 0);
   for (size_t i = 0; i < num_inputs; i++) {
-    const std::vector<int32_t> &m = sliced_input_specs_[i].modes;
+    const std::vector<int32_t> &m = network_desc_.tensors[i].modes;
     for (size_t k = 0; k < m.size(); k++)
       if (sliced.count(m[k])) {
         touched[i] = 1;
@@ -4383,43 +4177,28 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
       (contract_s > 0.0) ? (local_flops / contract_s / 1.0e9) : 0.0;
   const double t_total = prof_setup_ms_ + prof_contract_ms_ +
                          prof_reduce_gpu_ms_ + prof_reduce_mpi_ms_;
-  // aer-0132: the pack region as a RATE. Bytes are the counted read-and-write
-  // touches times the complex element width -- the whole conversion, with no
-  // factor applied here that is not visible at the call sites.
+  // aer-0132/0135: the pack VOLUME facts. Bytes are counted read-and-write
+  // touches times the complex element width, with no factor applied here
+  // that is not visible at the call sites. These feed the forge-time wall
+  // predictor (pack_rw_elems == 4x the plan write line, measured exact at
+  // p=8, job 21608137) and are unchanged by aer-0135.
   //
-  // pack_gbps_enqueue is named for its denominator: prof_pack_ms_ is ENQUEUE,
-  // not execution. It is a usable proxy for one measured reason -- job 21545804
-  // put the region at 558.8 us per dispatch against a 9.25 us hipBLAS dispatch
-  // floor on equally asynchronous launches, and the only available reading of a
-  // 60x gap is the host blocking on a saturated launch queue. If that stops
-  // holding, the rate reads LOW, never high: a low figure still demands an
-  // explanation, a high one cannot be an artefact of this substitution.
+  // What aer-0135 REMOVED here, and why: pack_gbps_enqueue and the
+  // operand/store split. Both were built on the belief that t_pack_ms was
+  // device drain observed through a saturated launch queue. The
+  // in-container probe falsified the mechanism: rocThrust's plain `par`
+  // synchronized the host after every launch (parallel_for.h:146 ->
+  // util.h:127-147 -> hipStreamSynchronize), so t_pack_ms was device time
+  // measured synchronously -- and the 187x operand/store asymmetry was an
+  // artifact of where the previous step's drain landed, not a per-kernel
+  // property. Under par_nosync, t_pack_ms and t_gemm_only_ms collapse to
+  // true microsecond-scale enqueue, useful only as launch-cost accounting;
+  // the wall figure is t_contract_ms, which includes the single
+  // contract_all barrier and is the only denominator a bandwidth claim may
+  // use.
   const double pack_bytes =
       static_cast<double>(prof_pack_rw_elems_) *
       static_cast<double>(2 * sizeof(data_t));
-  const double pack_gbps =
-      (prof_pack_ms_ > 0.0) ? pack_bytes / (prof_pack_ms_ / 1000.0) / 1.0e9
-                            : 0.0;
-  // aer-0133: the same rate for each half of the region. A gather reads
-  // scattered and writes contiguous; a split-complex store writes scattered
-  // 8-byte words, i.e. partial cache lines, which the hardware must
-  // read-modify-write. If store_gbps sits well below operand_gbps at
-  // comparable volume, that asymmetry is real and the next patch is to stop
-  // storing split-complex, not to sharpen the gather further.
-  const double pack_operand_bytes =
-      static_cast<double>(prof_pack_operand_elems_) *
-      static_cast<double>(2 * sizeof(data_t));
-  const double pack_store_bytes =
-      static_cast<double>(prof_pack_store_elems_) *
-      static_cast<double>(2 * sizeof(data_t));
-  const double pack_operand_gbps =
-      (prof_pack_operand_ms_ > 0.0)
-          ? pack_operand_bytes / (prof_pack_operand_ms_ / 1000.0) / 1.0e9
-          : 0.0;
-  const double pack_store_gbps =
-      (prof_pack_store_ms_ > 0.0)
-          ? pack_store_bytes / (prof_pack_store_ms_ / 1000.0) / 1.0e9
-          : 0.0;
   // aer-0133: the contiguous-run distribution, as element counts per bucket
   // b = floor(log2(run)), bucket 0 being run == 1 (nothing contiguous). This
   // says whether the vectorised path reaches most of the volume; if bucket 0
@@ -4451,7 +4230,7 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
             "counted volume -- either no pack kernel ran in any routed-step "
             "window (all-classic-accept run on the AER_TN_GEMM_COMPLEX=0 "
             "arm; the time is branch overhead) or a kernel is missing its "
-            "aer-0132 tally; pack_gbps_enqueue=0.0 is not meaningful\n",
+            "aer-0132 tally; the pack volume figures are not meaningful\n",
             prof_pack_ms_);
   fprintf(stderr,
           "[AER_TN_PROFILE] entry=%s rank=%d nprocs=%d ndev=%d slices=%lu "
@@ -4464,8 +4243,6 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           "graph_replays=%lu graph_captures=%lu "
           "t_pack_ms=%.3f t_gemm_only_ms=%.3f "
           "pack_rw_elems=%lu pack_calls=%lu pack_bytes=%.3e "
-          "pack_gbps_enqueue=%.1f pack_vec=%d "
-          "pack_operand_gbps=%.1f pack_store_gbps=%.1f "
           "pack_run_hist=%s\n",
           entrypoint, myrank_, nprocs_, num_devices_used_,
           (unsigned long)plan_.num_slices, (unsigned long)slices_local,
@@ -4484,8 +4261,7 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           (unsigned long)prof_graph_captures_,
           prof_pack_ms_, prof_gemm_only_ms_,
           (unsigned long)prof_pack_rw_elems_, (unsigned long)prof_pack_calls_,
-          pack_bytes, pack_gbps, tn_pack_vec(),
-          pack_operand_gbps, pack_store_gbps, run_hist.c_str());
+          pack_bytes, run_hist.c_str());
 
   if (AER::TensorNetwork::log_times()) {
     // aer-0110: emit the run.* phases in the aer-0109 vocabulary, sharing its
@@ -4817,7 +4593,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
   if (slice_end_ <= slice_begin_) {
     hipSetDevice(gpu_mgr_.device(0).device_id());
     auto &out_buf = gpu_mgr_.device(0).output_buffer();
-    thrust::fill(thrust_gpu::par.on(gpu_mgr_.device(0).stream()),
+    thrust::fill(thrust_gpu::par_nosync.on(gpu_mgr_.device(0).stream()),
                  out_buf.begin(), out_buf.begin() + out_size_,
                  thrust::complex<data_t>(0.0, 0.0));
     return;
@@ -4857,7 +4633,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
     }
 
     auto &out_buf = gpu_mgr_.device(idev).output_buffer();
-    thrust::fill(thrust_gpu::par.on(gpu_mgr_.device(idev).stream()),
+    thrust::fill(thrust_gpu::par_nosync.on(gpu_mgr_.device(idev).stream()),
                  out_buf.begin(),
                  out_buf.begin() + (size_t)out_size_ * (size_t)dev_slots,
                  thrust::complex<data_t>(0.0, 0.0));
@@ -4893,6 +4669,24 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
       gpu_mgr_.device(idev).sync_all_slots();
       gpu_mgr_.device(idev).reduce_output_slots(out_size_, dev_slots);
     }
+    // aer-0135: THE completion barrier, and deliberately the only one on the
+    // hot path. Every launch above now uses par_nosync, so nothing before
+    // this line waits for the device; stream order alone serializes the
+    // kernels and the aer-0116 memcpy against each other, which is all
+    // correctness needs until a HOST consumer reads device memory. Those
+    // consumers -- trace_output, get_output, the MPI trace reduction, the
+    // per-shot sampler -- all run after contract_all returns, and the
+    // streams are hipStreamNonBlocking (gpu_resource_manager.hpp:766), so a
+    // plain hipMemcpy would NOT implicitly wait for them. This sync is what
+    // makes every one of those reads safe, unconditionally; the
+    // profiling-gated prof_sync_devices() in contract_and_trace was never a
+    // correctness barrier and must not be mistaken for one. For dev_slots >
+    // 1 it repeats the join above at the cost of a no-op call. The full
+    // audit of every launch and every host read is in the aer-0135 commit
+    // message; the sites that keep their own explicit syncs (debug dumps,
+    // fault-inject read, sampler tail, redistribute, hoist fills) are
+    // enumerated there.
+    gpu_mgr_.device(idev).sync_all_slots();
   }
 }
 
@@ -4999,10 +4793,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   // capture ratio.
   const uint64_t snap_pack_rw_elems = prof_pack_rw_elems_;
   const uint64_t snap_pack_calls = prof_pack_calls_;
-  const uint64_t snap_pack_operand_elems = prof_pack_operand_elems_;
-  const uint64_t snap_pack_store_elems = prof_pack_store_elems_;
-  const double snap_pack_operand_ms = prof_pack_operand_ms_;
-  const double snap_pack_store_ms = prof_pack_store_ms_;
   const uint64_t snap_gemm_calls = prof_gemm_calls_;
   const uint64_t snap_ht_calls = prof_ht_calls_;
   hipGraph_t graph = nullptr;
@@ -5020,10 +4810,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     prof_gemm_only_ms_ = snap_gemm_only_ms;
     prof_pack_rw_elems_ = snap_pack_rw_elems;
     prof_pack_calls_ = snap_pack_calls;
-    prof_pack_operand_elems_ = snap_pack_operand_elems;
-    prof_pack_store_elems_ = snap_pack_store_elems;
-    prof_pack_operand_ms_ = snap_pack_operand_ms;
-    prof_pack_store_ms_ = snap_pack_store_ms;
     prof_gemm_calls_ = snap_gemm_calls;
     prof_ht_calls_ = snap_ht_calls;
     err = hipStreamEndCapture(dev.stream(stream_slot), &graph);
@@ -5107,6 +4893,13 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
   project_slice(slice_index, device_idx, all_planes);
 
   if (tn_debug()) {
+    // aer-0135: drain before any host-visible read. These are input planes,
+    // which setup uploads and no kernel writes, so the read is safe on its
+    // own merits -- but under par_nosync the PREVIOUS slice may still be in
+    // flight, and every dump site must be synced for the syncorder gate's
+    // rule to hold without exceptions. tn_debug() is off by default, so this
+    // costs production nothing.
+    hipStreamSynchronize(dev.stream(stream_slot));
     for (size_t i = 0; i < num_inputs; i++) {
       char label[64];
       snprintf(label, sizeof(label), "  input[%zu]", i);
@@ -5197,14 +4990,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
       // ratio states its own and nothing downstream needs to change.
       uint64_t step_pack_rw = 0;
       uint64_t step_pack_calls = 0;
-      // aer-0133: the same tally split by role, plus one extra stamp taken
-      // where the operand gathers end and the GEMM begins. Operand time is
-      // [g0, g1) and store time is [g2, end), which is exactly how aer-0112
-      // already partitions the window -- this only names the two halves it
-      // was lumping together. Three extra chrono reads per routed step, ~25 ns
-      // each, ~30 ms over a 100 s p=8 replay: 0.03%, and profile-gated.
-      uint64_t step_pack_operand = 0;
-      uint64_t step_pack_store = 0;
       // aer-0052: a permuted step packs its operands into scratch first (the
       // same stage_pack the WS-3 tile staging uses -- the permutation IS a
       // strided view: destination-order extents with the source's column-major
@@ -5248,7 +5033,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           // aer-0132: the AER_TN_GEMM_COMPLEX=0 arm is counted too, so the
           // four-GEMM A/B stays measurable rather than reporting zero volume.
           step_pack_rw += 2 * stage_block_elems(ps.perm_ext_a);
-          step_pack_operand += 2 * stage_block_elems(ps.perm_ext_a);
           step_pack_calls++;
           g_a_re = pbase + 0 * pe;
           g_a_im = pbase + 1 * pe;
@@ -5257,7 +5041,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           stage_pack<data_t>(dev.stream(stream_slot), g_b_re, g_b_im, pbase + 2 * pe,
                              pbase + 3 * pe, ps.perm_ext_b, ps.perm_str_b);
           step_pack_rw += 2 * stage_block_elems(ps.perm_ext_b);
-          step_pack_operand += 2 * stage_block_elems(ps.perm_ext_b);
           step_pack_calls++;
           g_b_re = pbase + 2 * pe;
           g_b_im = pbase + 3 * pe;
@@ -5303,14 +5086,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           interleave_repack<data_t>(dev.stream(stream_slot), all_planes[left].re,
                                     zbase + 0 * pe, ps.sidx_a, ps.sn_a);
           step_pack_rw += 2 * ps.sn_a;
-          step_pack_operand += 2 * ps.sn_a;
           step_pack_calls++;
         } else {
           interleave_pack<data_t>(dev.stream(stream_slot), all_planes[left].re,
                                   all_planes[left].im, zbase + 0 * pe,
                                   ps.sidx_a, ps.sn_a);
           step_pack_rw += 2 * ps.sn_a;
-          step_pack_operand += 2 * ps.sn_a;
           step_pack_calls++;
         }
         if (all_planes[right].il && ps.perm_ext_b.empty()) {
@@ -5319,14 +5100,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           interleave_repack<data_t>(dev.stream(stream_slot), all_planes[right].re,
                                     zbase + 2 * pe, ps.sidx_b, ps.sn_b);
           step_pack_rw += 2 * ps.sn_b;
-          step_pack_operand += 2 * ps.sn_b;
           step_pack_calls++;
         } else {
           interleave_pack<data_t>(dev.stream(stream_slot), all_planes[right].re,
                                   all_planes[right].im, zbase + 2 * pe,
                                   ps.sidx_b, ps.sn_b);
           step_pack_rw += 2 * ps.sn_b;
-          step_pack_operand += 2 * ps.sn_b;
           step_pack_calls++;
         }
         if (tn_profile()) prof_g1 = std::chrono::steady_clock::now();
@@ -5359,7 +5138,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                          ps.sidx_c, ps.sn_c);
           }
           step_pack_rw += 2 * ps.sn_c;
-          step_pack_store += 2 * ps.sn_c;
           step_pack_calls++;
         } else if (il_store) {
           // Non-corder: the GEMM result is already in declared (C) order, so
@@ -5380,7 +5158,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           // omitting it would make the rate read high on exactly the steps
           // aer-0116 optimised.
           step_pack_rw += 2 * static_cast<uint64_t>(c_nat);
-          step_pack_store += 2 * static_cast<uint64_t>(c_nat);
           step_pack_calls++;
         } else {
           // aer-0114 (§6 note): ps.lin_ext/lin_str are {c_nat} and {1}, computed
@@ -5390,7 +5167,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                        all_planes[result_idx].im,
                                        ps.sidx_c, ps.sn_c);
           step_pack_rw += 2 * ps.sn_c;
-          step_pack_store += 2 * ps.sn_c;
           step_pack_calls++;
         }
         if (il_store) {
@@ -5440,12 +5216,6 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         // here so time and volume are written in one place and cannot diverge.
         prof_pack_rw_elems_ += step_pack_rw;
         prof_pack_calls_ += step_pack_calls;
-        // aer-0133: [g0,g1) is operand staging, [g2,end) is the result store.
-        // Same window, same guard, so the two sum to prof_pack_ms_ exactly.
-        prof_pack_operand_elems_ += step_pack_operand;
-        prof_pack_store_elems_ += step_pack_store;
-        prof_pack_operand_ms_ += tn_ms_between(prof_g0, prof_g1);
-        prof_pack_store_ms_ += whole - tn_ms_between(prof_g0, prof_g2);
       }
 
     }
@@ -5606,20 +5376,25 @@ void TensorNetContractor_HipTensor<data_t>::accumulate_across_gpus() {
             != hipSuccess)
           hipGetLastError();
         thrust::transform(
-            thrust_gpu::par.on(gpu_mgr_.device(dst_dev).stream()),
+            thrust_gpu::par_nosync.on(gpu_mgr_.device(dst_dev).stream()),
             dst_buf.begin(), dst_buf.begin() + out_size_, src_buf.begin(),
             dst_buf.begin(), thrust::plus<thrust::complex<data_t>>());
       } else {
         std::vector<std::complex<data_t>> host_buf(out_size_);
         hipSetDevice(gpu_mgr_.device(src_dev).device_id());
+        // syncorder: source-completed -- runs after the contract_all
+        // barrier, and each pairwise iteration ends in the explicit dst
+        // stream sync below, so src_buf is final before this D2H.
         hipMemcpy(host_buf.data(), thrust::raw_pointer_cast(src_buf.data()),
                   out_size_ * sizeof(std::complex<data_t>), hipMemcpyDeviceToHost);
         hipSetDevice(gpu_mgr_.device(dst_dev).device_id());
         thrust::device_vector<thrust::complex<data_t>> tmp(out_size_);
+        // syncorder: H2D into a freshly constructed buffer with no pending
+        // writers; the blocking copy itself is the ordering.
         hipMemcpy(thrust::raw_pointer_cast(tmp.data()), host_buf.data(),
                   out_size_ * sizeof(std::complex<data_t>), hipMemcpyHostToDevice);
         thrust::transform(
-            thrust_gpu::par.on(gpu_mgr_.device(dst_dev).stream()),
+            thrust_gpu::par_nosync.on(gpu_mgr_.device(dst_dev).stream()),
             dst_buf.begin(), dst_buf.begin() + out_size_, tmp.begin(),
             dst_buf.begin(), thrust::plus<thrust::complex<data_t>>());
         hipStreamSynchronize(gpu_mgr_.device(dst_dev).stream());
@@ -5689,7 +5464,7 @@ double TensorNetContractor_HipTensor<data_t>::sample_measure_on_primary(
   QV::Chunk::strided_range<thrust::complex<data_t> *> iter(
       base, base + out_size_, stride);
 
-  thrust::inclusive_scan(thrust_gpu::par.on(dev.stream()), iter.begin(),
+  thrust::inclusive_scan(thrust_gpu::par_nosync.on(dev.stream()), iter.begin(),
                          iter.end(), iter.begin(),
                          thrust::plus<thrust::complex<data_t>>());
 
@@ -5699,13 +5474,13 @@ double TensorNetContractor_HipTensor<data_t>::sample_measure_on_primary(
   hipMemcpyAsync(thrust::raw_pointer_cast(dev_rnds.data()), rnds.data(),
                  rnds.size() * sizeof(double), hipMemcpyHostToDevice, dev.stream());
 
-  thrust::lower_bound(thrust_gpu::par.on(dev.stream()), iter.begin(),
+  thrust::lower_bound(thrust_gpu::par_nosync.on(dev.stream()), iter.begin(),
                       iter.end(), dev_rnds.begin(), dev_rnds.end(),
                       dev_samples.begin(), QV::Chunk::complex_less<data_t>());
 
   auto ci = thrust::counting_iterator<uint_t>(0);
   thrust::for_each_n(
-      thrust_gpu::par.on(dev.stream()), ci, rnds.size(),
+      thrust_gpu::par_nosync.on(dev.stream()), ci, rnds.size(),
       sampling_update_rnd_func_hip<data_t>(
           base, stride,
           (uint_t *)thrust::raw_pointer_cast(dev_samples.data()),

@@ -1128,6 +1128,8 @@ public:
     thrust::complex<data_t> *out =
         thrust::raw_pointer_cast(dev_out_.data()) +
         (size_t)(slot > 0 ? slot : 0) * (out_stride_ ? out_stride_ : num_elements);
+    // aer-0135: plain `par` deliberate -- once per slice, not per kernel.
+    // See accumulate_planar_to_output below for the full rationale.
     AccumulatePlanarFunctor<data_t> fn(out, re, im);
     thrust::for_each_n(
         thrust_gpu::par.on(stream(slot)),
@@ -1142,6 +1144,10 @@ public:
     // thrust::plus are NOT used: this translation unit carries no explicit
     // thrust algorithm includes, so only the algorithms it already exercises
     // are known available here.
+    // aer-0135: plain `par` deliberate. This runs once per CALL, not per
+    // kernel, folds at most slots-1 buffers, and ends in its own explicit
+    // stream sync below because the caller reads the result. See
+    // accumulate_planar_to_output for the full rationale on the split.
     thrust::complex<data_t> *base = thrust::raw_pointer_cast(dev_out_.data());
     for (int s = 1; s < slots; s++) {
       SlotReduceFunctor<data_t> fn(base, base + (size_t)s * num_elements);
@@ -1164,6 +1170,18 @@ public:
     thrust::complex<data_t> *out =
         thrust::raw_pointer_cast(dev_out_.data());
 
+    // aer-0135: plain `par` HERE IS DELIBERATE, and must stay. The contractor
+    // moved every per-kernel launch to par_nosync because rocThrust's `par`
+    // synchronizes the host after each algorithm (parallel_for.h:146) and the
+    // pack path pays that ~549k times per rank. This call is different: it
+    // runs ONCE PER SLICE, so its sync costs ~32 round-trips on a p=8 rank
+    // (microseconds against a 100 s contraction) and buys two things worth
+    // more than that. It bounds the launch queue to roughly one slice of
+    // kernels instead of letting the host enqueue every slice at once, and it
+    // gives the slice loop a natural drain point. Converting it to par_nosync
+    // is not a completion of aer-0135; it is a separate change that must be
+    // argued and measured on its own. checks/syncorder.py enforces the split:
+    // per-kernel launches must be nosync, these must not.
     AccumulatePlanarFunctor<data_t> fn(out, re, im);
     thrust::for_each_n(
         thrust_gpu::par.on(stream_),
@@ -1190,6 +1208,9 @@ public:
     auto *base = (thrust::complex<data_t> *)thrust::raw_pointer_cast(dev_out_.data());
     QV::Chunk::strided_range<thrust::complex<data_t> *> iter(
         base, base + dev_out_.size(), stride);
+    // aer-0135: a value-returning reduce blocks for its result under ANY
+    // policy, so the choice is immaterial here; left as `par` to keep the
+    // terminal-read sites uniform.
     thrust::complex<data_t> ret = thrust::reduce(
         thrust_gpu::par.on(stream_), iter.begin(), iter.end());
     return ret.real();
