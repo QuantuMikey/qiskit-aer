@@ -1161,6 +1161,20 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   double prof_gemm_only_ms_ = 0.0;
   uint64_t prof_gemm_calls_ = 0;
   uint64_t prof_ht_calls_ = 0;
+  // aer-0132: the VOLUME the pack region moves, beside the time it takes.
+  // prof_pack_ms_ has priced the region since aer-0112 but has no denominator,
+  // and a time without a denominator cannot be compared to a hardware limit --
+  // so "pack is 98% of enqueue" has never distinguished slow kernels from
+  // irreducible traffic. These two make the region a rate.
+  //
+  // UNIT: complex-element READ-AND-WRITE TOUCHES. Each call site states its own
+  // read+write multiplicity rather than the report applying a global factor,
+  // so a kernel with a different ratio (e.g. the accumulate=true scatter, which
+  // is read-modify-write) can be added without silently invalidating anything.
+  // Bytes are therefore exactly prof_pack_rw_elems_ * elem_bytes -- no hidden
+  // constant between the counter and the printed figure.
+  uint64_t prof_pack_rw_elems_ = 0;
+  uint64_t prof_pack_calls_ = 0;
 
   // Split-complex plane pointers for one tensor: re/im are independent
   // because slice projection advances both planes by the slice's element
@@ -1770,6 +1784,8 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_gemm_ms_ = 0.0;
     prof_pack_ms_ = 0.0;
     prof_gemm_only_ms_ = 0.0;
+    prof_pack_rw_elems_ = 0;
+    prof_pack_calls_ = 0;
     prof_gemm_calls_ = 0;
     prof_ht_calls_ = 0;
     prof_reduce_gpu_ms_ = 0.0;
@@ -3960,6 +3976,41 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
       (contract_s > 0.0) ? (local_flops / contract_s / 1.0e9) : 0.0;
   const double t_total = prof_setup_ms_ + prof_contract_ms_ +
                          prof_reduce_gpu_ms_ + prof_reduce_mpi_ms_;
+  // aer-0132: the pack region as a RATE. Bytes are the counted read-and-write
+  // touches times the complex element width -- the whole conversion, with no
+  // factor applied here that is not visible at the call sites.
+  //
+  // pack_gbps_enqueue is named for its denominator: prof_pack_ms_ is ENQUEUE,
+  // not execution. It is a usable proxy for one measured reason -- job 21545804
+  // put the region at 558.8 us per dispatch against a 9.25 us hipBLAS dispatch
+  // floor on equally asynchronous launches, and the only available reading of a
+  // 60x gap is the host blocking on a saturated launch queue. If that stops
+  // holding, the rate reads LOW, never high: a low figure still demands an
+  // explanation, a high one cannot be an artefact of this substitution.
+  const double pack_bytes =
+      static_cast<double>(prof_pack_rw_elems_) *
+      static_cast<double>(2 * sizeof(data_t));
+  const double pack_gbps =
+      (prof_pack_ms_ > 0.0) ? pack_bytes / (prof_pack_ms_ / 1000.0) / 1.0e9
+                            : 0.0;
+  // aer-0132: drift detector. Time and volume are written together at one
+  // site, so nonzero pack time with zero counted volume has exactly two
+  // possible causes, and the message names both rather than guessing: (1) no
+  // pack/scatter/copy kernel ran in any routed-step window -- reachable on the
+  // AER_TN_GEMM_COMPLEX=0 arm when every step is a classic accept, where the
+  // charged time is branch overhead, not kernel enqueue (the complex arm
+  // cannot produce this: its C store always tallies); or (2) a kernel was
+  // later added inside the window without a tally line, which would silently
+  // deflate the rate -- the one failure mode this counter must not have.
+  // Either way the rate is not meaningful, so say so.
+  if (prof_pack_ms_ > 0.0 && prof_pack_rw_elems_ == 0)
+    fprintf(stderr,
+            "[AER_TN_PROFILE] note: pack region charged %.3f ms with zero "
+            "counted volume -- either no pack kernel ran in any routed-step "
+            "window (all-classic-accept run on the AER_TN_GEMM_COMPLEX=0 "
+            "arm; the time is branch overhead) or a kernel is missing its "
+            "aer-0132 tally; pack_gbps_enqueue=0.0 is not meaningful\n",
+            prof_pack_ms_);
   fprintf(stderr,
           "[AER_TN_PROFILE] entry=%s rank=%d nprocs=%d ndev=%d slices=%lu "
           "slices_local=%lu plan_flops=%.3e local_flops=%.3e "
@@ -3969,7 +4020,9 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           "gemm_route=%d t_gemm_ms=%.3f gemm_calls=%lu ht_calls=%lu "
           "t_specs_ms=%.3f t_prebuild_ms=%.3f t_pool_ms=%.3f "
           "graph_replays=%lu graph_captures=%lu "
-          "t_pack_ms=%.3f t_gemm_only_ms=%.3f\n",
+          "t_pack_ms=%.3f t_gemm_only_ms=%.3f "
+          "pack_rw_elems=%lu pack_calls=%lu pack_bytes=%.3e "
+          "pack_gbps_enqueue=%.1f\n",
           entrypoint, myrank_, nprocs_, num_devices_used_,
           (unsigned long)plan_.num_slices, (unsigned long)slices_local,
           plan_.total_flops, local_flops, prof_setup_ms_, prof_path_ms_,
@@ -3985,7 +4038,9 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           prof_specs_ms_, prof_prebuild_ms_, prof_pool_ms_,
           (unsigned long)prof_graph_replays_,
           (unsigned long)prof_graph_captures_,
-          prof_pack_ms_, prof_gemm_only_ms_);
+          prof_pack_ms_, prof_gemm_only_ms_,
+          (unsigned long)prof_pack_rw_elems_, (unsigned long)prof_pack_calls_,
+          pack_bytes, pack_gbps);
 
   if (AER::TensorNetwork::log_times()) {
     // aer-0110: emit the run.* phases in the aer-0109 vocabulary, sharing its
@@ -4493,6 +4548,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   // pack + gemm_only == t_gemm_ms invariant.
   const double snap_pack_ms = prof_pack_ms_;
   const double snap_gemm_only_ms = prof_gemm_only_ms_;
+  // aer-0132: the volume counters accumulate in the same double-executed body
+  // as prof_pack_ms_ and must share its fate, or a captured visit inflates the
+  // volume while the time is restored and the derived rate reads high by the
+  // capture ratio.
+  const uint64_t snap_pack_rw_elems = prof_pack_rw_elems_;
+  const uint64_t snap_pack_calls = prof_pack_calls_;
   const uint64_t snap_gemm_calls = prof_gemm_calls_;
   const uint64_t snap_ht_calls = prof_ht_calls_;
   hipGraph_t graph = nullptr;
@@ -4508,6 +4569,8 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     prof_gemm_ms_ = snap_gemm_ms;
     prof_pack_ms_ = snap_pack_ms;
     prof_gemm_only_ms_ = snap_gemm_only_ms;
+    prof_pack_rw_elems_ = snap_pack_rw_elems;
+    prof_pack_calls_ = snap_pack_calls;
     prof_gemm_calls_ = snap_gemm_calls;
     prof_ht_calls_ = snap_ht_calls;
     err = hipStreamEndCapture(dev.stream(stream_slot), &graph);
@@ -4669,6 +4732,18 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
       std::chrono::steady_clock::time_point prof_g0, prof_g1, prof_g2;
       if (tn_profile())
         prof_g0 = std::chrono::steady_clock::now();
+      // aer-0132: per-step pack tally, folded into the members at the single
+      // accumulation point at the end of this window -- the same place, and the
+      // same tn_profile() guard, that prof_pack_ms_ and prof_gemm_calls_ use.
+      // Kept as plain locals so the branch bodies below add one unguarded
+      // integer line each instead of a guarded block each.
+      //
+      // The 2 * factor is the read-and-write touch count: every kernel counted
+      // here reads one element and writes one. It is written at each site, not
+      // applied globally in the report, so a future kernel with a different
+      // ratio states its own and nothing downstream needs to change.
+      uint64_t step_pack_rw = 0;
+      uint64_t step_pack_calls = 0;
       // aer-0052: a permuted step packs its operands into scratch first (the
       // same stage_pack the WS-3 tile staging uses -- the permutation IS a
       // strided view: destination-order extents with the source's column-major
@@ -4709,12 +4784,18 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         if (ps.gemm_perm_a) {
           stage_pack<data_t>(dev.stream(stream_slot), g_a_re, g_a_im, pbase + 0 * pe,
                              pbase + 1 * pe, ps.perm_ext_a, ps.perm_str_a);
+          // aer-0132: the AER_TN_GEMM_COMPLEX=0 arm is counted too, so the
+          // four-GEMM A/B stays measurable rather than reporting zero volume.
+          step_pack_rw += 2 * stage_block_elems(ps.perm_ext_a);
+          step_pack_calls++;
           g_a_re = pbase + 0 * pe;
           g_a_im = pbase + 1 * pe;
         }
         if (ps.gemm_perm_b) {
           stage_pack<data_t>(dev.stream(stream_slot), g_b_re, g_b_im, pbase + 2 * pe,
                              pbase + 3 * pe, ps.perm_ext_b, ps.perm_str_b);
+          step_pack_rw += 2 * stage_block_elems(ps.perm_ext_b);
+          step_pack_calls++;
           g_b_re = pbase + 2 * pe;
           g_b_im = pbase + 3 * pe;
         }
@@ -4751,24 +4832,35 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         // repacking it with identity strides and reading that copy, and the
         // GEMM's A/B inputs are read-only so no pool aliasing is introduced.
         if (all_planes[left].il && ps.perm_ext_a.empty()) {
+          // aer-0132: no kernel enqueued -- the GEMM reads the slot in place --
+          // so this branch tallies nothing, which is how the counter shows the
+          // aer-0115 direct read as volume NOT moved.
           a_in = all_planes[left].re;
         } else if (all_planes[left].il) {
           interleave_repack<data_t>(dev.stream(stream_slot), all_planes[left].re,
                                     zbase + 0 * pe, ps.sidx_a, ps.sn_a);
+          step_pack_rw += 2 * ps.sn_a;
+          step_pack_calls++;
         } else {
           interleave_pack<data_t>(dev.stream(stream_slot), all_planes[left].re,
                                   all_planes[left].im, zbase + 0 * pe,
                                   ps.sidx_a, ps.sn_a);
+          step_pack_rw += 2 * ps.sn_a;
+          step_pack_calls++;
         }
         if (all_planes[right].il && ps.perm_ext_b.empty()) {
           b_in = all_planes[right].re;
         } else if (all_planes[right].il) {
           interleave_repack<data_t>(dev.stream(stream_slot), all_planes[right].re,
                                     zbase + 2 * pe, ps.sidx_b, ps.sn_b);
+          step_pack_rw += 2 * ps.sn_b;
+          step_pack_calls++;
         } else {
           interleave_pack<data_t>(dev.stream(stream_slot), all_planes[right].re,
                                   all_planes[right].im, zbase + 2 * pe,
                                   ps.sidx_b, ps.sn_b);
+          step_pack_rw += 2 * ps.sn_b;
+          step_pack_calls++;
         }
         if (tn_profile()) prof_g1 = std::chrono::steady_clock::now();
         dev.execute_contraction_gemm_complex(
@@ -4799,6 +4891,8 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                          all_planes[result_idx].im,
                                          ps.sidx_c, ps.sn_c);
           }
+          step_pack_rw += 2 * ps.sn_c;
+          step_pack_calls++;
         } else if (il_store) {
           // Non-corder: the GEMM result is already in declared (C) order, so
           // the interleaved slot is a straight copy of the interleaved result
@@ -4813,6 +4907,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                        sizeof(data_t),
                                    hipMemcpyDeviceToDevice, dev.stream(stream_slot)),
                     "hipMemcpyAsync(C interleaved store)", dev.device_id());
+          // aer-0132: not a pack kernel, but the same read-and-write traffic
+          // over the same volume inside the window prof_pack_ms_ charges;
+          // omitting it would make the rate read high on exactly the steps
+          // aer-0116 optimised.
+          step_pack_rw += 2 * static_cast<uint64_t>(c_nat);
+          step_pack_calls++;
         } else {
           // aer-0114 (§6 note): ps.lin_ext/lin_str are {c_nat} and {1}, computed
           // once per step at classification instead of allocated per dispatch.
@@ -4820,6 +4920,8 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                        all_planes[result_idx].re,
                                        all_planes[result_idx].im,
                                        ps.sidx_c, ps.sn_c);
+          step_pack_rw += 2 * ps.sn_c;
+          step_pack_calls++;
         }
         if (il_store) {
           all_planes[result_idx].il = true;
@@ -4864,6 +4966,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         prof_gemm_only_ms_ += gemm_only;
         prof_pack_ms_ += whole - gemm_only;
         prof_gemm_calls_++;
+        // aer-0132: the volume counterparts of the two lines above, folded in
+        // here so time and volume are written in one place and cannot diverge.
+        prof_pack_rw_elems_ += step_pack_rw;
+        prof_pack_calls_ += step_pack_calls;
       }
 
     }

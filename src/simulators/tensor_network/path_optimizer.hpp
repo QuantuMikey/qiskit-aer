@@ -3341,6 +3341,32 @@ _aer_register_mtkahypar()
               (unsigned long long)tree_num_slices(tree),
               (long long)(tree.attr("N").cast<int64_t>() - 1),
               (size_t)py::len(tree.attr("sliced_inds")));
+      // aer-0132: the plan's intermediate write volume, which contract_stats
+      // already computes and this function has discarded since aer-0094
+      // (cotengra 0.7.5 core.py:1047 accumulates it, :1054 returns it
+      // multiplicity-scaled; the aer-0101 streaming replacement returns the
+      // identical value). total_flops prices the GEMMs, which are 1.9% of
+      // contraction; this prices the movement, which is the rest.
+      //
+      // A LOWER BOUND on pack traffic, not an estimate: it counts each interior
+      // node's output once, where a routed step also reads both operands
+      // through the pack. The measured figure is pack_rw_elems on the profile
+      // line; this is the forge-time predictor of it, available with no GPU.
+      //
+      // Its own line and its own guard, deliberately: "plan cost:" is a
+      // documented grep target and a gate input, so this can neither break a
+      // parser that has not heard of it nor take the cost line down with it.
+      try {
+        const double lw = py_log2(st["write"]).cast<double>();
+        const double welems = std::exp2(lw);
+        fprintf(stderr,
+                "[AER_TN_PATH] plan write: total_write_elements=%.3e (2^%.1f) "
+                "bytes=%.3e at %llu B/element (lower bound on pack traffic)\n",
+                welems, lw, welems * (double)element_size_bytes_,
+                (unsigned long long)element_size_bytes_);
+      } catch (py::error_already_set &we) {
+        we.discard_as_unraisable("AER_TN_PATH plan write report");
+      }
     }
 
     return extract_plan(tree, std::set<int32_t>(network.output_modes.begin(),
