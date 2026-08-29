@@ -730,10 +730,16 @@ struct StageIdx {
   // `run` consecutive SOURCE elements. run == 1 means the very first mode is
   // already out of natural order and every element needs its own address.
   //
-  // This is what makes a vectorised pack legal rather than merely plausible:
-  // with VEC <= run and run a multiple of VEC (guaranteed here, since these
-  // networks have extent-2 modes throughout, so run is a power of two), one
-  // address computation covers VEC contiguous elements.
+  // THE CONDITION IS DIVISIBILITY, NOT MAGNITUDE, and getting that wrong is a
+  // silent wrong-answer bug rather than a crash. A thread group starts at
+  // g*VEC and spans VEC elements; it stays inside ONE run-block only when VEC
+  // divides run. With run == 6 and VEC == 4, group 1 covers destination
+  // elements 4..7, whose true offsets are 4, 5, h(1)+0, h(1)+1 -- not four
+  // consecutive addresses. So the kernels test `run % VEC == 0`, which also
+  // subsumes run < VEC since run >= 1 always. These networks carry extent-2
+  // modes throughout, so run is a power of two and the test is satisfied
+  // whenever run >= VEC; the general form is what keeps the kernels correct on
+  // a network where extents are not all powers of two.
   int64_t run;
   void fill(const std::vector<int64_t> &extents,
             const std::vector<int64_t> &strides) {
@@ -819,35 +825,7 @@ template <typename data_t> struct deinterleave_scatter_func_hip {
   }
 };
 
-template <typename data_t>
-static void interleave_pack(hipStream_t stream, const data_t *src_re,
-                            const data_t *src_im, data_t *dst,
-                            const std::vector<int64_t> &extents,
-                            const std::vector<int64_t> &strides) {
-  const uint64_t n = stage_block_elems(extents);
-  interleave_pack_func_hip<data_t> f;
-  f.idx.fill(extents, strides);
-  f.src_re = src_re;
-  f.src_im = src_im;
-  f.dst = dst;
-  auto ci = thrust::counting_iterator<uint_t>(0);
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
-}
 
-template <typename data_t>
-static void deinterleave_scatter(hipStream_t stream, const data_t *src,
-                                 data_t *dst_re, data_t *dst_im,
-                                 const std::vector<int64_t> &extents,
-                                 const std::vector<int64_t> &strides) {
-  const uint64_t n = stage_block_elems(extents);
-  deinterleave_scatter_func_hip<data_t> f;
-  f.idx.fill(extents, strides);
-  f.src = src;
-  f.dst_re = dst_re;
-  f.dst_im = dst_im;
-  auto ci = thrust::counting_iterator<uint_t>(0);
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
-}
 
 // aer-0114: interleaved-SOURCE twin of interleave_pack. Reads an interleaved
 // complex source through (extents, strides) and writes interleaved. The index
@@ -869,18 +847,6 @@ template <typename data_t> struct interleave_repack_func_hip {
   }
 };
 
-template <typename data_t>
-static void interleave_repack(hipStream_t stream, const data_t *src,
-                              data_t *dst, const std::vector<int64_t> &extents,
-                              const std::vector<int64_t> &strides) {
-  const uint64_t n = stage_block_elems(extents);
-  interleave_repack_func_hip<data_t> f;
-  f.idx.fill(extents, strides);
-  f.src = src;
-  f.dst = dst;
-  auto ci = thrust::counting_iterator<uint_t>(0);
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
-}
 
 // aer-0114: interleaved-DESTINATION twin of deinterleave_scatter. Places an
 // interleaved GEMM result into an interleaved slot through the SAME corder
@@ -898,19 +864,6 @@ template <typename data_t> struct interleaved_scatter_func_hip {
   }
 };
 
-template <typename data_t>
-static void interleaved_scatter(hipStream_t stream, const data_t *src,
-                                data_t *dst,
-                                const std::vector<int64_t> &extents,
-                                const std::vector<int64_t> &strides) {
-  const uint64_t n = stage_block_elems(extents);
-  interleaved_scatter_func_hip<data_t> f;
-  f.idx.fill(extents, strides);
-  f.src = src;
-  f.dst = dst;
-  auto ci = thrust::counting_iterator<uint_t>(0);
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
-}
 
 
 // aer-0133: the GROUPED forms of the four pack-region kernels. Each thread
@@ -943,7 +896,7 @@ template <typename data_t, int VEC> struct interleave_pack_vec_hip {
   StageIdx idx;
   __host__ __device__ void operator()(const uint_t &g) const {
     const uint_t base = g * static_cast<uint_t>(VEC);
-    if (idx.run >= static_cast<int64_t>(VEC)) {
+    if (idx.run % static_cast<int64_t>(VEC) == 0) {
       const int64_t o = idx.offset(base);
       for (int v = 0; v < VEC; ++v) {
         dst[2 * (base + v)] = src_re[o + v];
@@ -966,7 +919,7 @@ template <typename data_t, int VEC> struct deinterleave_scatter_vec_hip {
   StageIdx idx;
   __host__ __device__ void operator()(const uint_t &g) const {
     const uint_t base = g * static_cast<uint_t>(VEC);
-    if (idx.run >= static_cast<int64_t>(VEC)) {
+    if (idx.run % static_cast<int64_t>(VEC) == 0) {
       const int64_t o = idx.offset(base);
       for (int v = 0; v < VEC; ++v) {
         dst_re[o + v] = src[2 * (base + v)];
@@ -988,7 +941,7 @@ template <typename data_t, int VEC> struct interleave_repack_vec_hip {
   StageIdx idx;
   __host__ __device__ void operator()(const uint_t &g) const {
     const uint_t base = g * static_cast<uint_t>(VEC);
-    if (idx.run >= static_cast<int64_t>(VEC)) {
+    if (idx.run % static_cast<int64_t>(VEC) == 0) {
       const int64_t o = idx.offset(base);
       for (int v = 0; v < VEC; ++v) {
         dst[2 * (base + v)] = src[2 * (o + v)];
@@ -1010,7 +963,7 @@ template <typename data_t, int VEC> struct interleaved_scatter_vec_hip {
   StageIdx idx;
   __host__ __device__ void operator()(const uint_t &g) const {
     const uint_t base = g * static_cast<uint_t>(VEC);
-    if (idx.run >= static_cast<int64_t>(VEC)) {
+    if (idx.run % static_cast<int64_t>(VEC) == 0) {
       const int64_t o = idx.offset(base);
       for (int v = 0; v < VEC; ++v) {
         dst[2 * (o + v)] = src[2 * (base + v)];
@@ -1171,6 +1124,53 @@ static void interleaved_scatter(hipStream_t stream, const data_t *src, data_t *d
     f.idx = idx; f.src = src; f.dst = dst;
     thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
   }
+}
+
+// aer-0133: the extents-based entry points now DELEGATE to the
+// prebuilt-index launchers above rather than carrying a second copy of
+// each launch. Before this patch the two families were independent
+// implementations that happened to agree; vectorising one and not the
+// other would have left the same call, spelled two ways, doing different
+// work. They are defined AFTER their targets so ordinary declaration
+// order suffices and no forward declarations are needed.
+template <typename data_t>
+static void interleave_pack(hipStream_t stream, const data_t *src_re,
+                            const data_t *src_im, data_t *dst,
+                            const std::vector<int64_t> &extents,
+                            const std::vector<int64_t> &strides) {
+  StageIdx idx;
+  idx.fill(extents, strides);
+  interleave_pack<data_t>(stream, src_re, src_im, dst, idx,
+                          stage_block_elems(extents));
+}
+template <typename data_t>
+static void deinterleave_scatter(hipStream_t stream, const data_t *src,
+                                 data_t *dst_re, data_t *dst_im,
+                                 const std::vector<int64_t> &extents,
+                                 const std::vector<int64_t> &strides) {
+  StageIdx idx;
+  idx.fill(extents, strides);
+  deinterleave_scatter<data_t>(stream, src, dst_re, dst_im, idx,
+                               stage_block_elems(extents));
+}
+template <typename data_t>
+static void interleave_repack(hipStream_t stream, const data_t *src,
+                              data_t *dst, const std::vector<int64_t> &extents,
+                              const std::vector<int64_t> &strides) {
+  StageIdx idx;
+  idx.fill(extents, strides);
+  interleave_repack<data_t>(stream, src, dst, idx,
+                            stage_block_elems(extents));
+}
+template <typename data_t>
+static void interleaved_scatter(hipStream_t stream, const data_t *src,
+                                data_t *dst,
+                                const std::vector<int64_t> &extents,
+                                const std::vector<int64_t> &strides) {
+  StageIdx idx;
+  idx.fill(extents, strides);
+  interleaved_scatter<data_t>(stream, src, dst, idx,
+                              stage_block_elems(extents));
 }
 
 // Pack a strided parent operand (both split-complex planes) into packed
@@ -1664,6 +1664,9 @@ private:
   // nprocs_ > 1); maybe_write_plan_file is rank-0-only and collective-free.
   bool try_load_plan_file(bool engaged);
   void maybe_write_plan_file(bool engaged);
+  // aer-0134: log-only census of how much of the plan is slice-invariant.
+  // Rank-0-only and collective-free, like maybe_write_plan_file above.
+  void report_slice_invariance();
   void contract_all();
   double sample_measure_on_primary(reg_t &samples, std::vector<double> &rnds,
                                    uint_t num_qubits);
@@ -2054,6 +2057,12 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_pack_store_elems_ = 0;
     prof_pack_operand_ms_ = 0.0;
     prof_pack_store_ms_ = 0.0;
+    // aer-0133: the run histogram resets with every other profile counter.
+    // Without this, a process running several contractions (or a setup retry
+    // after output-bound corruption, aer-0025) accumulates distributions from
+    // DIFFERENT plans into one line, and the histogram silently stops
+    // describing the plan whose profile line it prints beside.
+    std::memset(pack_run_hist(), 0, 8 * sizeof(uint64_t));
     prof_gemm_calls_ = 0;
     prof_ht_calls_ = 0;
     prof_reduce_gpu_ms_ = 0.0;
@@ -2694,8 +2703,126 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
             plan_.steps.size(), (unsigned long)plan_.num_slices,
             plan_.total_flops, num_devices_used_);
 
+  if (plan_valid_)
+    report_slice_invariance();
+
   if (tn_profile())
     prof_setup_ms_ += tn_ms_since(prof_setup_t0);
+}
+
+// aer-0134: how much of this plan is SLICE-INVARIANT, and what hoisting it
+// would cost.
+//
+// The engine replays all steps for every slice. A step whose subtree contains
+// no sliced mode produces the SAME tensor in every slice, so it is recomputed
+// slices_local times for one distinct result. This function measures how much
+// of the plan that is. It computes nothing the engine uses and changes no
+// behaviour -- it exists so the decision to implement hoisting is made on this
+// network's real numbers instead of an estimate.
+//
+// THE CRITERION, and why it is exact. Slice projection touches only tensors
+// carrying a sliced mode. So if no input tensor beneath a step carries one,
+// every input beneath it is the identical array in every slice, and therefore
+// so is its output. The converse also holds and matters: a sliced mode fully
+// SUMMED inside the subtree still makes the step slice-dependent, because the
+// sum over that mode is exactly what slicing splits. So the test is
+// membership over the whole subtree, not over the step's own legs. Verified
+// numerically off-target on a random network: every node classified invariant
+// was bit-identical across all slices, and every node classified dependent
+// actually differed.
+//
+// THE FOOTPRINT is the go/no-go number. Hoisted results must stay resident
+// across the whole slice loop, outside the per-slice pool that today reuses
+// storage by liveness. The frontier -- invariant steps consumed by a
+// slice-dependent parent -- is what would have to persist. Reported beside
+// the per-slice peak so the two are comparable at a glance: if the frontier
+// is several times the peak, hoisting does not fit a GCD and the idea is
+// dead however large the arithmetic saving looks.
+template <typename data_t>
+void TensorNetContractor_HipTensor<data_t>::report_slice_invariance() {
+  if (myrank_ != 0 || !tn_profile())
+    return;
+  const size_t num_inputs = sliced_input_specs_.size();
+  const size_t num_steps = plan_.steps.size();
+  if (num_steps == 0 || all_specs_.size() < num_inputs + num_steps)
+    return;
+  std::set<int32_t> sliced;
+  for (size_t s = 0; s < plan_.sliced.size(); s++)
+    sliced.insert(plan_.sliced[s].mode);
+  if (sliced.empty()) {
+    fprintf(stderr, "[AER_TN_INVARIANT] plan has no sliced modes; every step "
+                    "runs once already\n");
+    return;
+  }
+  // touched[i] is true when a sliced mode appears anywhere beneath tensor i.
+  // Inputs are leaves; steps inherit from both children. plan_.steps is in
+  // execution order, so one forward pass suffices.
+  std::vector<char> touched(num_inputs + num_steps, 0);
+  for (size_t i = 0; i < num_inputs; i++) {
+    const std::vector<int32_t> &m = sliced_input_specs_[i].modes;
+    for (size_t k = 0; k < m.size(); k++)
+      if (sliced.count(m[k])) {
+        touched[i] = 1;
+        break;
+      }
+  }
+  for (size_t st = 0; st < num_steps; st++) {
+    const size_t res = num_inputs + st;
+    touched[res] = (touched[plan_.steps[st].left] ||
+                    touched[plan_.steps[st].right]) ? 1 : 0;
+  }
+  // A step is consumed by at most the steps that name it; walk once more to
+  // find invariant steps whose consumer is slice-dependent (the frontier).
+  std::vector<char> feeds_dependent(num_inputs + num_steps, 0);
+  for (size_t st = 0; st < num_steps; st++) {
+    const size_t res = num_inputs + st;
+    if (touched[res]) {
+      if (!touched[plan_.steps[st].left])
+        feeds_dependent[plan_.steps[st].left] = 1;
+      if (!touched[plan_.steps[st].right])
+        feeds_dependent[plan_.steps[st].right] = 1;
+    }
+  }
+  // The final step's result leaves the plan, so an invariant final result is
+  // also frontier.
+  if (!touched[num_inputs + num_steps - 1])
+    feeds_dependent[num_inputs + num_steps - 1] = 1;
+
+  uint64_t inv_steps = 0;
+  double inv_write = 0.0, tot_write = 0.0, frontier = 0.0;
+  for (size_t st = 0; st < num_steps; st++) {
+    const size_t res = num_inputs + st;
+    const double sz = static_cast<double>(all_specs_[res].num_elements());
+    tot_write += sz;
+    if (!touched[res]) {
+      inv_steps++;
+      inv_write += sz;
+      if (feeds_dependent[res])
+        frontier += sz;
+    }
+  }
+  const uint64_t local = (slice_end_ > slice_begin_)
+                             ? (slice_end_ - slice_begin_) : 1;
+  // Realisable saving: an invariant step is computed once instead of once per
+  // LOCAL slice, so the fraction recovered is (local-1)/local of its volume.
+  const double recover = (local > 1) ? (double)(local - 1) / (double)local : 0.0;
+  const double peak = static_cast<double>(plan_.peak_intermediate_elements);
+  const size_t eb = 2 * sizeof(data_t);
+  fprintf(stderr,
+          "[AER_TN_INVARIANT] steps=%zu invariant=%llu (%.1f%%) "
+          "write_elems=%.3e invariant=%.3e (%.1f%%) "
+          "slices_local=%llu recoverable_write=%.3e (%.1f%% of plan) "
+          "hoist_frontier=%.3e elems (%.2f GB) peak=%.3e elems (%.2f GB) "
+          "frontier_over_peak=%.2f\n",
+          num_steps, (unsigned long long)inv_steps,
+          100.0 * (double)inv_steps / (double)num_steps,
+          tot_write, inv_write,
+          (tot_write > 0.0) ? 100.0 * inv_write / tot_write : 0.0,
+          (unsigned long long)local, inv_write * recover,
+          (tot_write > 0.0) ? 100.0 * inv_write * recover / tot_write : 0.0,
+          frontier, frontier * (double)eb / 1e9,
+          peak, peak * (double)eb / 1e9,
+          (peak > 0.0) ? frontier / peak : 0.0);
 }
 
 template <typename data_t>
