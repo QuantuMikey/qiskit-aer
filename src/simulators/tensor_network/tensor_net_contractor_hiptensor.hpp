@@ -715,6 +715,26 @@ struct StageIdx {
   int64_t str[kStageMaxRank];
   int8_t shift[kStageMaxRank];
   bool pow2;
+  // aer-0133: length of the leading CONTIGUOUS RUN, in elements.
+  //
+  // The structural fact this rests on. The walk below decomposes i in mixed
+  // radix over (ext, str). If the first m modes carry exactly the natural
+  // packed strides 1, ext[0], ext[0]*ext[1], ... then writing i = q*run + r
+  // with run = ext[0]*...*ext[m-1] gives
+  //
+  //     offset(q * run + r) == h(q) + r        for every r in [0, run)
+  //
+  // because those m modes contribute precisely the low-order part of i and
+  // the remaining modes contribute a term h(q) that does not depend on r. So
+  // each aligned block of `run` consecutive DESTINATION elements reads from
+  // `run` consecutive SOURCE elements. run == 1 means the very first mode is
+  // already out of natural order and every element needs its own address.
+  //
+  // This is what makes a vectorised pack legal rather than merely plausible:
+  // with VEC <= run and run a multiple of VEC (guaranteed here, since these
+  // networks have extent-2 modes throughout, so run is a power of two), one
+  // address computation covers VEC contiguous elements.
+  int64_t run;
   void fill(const std::vector<int64_t> &extents,
             const std::vector<int64_t> &strides) {
     const int r = static_cast<int>(extents.size());
@@ -732,6 +752,17 @@ struct StageIdx {
         shift[k] = 0;
         pow2 = false;
       }
+    }
+    // aer-0133: measure the run. Walk modes while each stride equals the
+    // running product of the extents before it -- the definition of natural
+    // packed order.
+    run = 1;
+    for (int k = 0; k < rank; ++k) {
+      if (str[k] != run)
+        break;
+      if (ext[k] <= 0)
+        break;
+      run *= ext[k];
     }
   }
   __host__ __device__ int64_t offset(uint_t i) const {
@@ -882,46 +913,264 @@ static void interleaved_scatter(hipStream_t stream, const data_t *src,
 }
 
 
+// aer-0133: the GROUPED forms of the four pack-region kernels. Each thread
+// handles VEC complex elements instead of one. Two independent wins, carried
+// by the same code:
+//
+//   MEMORY-LEVEL PARALLELISM. The scalar kernels run up to kStageMaxRank
+//   dependent integer operations to build ONE address and then issue ONE
+//   load, so a thread holds a single request in flight and the device waits
+//   on address latency. VEC independent addresses give VEC concurrent
+//   requests per thread. This applies whether or not anything is contiguous.
+//
+//   COALESCING. When StageIdx::run >= VEC the VEC addresses are consecutive
+//   (see the run derivation at its declaration), so ONE address computation
+//   covers the group and the accesses fall in one or two cache lines instead
+//   of VEC scattered ones. The test reads a kernel argument that is uniform
+//   across the wavefront, so the branch never diverges.
+//
+// CORRECTNESS. This changes WHICH THREAD MOVES WHICH ELEMENT and nothing
+// else: every element is read from the same source address and written to the
+// same destination address as before, so the destination buffer is
+// bit-identical to the scalar kernels' -- byte for byte, not approximately.
+// There is no floating-point arithmetic anywhere in these kernels to reorder.
+// The launcher picks VEC only when it divides the element count, so no tail
+// case exists.
+template <typename data_t, int VEC> struct interleave_pack_vec_hip {
+  const data_t *src_re;
+  const data_t *src_im;
+  data_t *dst;
+  StageIdx idx;
+  __host__ __device__ void operator()(const uint_t &g) const {
+    const uint_t base = g * static_cast<uint_t>(VEC);
+    if (idx.run >= static_cast<int64_t>(VEC)) {
+      const int64_t o = idx.offset(base);
+      for (int v = 0; v < VEC; ++v) {
+        dst[2 * (base + v)] = src_re[o + v];
+        dst[2 * (base + v) + 1] = src_im[o + v];
+      }
+    } else {
+      for (int v = 0; v < VEC; ++v) {
+        const int64_t o = idx.offset(base + v);
+        dst[2 * (base + v)] = src_re[o];
+        dst[2 * (base + v) + 1] = src_im[o];
+      }
+    }
+  }
+};
+
+template <typename data_t, int VEC> struct deinterleave_scatter_vec_hip {
+  const data_t *src;
+  data_t *dst_re;
+  data_t *dst_im;
+  StageIdx idx;
+  __host__ __device__ void operator()(const uint_t &g) const {
+    const uint_t base = g * static_cast<uint_t>(VEC);
+    if (idx.run >= static_cast<int64_t>(VEC)) {
+      const int64_t o = idx.offset(base);
+      for (int v = 0; v < VEC; ++v) {
+        dst_re[o + v] = src[2 * (base + v)];
+        dst_im[o + v] = src[2 * (base + v) + 1];
+      }
+    } else {
+      for (int v = 0; v < VEC; ++v) {
+        const int64_t o = idx.offset(base + v);
+        dst_re[o] = src[2 * (base + v)];
+        dst_im[o] = src[2 * (base + v) + 1];
+      }
+    }
+  }
+};
+
+template <typename data_t, int VEC> struct interleave_repack_vec_hip {
+  const data_t *src;
+  data_t *dst;
+  StageIdx idx;
+  __host__ __device__ void operator()(const uint_t &g) const {
+    const uint_t base = g * static_cast<uint_t>(VEC);
+    if (idx.run >= static_cast<int64_t>(VEC)) {
+      const int64_t o = idx.offset(base);
+      for (int v = 0; v < VEC; ++v) {
+        dst[2 * (base + v)] = src[2 * (o + v)];
+        dst[2 * (base + v) + 1] = src[2 * (o + v) + 1];
+      }
+    } else {
+      for (int v = 0; v < VEC; ++v) {
+        const int64_t o = idx.offset(base + v);
+        dst[2 * (base + v)] = src[2 * o];
+        dst[2 * (base + v) + 1] = src[2 * o + 1];
+      }
+    }
+  }
+};
+
+template <typename data_t, int VEC> struct interleaved_scatter_vec_hip {
+  const data_t *src;
+  data_t *dst;
+  StageIdx idx;
+  __host__ __device__ void operator()(const uint_t &g) const {
+    const uint_t base = g * static_cast<uint_t>(VEC);
+    if (idx.run >= static_cast<int64_t>(VEC)) {
+      const int64_t o = idx.offset(base);
+      for (int v = 0; v < VEC; ++v) {
+        dst[2 * (o + v)] = src[2 * (base + v)];
+        dst[2 * (o + v) + 1] = src[2 * (base + v) + 1];
+      }
+    } else {
+      for (int v = 0; v < VEC; ++v) {
+        const int64_t o = idx.offset(base + v);
+        dst[2 * o] = src[2 * (base + v)];
+        dst[2 * o + 1] = src[2 * (base + v) + 1];
+      }
+    }
+  }
+};
+
+// aer-0133: the widest group a thread may take. Four complex elements is 64 B
+// on the contiguous side -- one cache line -- past which widening stops buying
+// transactions and starts costing occupancy and registers. Raising it is a
+// measured ladder against pack_gbps_enqueue, not a guess, so it is a named
+// constant rather than a literal.
+static const int kPackVecMax = 4;
+
+// aer-0133: AER_TN_PACK_VEC overrides the group width (1 restores the exact
+// pre-0133 scalar kernels for an A/B without a rebuild; the default is
+// kPackVecMax). The kernels are bit-identical at every width, so this lever
+// changes throughput only -- it is a measurement knob, not an accuracy one,
+// and that is why it may default ON.
+static int tn_pack_vec() {
+  static bool checked = false;
+  static int cached = kPackVecMax;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_PACK_VEC");
+    if (v != nullptr && v[0] != '\0') {
+      const long got = std::strtol(v, nullptr, 10);
+      if (got == 1 || got == 2 || got == 4)
+        cached = static_cast<int>(got);
+      else
+        fprintf(stderr,
+                "[AER_TN] warning: AER_TN_PACK_VEC='%s' is not 1, 2 or 4; "
+                "using %d\n",
+                v, cached);
+    }
+    checked = true;
+  }
+  return cached;
+}
+
+// aer-0133: VEC must divide the element count exactly so the kernels need no
+// tail branch. These networks carry extent-2 modes throughout, so n is a power
+// of two and this lands on the requested width; the divisibility test is what
+// keeps the kernels correct on a network where it is not.
+static int pack_vec_width(uint64_t n) {
+  int v = tn_pack_vec();
+  while (v > 1 && (n % static_cast<uint64_t>(v)) != 0)
+    v /= 2;
+  return v;
+}
+
+// aer-0133: shape census for the pack region, filled by the launchers below.
+// Bucket b holds the element count whose leading contiguous run was in
+// [2^b, 2^(b+1)); bucket 0 is run == 1, the fully scattered case. This is the
+// distribution that says whether the vectorised path is reaching most of the
+// volume or almost none of it, which is what decides whether further kernel
+// work (LDS tiling) is worth attempting after this patch is measured.
+// Process-local, written only under tn_profile().
+inline uint64_t *pack_run_hist() {
+  static uint64_t h[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  return h;
+}
+inline void pack_note_run(int64_t run, uint64_t n) {
+  int b = 0;
+  while (b < 7 && (int64_t{1} << (b + 1)) <= run)
+    ++b;
+  pack_run_hist()[b] += n;
+}
+
 // aer-0115: prebuilt-index overloads. No fill, no element-count loop -- the
 // launch does nothing but copy the functor and enqueue.
+// aer-0133: each now selects the grouped kernel. VEC is a compile-time
+// parameter, so the three instantiations are separate kernels and the group
+// loop unrolls; VEC == 1 dispatches the original scalar functor unchanged, so
+// AER_TN_PACK_VEC=1 is exactly the pre-0133 code path.
 template <typename data_t>
 static void interleave_pack(hipStream_t stream, const data_t *src_re, const data_t *src_im, data_t *dst,
                             const StageIdx &idx, uint64_t n) {
-  interleave_pack_func_hip<data_t> f;
-  f.idx = idx;
-  f.src_re = src_re; f.src_im = src_im; f.dst = dst;
   auto ci = thrust::counting_iterator<uint_t>(0);
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  const int vec = pack_vec_width(n);
+  if (vec == 4) {
+    interleave_pack_vec_hip<data_t, 4> f;
+    f.idx = idx; f.src_re = src_re; f.src_im = src_im; f.dst = dst;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 4, f);
+  } else if (vec == 2) {
+    interleave_pack_vec_hip<data_t, 2> f;
+    f.idx = idx; f.src_re = src_re; f.src_im = src_im; f.dst = dst;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 2, f);
+  } else {
+    interleave_pack_func_hip<data_t> f;
+    f.idx = idx; f.src_re = src_re; f.src_im = src_im; f.dst = dst;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  }
 }
 
 template <typename data_t>
 static void deinterleave_scatter(hipStream_t stream, const data_t *src, data_t *dst_re, data_t *dst_im,
                             const StageIdx &idx, uint64_t n) {
-  deinterleave_scatter_func_hip<data_t> f;
-  f.idx = idx;
-  f.src = src; f.dst_re = dst_re; f.dst_im = dst_im;
   auto ci = thrust::counting_iterator<uint_t>(0);
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  const int vec = pack_vec_width(n);
+  if (vec == 4) {
+    deinterleave_scatter_vec_hip<data_t, 4> f;
+    f.idx = idx; f.src = src; f.dst_re = dst_re; f.dst_im = dst_im;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 4, f);
+  } else if (vec == 2) {
+    deinterleave_scatter_vec_hip<data_t, 2> f;
+    f.idx = idx; f.src = src; f.dst_re = dst_re; f.dst_im = dst_im;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 2, f);
+  } else {
+    deinterleave_scatter_func_hip<data_t> f;
+    f.idx = idx; f.src = src; f.dst_re = dst_re; f.dst_im = dst_im;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  }
 }
 
 template <typename data_t>
 static void interleave_repack(hipStream_t stream, const data_t *src, data_t *dst,
                             const StageIdx &idx, uint64_t n) {
-  interleave_repack_func_hip<data_t> f;
-  f.idx = idx;
-  f.src = src; f.dst = dst;
   auto ci = thrust::counting_iterator<uint_t>(0);
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  const int vec = pack_vec_width(n);
+  if (vec == 4) {
+    interleave_repack_vec_hip<data_t, 4> f;
+    f.idx = idx; f.src = src; f.dst = dst;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 4, f);
+  } else if (vec == 2) {
+    interleave_repack_vec_hip<data_t, 2> f;
+    f.idx = idx; f.src = src; f.dst = dst;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 2, f);
+  } else {
+    interleave_repack_func_hip<data_t> f;
+    f.idx = idx; f.src = src; f.dst = dst;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  }
 }
 
 template <typename data_t>
 static void interleaved_scatter(hipStream_t stream, const data_t *src, data_t *dst,
                             const StageIdx &idx, uint64_t n) {
-  interleaved_scatter_func_hip<data_t> f;
-  f.idx = idx;
-  f.src = src; f.dst = dst;
   auto ci = thrust::counting_iterator<uint_t>(0);
-  thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  const int vec = pack_vec_width(n);
+  if (vec == 4) {
+    interleaved_scatter_vec_hip<data_t, 4> f;
+    f.idx = idx; f.src = src; f.dst = dst;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 4, f);
+  } else if (vec == 2) {
+    interleaved_scatter_vec_hip<data_t, 2> f;
+    f.idx = idx; f.src = src; f.dst = dst;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n / 2, f);
+  } else {
+    interleaved_scatter_func_hip<data_t> f;
+    f.idx = idx; f.src = src; f.dst = dst;
+    thrust::for_each_n(thrust_gpu::par.on(stream), ci, n, f);
+  }
 }
 
 // Pack a strided parent operand (both split-complex planes) into packed
@@ -1175,6 +1424,21 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // constant between the counter and the printed figure.
   uint64_t prof_pack_rw_elems_ = 0;
   uint64_t prof_pack_calls_ = 0;
+  // aer-0133: the same volume split by ROLE -- operand gathers (A and B)
+  // versus result stores (C). The two are not symmetric on hardware even at
+  // equal volume: a gather reads scattered and writes contiguous, while
+  // deinterleave_scatter writes 8 scattered bytes per element, a PARTIAL
+  // cache line, which forces a read-modify-write of the whole line. If the
+  // store side turns out to cost materially more per byte, the next patch is
+  // to stop storing split-complex at all (extending aer-0114's interleaved
+  // store to the final output slot), not to sharpen the gather further. That
+  // is a different patch, and this counter is what chooses between them.
+  // t_pack_ms remains the whole region, so operand + store here sum to
+  // prof_pack_rw_elems_ exactly.
+  uint64_t prof_pack_operand_elems_ = 0;
+  uint64_t prof_pack_store_elems_ = 0;
+  double prof_pack_operand_ms_ = 0.0;
+  double prof_pack_store_ms_ = 0.0;
 
   // Split-complex plane pointers for one tensor: re/im are independent
   // because slice projection advances both planes by the slice's element
@@ -1786,6 +2050,10 @@ void TensorNetContractor_HipTensor<data_t>::setup_contraction(
     prof_gemm_only_ms_ = 0.0;
     prof_pack_rw_elems_ = 0;
     prof_pack_calls_ = 0;
+    prof_pack_operand_elems_ = 0;
+    prof_pack_store_elems_ = 0;
+    prof_pack_operand_ms_ = 0.0;
+    prof_pack_store_ms_ = 0.0;
     prof_gemm_calls_ = 0;
     prof_ht_calls_ = 0;
     prof_reduce_gpu_ms_ = 0.0;
@@ -3348,6 +3616,18 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
       sp.sidx_c.fill(sp.gemm_scatter_c ? sp.scat_ext : sp.lin_ext,
                      sp.gemm_scatter_c ? sp.scat_str : sp.lin_str);
       sp.sn_c = stage_block_elems(sp.gemm_scatter_c ? sp.scat_ext : sp.lin_ext);
+      // aer-0133: census the run distribution here, where the shapes are
+      // final and the cost is one classification-time bucket increment per
+      // role -- not per dispatch. Weighted by elements, not by step count,
+      // because the question is what fraction of the VOLUME the vectorised
+      // path reaches. Counted once per plan step; the slice loop multiplies
+      // every step by the local slice count, so read the histogram as a
+      // distribution, not as a total.
+      if (tn_profile()) {
+        pack_note_run(sp.sidx_a.run, sp.sn_a);
+        pack_note_run(sp.sidx_b.run, sp.sn_b);
+        pack_note_run(sp.sidx_c.run, sp.sn_c);
+      }
     }
 
     if (tn_debug()) {
@@ -3993,6 +4273,41 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
   const double pack_gbps =
       (prof_pack_ms_ > 0.0) ? pack_bytes / (prof_pack_ms_ / 1000.0) / 1.0e9
                             : 0.0;
+  // aer-0133: the same rate for each half of the region. A gather reads
+  // scattered and writes contiguous; a split-complex store writes scattered
+  // 8-byte words, i.e. partial cache lines, which the hardware must
+  // read-modify-write. If store_gbps sits well below operand_gbps at
+  // comparable volume, that asymmetry is real and the next patch is to stop
+  // storing split-complex, not to sharpen the gather further.
+  const double pack_operand_bytes =
+      static_cast<double>(prof_pack_operand_elems_) *
+      static_cast<double>(2 * sizeof(data_t));
+  const double pack_store_bytes =
+      static_cast<double>(prof_pack_store_elems_) *
+      static_cast<double>(2 * sizeof(data_t));
+  const double pack_operand_gbps =
+      (prof_pack_operand_ms_ > 0.0)
+          ? pack_operand_bytes / (prof_pack_operand_ms_ / 1000.0) / 1.0e9
+          : 0.0;
+  const double pack_store_gbps =
+      (prof_pack_store_ms_ > 0.0)
+          ? pack_store_bytes / (prof_pack_store_ms_ / 1000.0) / 1.0e9
+          : 0.0;
+  // aer-0133: the contiguous-run distribution, as element counts per bucket
+  // b = floor(log2(run)), bucket 0 being run == 1 (nothing contiguous). This
+  // says whether the vectorised path reaches most of the volume; if bucket 0
+  // dominates, the remaining win needs LDS tiling rather than wider groups.
+  std::string run_hist;
+  {
+    std::ostringstream rh;
+    const uint64_t *h = pack_run_hist();
+    for (int b = 0; b < 8; ++b) {
+      if (b)
+        rh << ',';
+      rh << h[b];
+    }
+    run_hist = rh.str();
+  }
   // aer-0132: drift detector. Time and volume are written together at one
   // site, so nonzero pack time with zero counted volume has exactly two
   // possible causes, and the message names both rather than guessing: (1) no
@@ -4022,7 +4337,9 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           "graph_replays=%lu graph_captures=%lu "
           "t_pack_ms=%.3f t_gemm_only_ms=%.3f "
           "pack_rw_elems=%lu pack_calls=%lu pack_bytes=%.3e "
-          "pack_gbps_enqueue=%.1f\n",
+          "pack_gbps_enqueue=%.1f pack_vec=%d "
+          "pack_operand_gbps=%.1f pack_store_gbps=%.1f "
+          "pack_run_hist=%s\n",
           entrypoint, myrank_, nprocs_, num_devices_used_,
           (unsigned long)plan_.num_slices, (unsigned long)slices_local,
           plan_.total_flops, local_flops, prof_setup_ms_, prof_path_ms_,
@@ -4040,7 +4357,8 @@ void TensorNetContractor_HipTensor<data_t>::prof_report(
           (unsigned long)prof_graph_captures_,
           prof_pack_ms_, prof_gemm_only_ms_,
           (unsigned long)prof_pack_rw_elems_, (unsigned long)prof_pack_calls_,
-          pack_bytes, pack_gbps);
+          pack_bytes, pack_gbps, tn_pack_vec(),
+          pack_operand_gbps, pack_store_gbps, run_hist.c_str());
 
   if (AER::TensorNetwork::log_times()) {
     // aer-0110: emit the run.* phases in the aer-0109 vocabulary, sharing its
@@ -4554,6 +4872,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
   // capture ratio.
   const uint64_t snap_pack_rw_elems = prof_pack_rw_elems_;
   const uint64_t snap_pack_calls = prof_pack_calls_;
+  const uint64_t snap_pack_operand_elems = prof_pack_operand_elems_;
+  const uint64_t snap_pack_store_elems = prof_pack_store_elems_;
+  const double snap_pack_operand_ms = prof_pack_operand_ms_;
+  const double snap_pack_store_ms = prof_pack_store_ms_;
   const uint64_t snap_gemm_calls = prof_gemm_calls_;
   const uint64_t snap_ht_calls = prof_ht_calls_;
   hipGraph_t graph = nullptr;
@@ -4571,6 +4893,10 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice(
     prof_gemm_only_ms_ = snap_gemm_only_ms;
     prof_pack_rw_elems_ = snap_pack_rw_elems;
     prof_pack_calls_ = snap_pack_calls;
+    prof_pack_operand_elems_ = snap_pack_operand_elems;
+    prof_pack_store_elems_ = snap_pack_store_elems;
+    prof_pack_operand_ms_ = snap_pack_operand_ms;
+    prof_pack_store_ms_ = snap_pack_store_ms;
     prof_gemm_calls_ = snap_gemm_calls;
     prof_ht_calls_ = snap_ht_calls;
     err = hipStreamEndCapture(dev.stream(stream_slot), &graph);
@@ -4744,6 +5070,14 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
       // ratio states its own and nothing downstream needs to change.
       uint64_t step_pack_rw = 0;
       uint64_t step_pack_calls = 0;
+      // aer-0133: the same tally split by role, plus one extra stamp taken
+      // where the operand gathers end and the GEMM begins. Operand time is
+      // [g0, g1) and store time is [g2, end), which is exactly how aer-0112
+      // already partitions the window -- this only names the two halves it
+      // was lumping together. Three extra chrono reads per routed step, ~25 ns
+      // each, ~30 ms over a 100 s p=8 replay: 0.03%, and profile-gated.
+      uint64_t step_pack_operand = 0;
+      uint64_t step_pack_store = 0;
       // aer-0052: a permuted step packs its operands into scratch first (the
       // same stage_pack the WS-3 tile staging uses -- the permutation IS a
       // strided view: destination-order extents with the source's column-major
@@ -4787,6 +5121,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           // aer-0132: the AER_TN_GEMM_COMPLEX=0 arm is counted too, so the
           // four-GEMM A/B stays measurable rather than reporting zero volume.
           step_pack_rw += 2 * stage_block_elems(ps.perm_ext_a);
+          step_pack_operand += 2 * stage_block_elems(ps.perm_ext_a);
           step_pack_calls++;
           g_a_re = pbase + 0 * pe;
           g_a_im = pbase + 1 * pe;
@@ -4795,6 +5130,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           stage_pack<data_t>(dev.stream(stream_slot), g_b_re, g_b_im, pbase + 2 * pe,
                              pbase + 3 * pe, ps.perm_ext_b, ps.perm_str_b);
           step_pack_rw += 2 * stage_block_elems(ps.perm_ext_b);
+          step_pack_operand += 2 * stage_block_elems(ps.perm_ext_b);
           step_pack_calls++;
           g_b_re = pbase + 2 * pe;
           g_b_im = pbase + 3 * pe;
@@ -4840,12 +5176,14 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           interleave_repack<data_t>(dev.stream(stream_slot), all_planes[left].re,
                                     zbase + 0 * pe, ps.sidx_a, ps.sn_a);
           step_pack_rw += 2 * ps.sn_a;
+          step_pack_operand += 2 * ps.sn_a;
           step_pack_calls++;
         } else {
           interleave_pack<data_t>(dev.stream(stream_slot), all_planes[left].re,
                                   all_planes[left].im, zbase + 0 * pe,
                                   ps.sidx_a, ps.sn_a);
           step_pack_rw += 2 * ps.sn_a;
+          step_pack_operand += 2 * ps.sn_a;
           step_pack_calls++;
         }
         if (all_planes[right].il && ps.perm_ext_b.empty()) {
@@ -4854,12 +5192,14 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           interleave_repack<data_t>(dev.stream(stream_slot), all_planes[right].re,
                                     zbase + 2 * pe, ps.sidx_b, ps.sn_b);
           step_pack_rw += 2 * ps.sn_b;
+          step_pack_operand += 2 * ps.sn_b;
           step_pack_calls++;
         } else {
           interleave_pack<data_t>(dev.stream(stream_slot), all_planes[right].re,
                                   all_planes[right].im, zbase + 2 * pe,
                                   ps.sidx_b, ps.sn_b);
           step_pack_rw += 2 * ps.sn_b;
+          step_pack_operand += 2 * ps.sn_b;
           step_pack_calls++;
         }
         if (tn_profile()) prof_g1 = std::chrono::steady_clock::now();
@@ -4892,6 +5232,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                          ps.sidx_c, ps.sn_c);
           }
           step_pack_rw += 2 * ps.sn_c;
+          step_pack_store += 2 * ps.sn_c;
           step_pack_calls++;
         } else if (il_store) {
           // Non-corder: the GEMM result is already in declared (C) order, so
@@ -4912,6 +5253,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
           // omitting it would make the rate read high on exactly the steps
           // aer-0116 optimised.
           step_pack_rw += 2 * static_cast<uint64_t>(c_nat);
+          step_pack_store += 2 * static_cast<uint64_t>(c_nat);
           step_pack_calls++;
         } else {
           // aer-0114 (§6 note): ps.lin_ext/lin_str are {c_nat} and {1}, computed
@@ -4921,6 +5263,7 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                        all_planes[result_idx].im,
                                        ps.sidx_c, ps.sn_c);
           step_pack_rw += 2 * ps.sn_c;
+          step_pack_store += 2 * ps.sn_c;
           step_pack_calls++;
         }
         if (il_store) {
@@ -4970,6 +5313,12 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
         // here so time and volume are written in one place and cannot diverge.
         prof_pack_rw_elems_ += step_pack_rw;
         prof_pack_calls_ += step_pack_calls;
+        // aer-0133: [g0,g1) is operand staging, [g2,end) is the result store.
+        // Same window, same guard, so the two sum to prof_pack_ms_ exactly.
+        prof_pack_operand_elems_ += step_pack_operand;
+        prof_pack_store_elems_ += step_pack_store;
+        prof_pack_operand_ms_ += tn_ms_between(prof_g0, prof_g1);
+        prof_pack_store_ms_ += whole - tn_ms_between(prof_g0, prof_g2);
       }
 
     }
