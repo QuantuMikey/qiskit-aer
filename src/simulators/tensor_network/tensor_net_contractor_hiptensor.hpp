@@ -1154,10 +1154,12 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   // slot skips invariant steps: frontier results (invariant results a
   // slice-dependent step consumes, plus an invariant final) get their planes
   // restored from the pool slot the first slice wrote -- which
-  // setup_pool_and_cache pinned by extending the slot's lifetime to the last
-  // step, so plan_layout's find_offset (lifetime-overlap test,
-  // gpu_resource_manager.hpp:375) can never hand that storage to anyone
-  // else -- and non-frontier invariant results, whose only consumers are
+  // setup_pool_and_cache pinned to lifetime [0, num_steps-1] (aer-0138:
+  // BOTH ends; see the extension site for the one-directional trap the
+  // first shipped version fell into), so plan_layout's find_offset
+  // (gpu_resource_manager.hpp:375) can never hand that storage to anyone
+  // else in either time direction -- and non-frontier invariant results,
+  // whose only consumers are
   // themselves skipped, keep null planes so any erroneous read faults
   // loudly (the aer-0116 null-im discipline).
   bool hoist_engaged_ = false;
@@ -3757,16 +3759,28 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     int birth = static_cast<int>(step);
     int death = last_used[result_idx];
     if (death < 0) death = static_cast<int>(num_steps - 1);
-    // aer-0137: a frontier result must survive every later step of every
-    // later slice -- its producing step is skipped after the first slice on
-    // a slot, and its consumers are slice-dependent steps that re-run each
-    // slice. Extending the lifetime to the final step makes find_offset's
-    // lifetime-overlap test refuse to place ANY other allocation over this
-    // storage, so the first slice's bytes are still there when slice N reads
-    // them. Costs exactly the frontier footprint the census reports
-    // (reference ~3.2 GB, winner ~12.9 GB beside a ~4.3 GB peak).
-    if (hoist_engaged_ && hoist_frontier_[step])
+    // aer-0137/0138: a frontier result must survive every later step of
+    // every later slice -- its producing step is skipped after the first
+    // slice on a slot, and its consumers are slice-dependent steps that
+    // re-run each slice. The pin must be BIDIRECTIONAL: death alone
+    // (aer-0137 as first shipped) only blocks allocations born after the
+    // frontier step, while find_offset's lifetime test still let slots
+    // that die BEFORE the frontier step's birth share its storage --
+    // legitimate reuse within one slice, fatal across slices, because
+    // every later slice re-executes those early variant steps and writes
+    // over the hoisted bytes before the frontier's consumers read them.
+    // Field proof: job 21623475 (ZZ -0.000168, wall at the predicted
+    // hoisted 0.636x -- skips ran, data was clobbered); offline layout
+    // replication on the winner plan counts 2767 spatial overlaps under
+    // the death-only rule and ZERO with birth pinned to 0. Lifetime
+    // [0, num_steps-1] conflicts with every allocation, so the frontier
+    // slot's storage is exclusive in both directions. Costs the layout
+    // sharing the old rule wrongly permitted: winner pool 20.67 ->
+    // 25.77 GB (replicated layout), against 64 GB per GCD.
+    if (hoist_engaged_ && hoist_frontier_[step]) {
+      birth = 0;
       death = static_cast<int>(num_steps - 1);
+    }
 
     intermediates.push_back(
         std::make_tuple(bytes, birth, death, static_cast<int>(result_idx)));
