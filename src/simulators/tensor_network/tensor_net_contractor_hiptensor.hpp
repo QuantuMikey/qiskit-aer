@@ -151,6 +151,21 @@ static bool tn_hip_graph() {
   return cached;
 }
 
+// aer-0137: slice-invariant step hoisting (E). Default ON; "0" disables for
+// A/B. The measured ceilings this deletes (rocprof_step_attrib on jobs
+// 21620412/21620413): 10.1% of device time on the reference plan
+// (slices_local=32), 32.8% on the winner plan (slices_local=8).
+static bool tn_hoist() {
+  static bool checked = false;
+  static bool cached = true;
+  if (!checked) {
+    const char *v = std::getenv("AER_TN_HOIST");
+    cached = !(v != nullptr && v[0] == '0' && v[1] == '\0');
+    checked = true;
+  }
+  return cached;
+}
+
 static bool tn_profile() {
   static bool checked = false;
   static bool enabled = false;
@@ -1130,6 +1145,26 @@ class TensorNetContractor_HipTensor : public TensorNetContractor<data_t> {
   std::vector<TensorSpec> all_specs_;
   std::set<int32_t> sliced_mode_set_;
   bool pool_ready_;
+  // aer-0137: slice-invariant step hoisting (E). Classified once per plan in
+  // setup_pool_and_cache with the same touched/feeds_dependent propagation as
+  // report_slice_invariance (:2544, cross-referenced there). The FIRST slice a
+  // (device, stream slot) executes is the hoist pass: it runs every step
+  // unchanged, and hoist_il_ records each invariant result's storage layout
+  // (interleaved vs split) exactly as executed. Every later slice on that
+  // slot skips invariant steps: frontier results (invariant results a
+  // slice-dependent step consumes, plus an invariant final) get their planes
+  // restored from the pool slot the first slice wrote -- which
+  // setup_pool_and_cache pinned by extending the slot's lifetime to the last
+  // step, so plan_layout's find_offset (lifetime-overlap test,
+  // gpu_resource_manager.hpp:375) can never hand that storage to anyone
+  // else -- and non-frontier invariant results, whose only consumers are
+  // themselves skipped, keep null planes so any erroneous read faults
+  // loudly (the aer-0116 null-im discipline).
+  bool hoist_engaged_ = false;
+  std::vector<char> hoist_step_invariant_;
+  std::vector<char> hoist_frontier_;
+  std::vector<char> hoist_il_;
+  std::vector<char> hoist_done_;
   // aer-0040: how the GEMM route classified every step of the last plan. Reset
   // in setup_pool_and_cache, printed by prof_report and by the verbose setup
   // line, and the reason no separate job is needed to count how often a step's
@@ -3575,6 +3610,73 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
   if (num_steps > 0)
     last_used[num_inputs + num_steps - 1] = static_cast<int>(num_steps - 1);
 
+  // aer-0137: classify slice invariance for hoisting. Mirrors
+  // report_slice_invariance (:2544) line for line -- leaves touched iff a
+  // sliced mode appears in the FULL pre-projection mode list
+  // (network_desc_.tensors, the aer-0135 lesson), steps inherit from either
+  // child, frontier = invariant results a touched step consumes plus an
+  // invariant final. Kept as a second copy of ~25 straight-line propagation
+  // lines rather than a shared helper so the field-validated census function
+  // stays byte-untouched; both sites cross-reference each other.
+  hoist_engaged_ = false;
+  hoist_step_invariant_.assign(num_steps, 0);
+  hoist_frontier_.assign(num_steps, 0);
+  hoist_il_.assign(num_steps, 0);
+  if (tn_hoist() && !plan_.sliced.empty() && num_steps > 0) {
+    std::set<int32_t> sliced;
+    for (size_t s = 0; s < plan_.sliced.size(); s++)
+      sliced.insert(plan_.sliced[s].mode);
+    std::vector<char> touched(num_total, 0);
+    for (size_t i = 0; i < num_inputs; i++) {
+      const std::vector<int32_t> &m = network_desc_.tensors[i].modes;
+      for (size_t k = 0; k < m.size(); k++)
+        if (sliced.count(m[k])) {
+          touched[i] = 1;
+          break;
+        }
+    }
+    for (size_t step = 0; step < num_steps; step++) {
+      const size_t res = num_inputs + step;
+      touched[res] = (touched[plan_.steps[step].left] ||
+                      touched[plan_.steps[step].right]) ? 1 : 0;
+      hoist_step_invariant_[step] = touched[res] ? 0 : 1;
+    }
+    uint64_t inv_n = 0, frontier_n = 0;
+    double frontier_elems = 0.0;
+    for (size_t step = 0; step < num_steps; step++) {
+      const size_t res = num_inputs + step;
+      if (touched[res]) {
+        const uint64_t l = plan_.steps[step].left;
+        const uint64_t r = plan_.steps[step].right;
+        if (l >= num_inputs && !touched[l])
+          hoist_frontier_[l - num_inputs] = 1;
+        if (r >= num_inputs && !touched[r])
+          hoist_frontier_[r - num_inputs] = 1;
+      } else {
+        inv_n++;
+      }
+    }
+    if (!touched[num_inputs + num_steps - 1])
+      hoist_frontier_[num_steps - 1] = 1;
+    for (size_t step = 0; step < num_steps; step++)
+      if (hoist_frontier_[step]) {
+        frontier_n++;
+        frontier_elems +=
+            static_cast<double>(all_specs_[num_inputs + step].num_elements());
+      }
+    // Engage only when something is actually invariant; a fully variant plan
+    // takes the unhoisted path bit for bit.
+    hoist_engaged_ = (inv_n > 0);
+    if (hoist_engaged_ && myrank_ == 0)
+      fprintf(stderr,
+              "[AER_TN_HOIST] engaged: invariant=%llu/%zu frontier=%llu "
+              "pinned=%.2f GB (computed once per stream slot, skipped on "
+              "every later slice; AER_TN_HOIST=0 disables)\n",
+              (unsigned long long)inv_n, num_steps,
+              (unsigned long long)frontier_n,
+              frontier_elems * 2.0 * sizeof(data_t) / 1e9);
+  }
+
   for (size_t step = 0; step < num_steps; step++) {
     // Use the padded per-step descriptor shape, not the raw all_specs_
     // (which for inputs may differ from what this specific plan needs).
@@ -3655,6 +3757,16 @@ void TensorNetContractor_HipTensor<data_t>::setup_pool_and_cache(int device_idx,
     int birth = static_cast<int>(step);
     int death = last_used[result_idx];
     if (death < 0) death = static_cast<int>(num_steps - 1);
+    // aer-0137: a frontier result must survive every later step of every
+    // later slice -- its producing step is skipped after the first slice on
+    // a slot, and its consumers are slice-dependent steps that re-run each
+    // slice. Extending the lifetime to the final step makes find_offset's
+    // lifetime-overlap test refuse to place ANY other allocation over this
+    // storage, so the first slice's bytes are still there when slice N reads
+    // them. Costs exactly the frontier footprint the census reports
+    // (reference ~3.2 GB, winner ~12.9 GB beside a ~4.3 GB peak).
+    if (hoist_engaged_ && hoist_frontier_[step])
+      death = static_cast<int>(num_steps - 1);
 
     intermediates.push_back(
         std::make_tuple(bytes, birth, death, static_cast<int>(result_idx)));
@@ -4602,6 +4714,11 @@ void TensorNetContractor_HipTensor<data_t>::contract_all() {
   // slice's true cost including its share of buffer setup on this call.
   const std::chrono::steady_clock::time_point gate_t0 =
       std::chrono::steady_clock::now();
+  // aer-0137: hoisted results are a property of THIS call's input values;
+  // a new contract_all (new instruction, new gate angles) must re-execute
+  // the invariant steps once. Reset here, not in setup: the plan and pool
+  // survive across instructions (aer-0027/0070) but the values do not.
+  hoist_done_.assign((size_t)num_devices_used_ * kMaxStreamSlots, 0);
   // aer-0118: multi-stream slice overlap (§6 item 5). nslots == 1 is the
   // pre-0119 path exactly: one stream, one pool region, one output region,
   // sequential slices, byte-identical output. Above 1, each slot owns a
@@ -4915,6 +5032,36 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
     uint64_t left = plan_.steps[step].left;
     uint64_t right = plan_.steps[step].right;
     size_t result_idx = num_inputs + step;
+
+    // aer-0137: after this slot's first slice has executed the plan once,
+    // every slice-invariant step is a re-computation of bytes that are
+    // still sitting in this slot's pool region (frontier lifetimes pinned
+    // in setup_pool_and_cache). Restore the plane pointers and move on --
+    // no memset, no pack, no GEMM. Only frontier results are restored:
+    // a non-frontier invariant result's consumers are themselves skipped,
+    // and leaving its planes null makes any bookkeeping error fault
+    // instead of reading recycled storage. hoist_il_ replays the storage
+    // layout (interleaved vs split) exactly as the first slice chose it.
+    if (hoist_engaged_ && hoist_step_invariant_[step] &&
+        hoist_done_[(size_t)device_idx * kMaxStreamSlots + stream_slot]) {
+      if (hoist_frontier_[step]) {
+        void *slot_ptr =
+            dev.pool().get_tensor_ptr(static_cast<int>(result_idx),
+                                      stream_slot);
+        all_planes[result_idx].re = reinterpret_cast<data_t *>(slot_ptr);
+        if (hoist_il_[step]) {
+          all_planes[result_idx].il = true;
+          all_planes[result_idx].im = nullptr;
+        } else {
+          all_planes[result_idx].il = false;
+          all_planes[result_idx].im = reinterpret_cast<data_t *>(
+              static_cast<char *>(slot_ptr) +
+              plane_bytes(all_specs_[result_idx].num_elements(),
+                          sizeof(data_t)));
+        }
+      }
+      continue;
+    }
 
     // Use the per-step padded descriptor shape we recorded in
     // setup_pool_and_cache. The plan cache is keyed on these same
@@ -5246,7 +5393,22 @@ void TensorNetContractor_HipTensor<data_t>::contract_single_slice_direct(
                                    all_planes[result_idx].im,
                                    all_specs_[result_idx].num_elements(), 32);
     }
+
+    // aer-0137: record the layout this step's result was actually stored in
+    // (set by the complex arm's il_store decision above, false on the planar
+    // arm) so the skip branch can restore identical plane pointers on every
+    // later slice of this slot.
+    if (hoist_engaged_ && hoist_step_invariant_[step])
+      hoist_il_[step] = all_planes[result_idx].il ? 1 : 0;
   }
+
+  // aer-0137: this slot has now executed every step once; every later slice
+  // on it skips the invariant steps. Per (device, slot) because each slot
+  // owns its own pool region (aer-0118) -- a hoisted result in slot 0's
+  // region is invisible to slot 1, which therefore runs its own first slice
+  // in full.
+  if (hoist_engaged_)
+    hoist_done_[(size_t)device_idx * kMaxStreamSlots + stream_slot] = 1;
 
   size_t final_idx = num_inputs + num_steps - 1;
   int64_t final_elements = all_specs_[final_idx].num_elements();
