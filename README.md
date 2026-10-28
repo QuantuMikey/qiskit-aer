@@ -25,20 +25,25 @@ itself: it offloads path search, slicing and contraction to NVIDIA cuQuantum
 of upstream Aer support statevector simulation but have no tensor network
 backend.
 
-This fork was built to run large tensor network simulations on [LUMI](https://www.lumi-supercomputer.eu/),
-whose GPU partition (LUMI-G) uses AMD Instinct MI250X GPUs. It is also
-intended for other AMD-based systems, such as LUMI-AI.
+This fork implements the tensor network method natively for AMD GPUs. It was
+built to run large tensor network simulations on
+[LUMI](https://www.lumi-supercomputer.eu/), whose GPU partition uses AMD
+Instinct MI250X GPUs, and is intended for other AMD-based systems as well. The
+fork itself is controlled entirely by environment variables and has no
+dependence on a particular scheduler or site; the LUMI-specific scripts are
+collected in the [appendix](#appendix-running-on-lumi).
 
 ### What is different from upstream
 
 | Area | Upstream qiskit-aer | This fork |
 |---|---|---|
-| Tensor network on AMD GPUs | Not available | GPU contractor on ROCm: each pairwise contraction runs as one hipBLAS ZGEMM (CGEMM in single precision), with the fork's own kernels handling operand layout |
-| Contraction path search | Done inside cuTensorNet | [cotengra](https://github.com/jcmgray/cotengra) hyper-optimizer, with optional mt-kahypar and cotengrust |
+| Tensor network on AMD GPUs | Not available | Native ROCm contractor: each pairwise contraction runs as one hipBLAS ZGEMM (CGEMM in single precision), with the fork's own kernels handling operand layout |
+| Contraction path search | Done inside cuTensorNet | [cotengra](https://github.com/jcmgray/cotengra) hyper-optimizer, with optional Mt-KaHyPar and cotengrust |
 | Large networks | Slicing handled inside cuTensorNet | Memory-aware slicing, with slices distributed across MPI ranks |
 | Path search under MPI | Handled inside cuTensorNet | Search trials sharded across ranks; best plan (lowest FLOP count after slicing) chosen collectively |
-| Plan reuse | None | Contraction plans saved to disk and replayed in later runs |
+| Plan reuse | None | Contraction plans saved to disk and replayed in later runs, at any number of GPUs |
 | CPU-only path search | n/a | Search on CPU nodes, contraction later on GPU nodes |
+| Slice-invariant hoisting | n/a | Steps that do not depend on the sliced indices are computed once and skipped on every later slice |
 | GPU capability query | n/a | `AerSimulator.gpu_device_count()` and `AerSimulator.tensor_network_gpu_available()` |
 | Statevector on AMD GPUs | 32-bit grid dimension overflow at large qubit counts | Fixed in `ExecuteSum`/`ExecuteSum2` and blocked-gate kernels |
 
@@ -46,45 +51,35 @@ Note: the build flag and macro are still named `AER_ENABLE_HIPTENSOR` /
 `AER_HIPTENSOR` for historical reasons. The contraction backend is hipBLAS;
 hipTensor is no longer linked.
 
-### Split CPU/GPU workflow
+## Requirements
 
-For large networks, the contraction path search can take far longer than the
-contraction itself, and it does not need a GPU. The fork separates the two:
+| Component | Version | Notes |
+|---|---|---|
+| ROCm with hipBLAS | 6.4.2 / hipBLAS 2.4.0 | the only GEMM backend measured |
+| Python | 3.12 | tested with |
+| **cotengra** | **0.7.5, exact** | **Hard pin.** The fork patches cotengra's internals (the search memory cap rebinds module-level objects and import-time preset instances; the forge calls `ContractionTree.from_path(..., ssa_path=...)` as 0.7.5 defines it). Another release needs changes to the fork's source. |
+| cotengrust | 0.2.1 | Rust greedy path search; used outside the memory cap |
+| optuna | 3.6.2 | default `optlib` for the hyper search |
+| cmaes | 0.13.1 | alternative `optlib` |
+| kahypar | 1.3.7 | kahypar-class trial methods in cotengra's default pool |
+| mtkahypar | 1.6.2 | the `mt-kahypar` search method used for the largest networks |
+| mpi4py | 4.0.3 | multi-GPU runs |
+| qiskit | 2.1.2 | tested with |
+| numpy | 2.2.6 | tested with |
 
-1. **Search on CPU nodes.** Run the hyper-optimized path search on CPU-only
-   nodes (for example LUMI-C), one MPI rank with 16 physical cores. The search
-   has two stages: the Mt-KaHyPar partitioning trials, which use all 16
-   threads, and cotengra's slicing/reconfiguration, which is single-threaded
-   Python and takes about half the search time at p = 9. More threads do not
-   help: at 128 threads the partitioning ran 1.6× slower than at 16, and the
-   slicing stage is unchanged. Each search gives a different result, so run it
-   several times with different seeds. Plans are saved, and the best one
-   (lowest FLOP count after slicing) is kept.
-2. **Contract on GPU nodes.** Run the contraction on LUMI-G, replaying the
-   best saved plan instead of searching again.
+For multi-GPU runs, Aer must be linked against a GPU-aware MPI. On a Cray
+system this means Cray MPICH with its GTL library (`libmpi_gtl_hsa.so`); on
+other systems a GPU-aware OpenMPI or MPICH built with ROCm support. Without
+GPU-aware MPI the fork still runs on a single GPU.
 
-The main settings:
+A reference container build (Singularity, Cray MPICH, all packages above) is
+in [QuantuMikey/CSC_QT_simulations_container_builder](https://github.com/QuantuMikey/CSC_QT_simulations_container_builder),
+subdirectory `ccpe-extensions-cray-qiskit-aer-patch-tensor-networks`. It is
+LUMI-specific, but its stage definitions list every build step.
 
-| Variable | Purpose |
-|---|---|
-| `AER_TN_FORGE_ONLY=1` | Run only the path search and save the plan, then exit before any GPU work. Allows `tensor_network` on nodes with no GPU. Pair with `AER_TN_PLAN_FORGE=1`. |
-| `AER_TN_PLAN_DIR` | Directory of saved plans (one per network topology). Keeps the best plan per topology. |
-| `AER_TN_PLAN_FILE` | Single saved plan file (one topology). |
-| `AER_TN_PATH_MAX_REPEATS` | Number of search trials. Under MPI this is the total across all ranks. |
-| `AER_TN_PATH_METHODS` | Restrict cotengra's search methods (e.g. `greedy`, `mt-kahypar`). |
-| `AER_TN_MTKAHYPAR_THREADS` | Threads for Mt-KaHyPar trials. 16 is the measured sweet spot on LUMI-C. |
-| `AER_TN_SLICE_TARGET_BYTES` | Per-slice memory target; lower values slice more aggressively. On a 64 GB MI250X GCD, 8 GiB (`8589934592`) is the measured safe value: the device pool is a liveness layout of all intermediates, about 3× the per-slice peak, so a plan whose peak actually reaches a 16 GiB target does not fit. |
-| `AER_TN_MIN_SLICES_PER_RANK` | Minimum slices per MPI rank, so every rank gets work. |
-| `AER_TN_HOIST` | Slice-invariant hoisting: steps that do not depend on the sliced indices are computed once and skipped on every later slice. On by default; set `0` when the pinned frontier does not fit device memory (required at p = 9, see below). |
+## Building
 
-Further tuning and diagnostic variables (`AER_TN_*`) are documented in
-comments in `src/simulators/tensor_network/path_optimizer.hpp`.
-
-### Building
-
-Requires ROCm with hipBLAS, a C++17 compiler, and `cotengra>=0.7.0` installed
-in the build's Python environment. Enable the tensor network backend in a
-ROCm build with:
+Enable the tensor network backend in a ROCm build with:
 
 ```bash
 export AER_ENABLE_HIPTENSOR=1
@@ -92,9 +87,7 @@ export AER_ENABLE_HIPTENSOR=1
 
 Then follow the ROCm build instructions in the
 [contributing guide](CONTRIBUTING.md). The build stops with an error if
-cotengra or hipBLAS is not found.
-
-Usage is the same as upstream:
+cotengra or hipBLAS is not found. Usage is the same as upstream:
 
 ```python
 from qiskit_aer import AerSimulator
@@ -102,31 +95,170 @@ from qiskit_aer import AerSimulator
 sim = AerSimulator(method="tensor_network", device="GPU")
 ```
 
-### Example: QAOA at p = 9 on LUMI
+Small circuits need nothing else. The rest of this section is about networks
+too large for one GPU.
 
-This example reproduces one row of Table I of
-[arXiv:2107.00677](https://arxiv.org/abs/2107.00677): fixed-angle QAOA for
-MaxCut at depth p on the depth-p tree subgraph of a 3-regular graph. At p = 9
-the circuit has 2046 qubits. The quantity computed is ⟨Z₀Z₁⟩ on the root edge,
-from which the cut fraction is C_p = (1 − ⟨Z₀Z₁⟩) / 2.
+## How large networks are run
 
-The run has two steps: a CPU-only path search that saves plans, then a GPU
-contraction that replays the best plan. Both steps run the same Python script.
+The pipeline has two halves that run separately:
 
-#### Python script (`tree_row.py`)
+- **The forge** (path search). cotengra searches for a cheap contraction
+  order, the slicer cuts indices until every intermediate fits the per-slice
+  memory target, and the result is saved as a **plan file**: the step list,
+  the sliced indices and the exact FLOP count. The forge needs no GPU and runs
+  on CPU nodes.
+- **The replay** (contraction). Loads a plan file and executes it on the
+  GPUs. Slices are the unit of distribution: each MPI rank takes a contiguous
+  range and the partial results are reduced at the end. The same plan file
+  replays at any number of ranks.
 
+Two facts about memory and threads decide how to size the runs:
+
+- **Device memory.** Before contracting, the fork lays out a pool holding every
+  intermediate of a slice by liveness. That pool is about **3× the per-slice
+  peak**, so the slice target should be about **1/8 of device memory** (8 GiB
+  on a 64 GB GPU). Slice-invariant hoisting pins a further "frontier" of
+  reused results into the pool for the whole run; its size depends on the
+  plan, not on the slice target, and on the largest networks it no longer
+  fits, in which case hoisting is turned off (`AER_TN_HOIST=0`). The
+  `[AER_TN_INVARIANT]` line printed at setup gives both numbers.
+- **Search threads.** The forge has two stages: Mt-KaHyPar partitioning
+  trials, which are multithreaded, and cotengra's slicing/reconfiguration,
+  which is single-threaded Python and takes about half the search time on
+  large networks. More threads plateau early: on 128-core EPYC nodes, 128
+  threads ran the partitioning 1.6× slower than 16. Run several searches with
+  different seeds in parallel instead; plan cost varies by orders of magnitude
+  between seeds, and the best plan is what gets replayed.
+
+### Step 1: forge on a CPU node
+
+One process, 16 physical cores, no GPU. Repeat with different seeds; each run
+saves a plan file named after its seed, slice target and FLOP count, and the
+`captured plan to` line in its log gives the full path.
+
+```bash
+export AER_TN_PLAN_FORGE=1              # serial search that banks a plan
+export AER_TN_FORGE_ONLY=1              # exit before any GPU work
+export AER_TN_PLAN_DIR=$PWD/plans       # where plans are saved
+export AER_TN_FORGE_BUDGET_MB=65226     # free memory of one replay GPU, MB
+export AER_TN_SLICE_TARGET_BYTES=8589934592   # 8 GiB: ~1/8 of a 64 GB GPU
+export AER_TN_MIN_SLICES_PER_RANK=64    # slice floor, so wide replays have work
+export AER_TN_SLICE_RECONF_EVERY=1      # reconfigure the tree after every cut
+export AER_TN_PATH_PRESET=hyper
+export AER_TN_PATH_METHODS=mt-kahypar
+export AER_TN_MTKAHYPAR_THREADS=16
+export AER_TN_PATH_SEED=12142           # change per run
+export AER_TN_PATH_MAX_REPEATS=16       # trials per search
+export AER_TN_PATH_MAX_TIME=14400       # search wall cap, s
+export AER_TN_LOG_TIMES=1               # phase timings in the log
+export AER_TN_PATH_VERBOSE=1            # search and plan-cost lines
+export MALLOC_ARENA_MAX=2
+python3 -u tree_row.py
+```
+
+A forge run ends with the backend raising a tagged error instead of
+contracting; that is the designed exit on a node with no GPU. The log's
+`plan cost:` line reports the plan's total FLOPs and slice count.
+
+### Step 2: probe on one GPU
+
+Before committing a large allocation, replay the plan on **one GPU with a
+short wall limit** (5 minutes). This answers the two questions that decide the
+real run:
+
+- **Does it fit?** The pool is allocated at setup. An out-of-memory here means
+  the plan needs `AER_TN_HOIST=0`, or a smaller slice target at the forge.
+- **How long is one slice?** After the first slice, every rank extrapolates
+  `first-slice time × remaining slices` against the job's remaining wall time
+  (`SLURM_JOB_END_TIME` under SLURM, or `AER_TN_WALL_BUDGET_S`) and aborts
+  with that estimate if it does not fit. On a short wall this refusal is the
+  intended outcome: the message carries the measured per-slice time, which
+  sizes the real run. `AER_TN_WALL_GATE=warn` reports without aborting.
+
+```bash
+export AER_TN_PLAN_FILE=/abs/path/plans/plan_<key>.s12142.t8g.<...>.ctg
+export AER_TN_GPU_PERSIST=1
+export AER_TN_PROFILE=1                 # per-rank contraction timing
+export AER_TN_MEMORY_VERBOSE=1          # pool size before allocation
+export MALLOC_ARENA_MAX=2
+python3 -u tree_row.py
+```
+
+Do not enable GPU-aware MPI flags for a single-process run; some MPI stacks
+abort at init when they are set with one task.
+
+### Step 3: replay at width
+
+Launch one process per GPU with GPU-aware MPI, replaying the same plan file.
+Choose the rank count so that slices divide evenly and
+`slices per rank × per-slice time` fits the wall. Keep `AER_TN_VERBOSE` off:
+at 2048 ranks its per-step lines pushed ~25 million lines through the
+launcher's stdio and stretched setup from 30 seconds to over 7 minutes.
+
+The per-rank contraction time is printed on the `t_contract_ms` line
+(`AER_TN_PROFILE=1`); read the mean across ranks, since the spread is a few
+percent.
+
+### Settings reference
+
+| Variable | Purpose |
+|---|---|
+| `AER_TN_PLAN_FORGE=1` | Serial search per rank that banks a plan into the plan directory |
+| `AER_TN_FORGE_ONLY=1` | Exit after banking the plan, before any GPU work; allows the forge on nodes with no GPU |
+| `AER_TN_PLAN_DIR` | Directory of saved plans, one per network topology; keeps the best plan per topology |
+| `AER_TN_PLAN_FILE` | A single plan file to replay; no search runs |
+| `AER_TN_FORGE_BUDGET_MB` | Free device memory of the GPU the plan will replay on, in MB; required by a forge on a node with no GPU |
+| `AER_TN_SLICE_TARGET_BYTES` | Per-slice memory target; lower values slice more aggressively. About 1/8 of device memory, because the pool is ~3× the per-slice peak |
+| `AER_TN_MIN_SLICES_PER_RANK` | Minimum slices per rank, applied at the forge; set it to the widest replay you will want |
+| `AER_TN_SLICE_RECONF_EVERY` | Reconfigure the contraction tree after every N cuts during slicing (1 recommended for deep networks) |
+| `AER_TN_PATH_MAX_REPEATS` | Number of search trials; under MPI the total across ranks |
+| `AER_TN_PATH_MAX_TIME` | Search wall cap in seconds |
+| `AER_TN_PATH_PRESET` / `AER_TN_PATH_METHODS` | cotengra preset and method list (e.g. `hyper`, `mt-kahypar`) |
+| `AER_TN_MTKAHYPAR_THREADS` | Threads for Mt-KaHyPar trials |
+| `AER_TN_PATH_SEED` | Search seed; different seeds give different plans |
+| `AER_TN_HOIST` | Slice-invariant hoisting; on by default, `0` to disable when the pinned frontier does not fit |
+| `AER_TN_WALL_GATE` | First-slice wall gate: unset/`1` aborts, `warn` reports only, `0` disables |
+| `AER_TN_GPU_PERSIST=1` | Keep device context and pool alive across contractions in one process |
+| `AER_TN_PROFILE`, `AER_TN_LOG_TIMES`, `AER_TN_PATH_VERBOSE`, `AER_TN_MEMORY_VERBOSE` | Diagnostics: per-phase timings, search lines, pool size |
+| `AER_TN_VERBOSE` | Per-step setup logging; keep off for large runs |
+
+Further variables (`AER_TN_*`) are documented in comments in
+`src/simulators/tensor_network/path_optimizer.hpp`.
+
+## Validation: Table I of arXiv:2107.00677, p = 1 to 9
+
+The fork was validated by reproducing Table I of
+[arXiv:2107.00677](https://arxiv.org/abs/2107.00677) (Wurtz and Lykov,
+fixed-angle QAOA for MaxCut on 3-regular graphs). Row p of the table is the
+guaranteed cut fraction on the depth-p tree subgraph, C_p = (1 − ⟨Z₀Z₁⟩) / 2 on
+the root edge, with N = 2^(p+2) − 2 qubits. At p = 9 the circuit has 2046
+qubits. Every row from p = 1 to p = 9 was computed with
+`method="tensor_network"` on MI250X GPUs and compared with the published
+constant.
+
+### The script
+
+The same script runs the forge and the replay; the environment decides which.
 The fixed angles come from
 [danlkv/fixed-angle-QAOA](https://github.com/danlkv/fixed-angle-QAOA)
-(3-regular graphs, key `"3"`), stored as `fixed_angles_3reg.json` in the form
+(3-regular graphs, key `"3"`), stored next to the script as
+`fixed_angles_3reg.json` in the form
 `{"9": {"gamma": [...], "beta": [...], "AR": ...}, ...}`.
 
 ```python
-import json, os, sys
+# tree_row.py
+import json, math, os, sys
 
-# Import qiskit_aer before mpi4py: Aer initializes MPI at import time.
+# Import order matters: qiskit_aer initializes MPI at import time, so it
+# comes first and mpi4py attaches afterwards without initializing.
 from qiskit import QuantumCircuit, transpile
 from qiskit.quantum_info import Pauli
 from qiskit_aer import AerSimulator
+
+import mpi4py
+mpi4py.rc.initialize = False
+mpi4py.rc.finalize = False
+from mpi4py import MPI
 
 
 def tree_graph(p):
@@ -154,34 +286,107 @@ def qaoa_circuit(n, edges, gammas, betas):
     return qc
 
 
+rank = MPI.COMM_WORLD.Get_rank()
 p = int(os.environ["TREE_P"])
-row = json.load(open("fixed_angles_3reg.json"))[str(p)]
+here = os.path.dirname(os.path.abspath(__file__))
+row = json.load(open(os.path.join(here, "fixed_angles_3reg.json")))[str(p)]
 n, edges = tree_graph(p)
 qc = qaoa_circuit(n, edges, row["gamma"], row["beta"])
 qc.save_expectation_value(Pauli("ZZ"), [0, 1], label="zz")
 
 sim = AerSimulator(method="tensor_network", device="GPU")
-sim.set_max_qubits(n)  # default cap is the statevector limit, not meaningful for TN
+sim.set_max_qubits(n)  # the default cap is the statevector limit, meaningless for TN
 result = sim.run(transpile(qc, sim, optimization_level=0), shots=1).result()
 
 # A forge-only run saves its plan and then returns an unsuccessful result
 # by design; it does not contract.
 if os.environ.get("AER_TN_FORGE_ONLY") == "1":
     ok = "plan capture complete at setup" in str(result.status)
-    print("forge OK" if ok else f"forge FAILED: {result.status}")
+    if rank == 0:
+        print("forge OK" if ok else f"forge FAILED: {result.status}")
     sys.exit(0 if ok else 1)
 
-if int(os.environ.get("SLURM_PROCID", 0)) == 0:
+if rank == 0:
     zz = float(result.data(0)["zz"])
     c_p = (1 - zz) / 2
     print(f"p={p} N={n} ZZ={zz:+.15f} C_p={c_p:.15f} "
           f"table={row['AR']:.15f} diff={abs(c_p - row['AR']):.3e}")
 ```
 
-#### Step 1: path search on a CPU node (`forge.sh`)
+### What was run
 
-Submit this several times with different seeds. Each job adds a plan to the
-plan directory; plan file names record the seed, slice target, and FLOP count.
+- **p = 1 to 7**: one forge per depth, replayed on 4 GPUs.
+- **p = 8**: forge, then a seed sweep; the best plan (4.0e14 FLOPs, 64
+  slices) replayed on 8 GPUs with hoisting on.
+- **p = 9**: 32 forges at the 8 GiB slice target (24 distinct seeds, 8 of
+  them repeated with 128 threads as a thread-count comparison) plus 8 at a 12
+  GiB target. Each search took 7–11 minutes. Plan cost varied by a factor of
+  10⁴ across seeds; the best (seed 12142, 1.1e18 FLOPs, 16,384 slices) was
+  probed on one GPU, which showed the pool fits only with `AER_TN_HOIST=0`
+  (28 GiB pool; the 27 GB hoist frontier would exceed the 64 GB GPU), and
+  measured 36–39 s per slice. It was then replayed on 2048 GPUs at 8 slices
+  per rank.
+
+### Results
+
+| p | Qubits | GPUs (MI250X GCDs) | Slices | Run time | GPU-hours | Diff vs. paper |
+|---|---|---|---|---|---|---|
+| 1 | 6 | 4 | 16 | 12 s | 0.01 | 4e-8 |
+| 2 | 14 | 4 | 16 | 11 s | 0.01 | 1e-7 |
+| 3 | 30 | 4 | 16 | 11 s | 0.01 | 3e-7 |
+| 4 | 62 | 4 | 16 | 12 s | 0.01 | 7e-7 |
+| 5 | 126 | 4 | 16 | 12 s | 0.01 | 1e-6 |
+| 6 | 254 | 4 | 128 | 16 s | 0.02 | 3e-6 |
+| 7 | 510 | 4 | 16 | 20 s | 0.02 | 1e-5 |
+| 8 | 1022 | 8 | 64 | 34 s | 0.08 | 2e-5 |
+| 9 | 2046 | 2048 | 16,384 | 325 s | 185 | 5e-5 |
+
+- Each MI250X has two GCDs; each GCD appears to the software as one GPU.
+- "Run time" is the simulator's own timer (transpile, contraction and
+  reductions); container start is excluded. GPU-hours are run time × GPUs.
+  The p = 9 job was billed as 6 min 13 s of wall time on 256 nodes, about 212
+  GPU-hours. The forges are not included; they ran on CPU nodes.
+- "Diff vs. paper" is the absolute difference between the computed C_p and the
+  published value. The published values carry their own optimizer residual,
+  so differences below 1e-4 are a match.
+- For p ≤ 5 and p = 7 the 16 slices are the forge's distribution floor, not a
+  memory requirement; from p = 6 the slice count is set by the memory
+  envelope. For p ≤ 5 the run time is almost entirely fixed per-job overhead.
+- p = 8 ran with hoisting on; p = 9 with hoisting off.
+
+### Status
+
+Experimental. Validated up to p = 9 (2046 qubits) as above. Larger p was not
+attempted: cost grew well over 1000× from p = 8 to p = 9, and the p = 9 run
+was already at the memory limit of a 64 GB GPU.
+
+Related: [Quantum simulations on LUMI with Qiskit Aer](https://fiqci.fi/publications/2025-04-01-LUMI-quantum-simulations-qiskit-aer) (FiQCI blog).
+
+## Appendix: running on LUMI
+
+The exact commands used for the p = 9 row. LUMI uses SLURM, Singularity, Cray
+MPICH and an `/appl`-provided GPU-affinity wrapper; the `SINGULARITYENV_*`
+prefix passes a variable into the container without the prefix.
+
+**Partitions.** The forge ran on `small` (LUMI-C, CPU-only, billed per core).
+The single-GPU probe ran on `small-g` (partial node). The full replay ran on
+`standard-g` (whole nodes, 8 GCDs each, billed as 8 GPU-hours per node-hour).
+
+**`standard-g` shape.** Use `--ntasks` (not `--ntasks-per-node`) and
+`--gpus-per-task=1` (not `--gpus-per-node`); otherwise the GPU-affinity
+wrapper can hide the GPUs from the ranks. Bind one rank per GCD with the
+LUMI CPU mask below. On `small-g`, strip `SLURM_NTASKS_PER_NODE` inside the
+`srun` so the wrapper's device override cannot fire on a partial node.
+
+**GPU-aware MPI.** Set the Cray MPICH GPU flags only when `ntasks > 1`. With
+one task the wrapper aborts at MPI init with "GPU_SUPPORT_ENABLED is
+requested, but GTL library is not linked".
+
+**Container image.** Stripe the image before a many-node run; a 16 GB image at
+stripe count 1 is read by every node from one OST. The LUMI-recommended
+layout is `lfs migrate -E 256M -C 1 -S 4M -E 16G -C 4 -S 4M -E EOF -C 8 -S 4M <image>.sif`.
+
+### `forge.sh`
 
 ```bash
 #!/bin/bash
@@ -195,7 +400,6 @@ SIF=<container>.sif
 PLANS=$PWD/plans
 mkdir -p "$PLANS"
 
-# SINGULARITYENV_* variables are passed into the container without the prefix.
 export SINGULARITYENV_TREE_P="$P"
 export SINGULARITYENV_AER_TN_PLAN_FORGE=1
 export SINGULARITYENV_AER_TN_FORGE_ONLY=1
@@ -203,13 +407,15 @@ export SINGULARITYENV_AER_TN_PLAN_DIR="$PLANS"
 export SINGULARITYENV_AER_TN_MIN_SLICES_PER_RANK=64
 export SINGULARITYENV_AER_TN_FORGE_BUDGET_MB=65226   # free memory of one MI250X GCD
 export SINGULARITYENV_AER_TN_SLICE_RECONF_EVERY=1
+export SINGULARITYENV_AER_TN_LOG_TIMES=1
+export SINGULARITYENV_AER_TN_PATH_VERBOSE=1
 export SINGULARITYENV_MALLOC_ARENA_MAX=2
 
 srun --ntasks=1 singularity exec "$SIF" python3 -u tree_row.py
 ```
 
-Command used for p = 9 (LUMI-C `small` partition, 16 physical cores;
-`--hint=nomultithread` keeps SMT siblings off the allocation):
+Command used for p = 9 (16 physical cores; `--hint=nomultithread` keeps SMT
+siblings off the allocation). Submitted once per seed:
 
 ```bash
 sbatch --partition=small --cpus-per-task=16 --hint=nomultithread \
@@ -224,52 +430,57 @@ SINGULARITYENV_AER_TN_PATH_MAX_REPEATS=16 \
   forge.sh 9
 ```
 
-For p = 9 the search was run 32 times at the 8 GiB slice target (24 distinct
-seeds; 8 of them repeated on `standard` nodes with 128 threads as a
-thread-count comparison), plus 8 times at a 12 GiB target. Searches took 7 to
-10 minutes on 16 cores and 9 to 11 minutes on 128. Plan cost varied by a factor
-of 10⁴ across seeds. Step 2 used the best plan: seed 12142 at 8 GiB
-(1.1e18 FLOPs, 16,384 slices).
-
-#### Step 2: contraction on GPU nodes (`replay.sh`)
-
-The saved plan works at any number of ranks; slices are distributed across
-the ranks.
+### `replay.sh`
 
 ```bash
 #!/bin/bash
 #SBATCH --job-name=replay
 #SBATCH --account=<project>
-#SBATCH --partition=standard-g
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=7
 
 P="$1"
 PLAN="$2"
 SIF=<container>.sif
-WRAP=/appl/local/quantum/qiskit/run-singularity-with-gpu-affinity   # LUMI GPU-affinity wrapper
+WRAP=/appl/local/quantum/qiskit/run-singularity-with-gpu-affinity
 
-# GPU-aware Cray MPICH settings for multi-rank runs. Do NOT set these for a
-# single-rank job: with one task the LUMI wrapper aborts at MPI init with
-# "GPU_SUPPORT_ENABLED is requested, but GTL library is not linked".
-export MPICH_GPU_SUPPORT_ENABLED=1
-export MPICH_GPU_IPC_CACHE_MAX_SIZE=100
-export MPICH_GPU_IPC_THRESHOLD=524288
-export MPICH_OFI_NIC_POLICY=GPU
+if [ "${SLURM_NTASKS:-1}" -gt 1 ]; then
+  export MPICH_GPU_SUPPORT_ENABLED=1
+  export MPICH_GPU_IPC_CACHE_MAX_SIZE=100
+  export MPICH_GPU_IPC_THRESHOLD=524288
+  export MPICH_OFI_NIC_POLICY=GPU
+else
+  export MPICH_GPU_SUPPORT_ENABLED=0
+fi
 
-# One rank per GCD, bound to the CPU cores closest to it
 MASK=mask_cpu:0xfe000000000000,0xfe00000000000000,0xfe0000,0xfe000000,0xfe,0xfe00,0xfe00000000,0xfe0000000000
+if [ "$SLURM_JOB_PARTITION" = "standard-g" ]; then
+  SRUN=(srun --cpu-bind=$MASK)
+else
+  SRUN=(srun --ntasks="$SLURM_NTASKS" env -u SLURM_NTASKS_PER_NODE)
+fi
 
 export SINGULARITYENV_TREE_P="$P"
 export SINGULARITYENV_AER_TN_PLAN_FILE="$PLAN"
 export SINGULARITYENV_AER_TN_GPU_PERSIST=1
+export SINGULARITYENV_AER_TN_PROFILE=1
 export SINGULARITYENV_AER_TN_RG_THREADS=7
 export SINGULARITYENV_MALLOC_ARENA_MAX=2
 
-srun --cpu-bind=$MASK "$WRAP" "$SIF" python3 -u tree_row.py
+"${SRUN[@]}" "$WRAP" "$SIF" python3 -u tree_row.py
 ```
 
-Command used for p = 9 (256 LUMI-G nodes, 2048 GCDs, about 6 minutes wall time):
+Single-GPU probe (5 minutes; ends with the wall gate's measured per-slice
+time, or an out-of-memory if the plan does not fit):
+
+```bash
+sbatch --partition=small-g --ntasks=1 --gpus-per-task=1 --cpus-per-task=7 \
+  --mem=60G --time=00:05:00 \
+  --export=ALL,SINGULARITYENV_AER_TN_HOIST=0,SINGULARITYENV_AER_TN_MEMORY_VERBOSE=1 \
+  replay.sh 9 /abs/path/plans/plan_<key>.s12142.t8g.<...>.ctg
+```
+
+Full replay (256 nodes, 2048 GCDs, 8 slices per rank, about 6 minutes wall):
 
 ```bash
 sbatch --partition=standard-g --nodes=256 --ntasks=2048 \
@@ -278,50 +489,11 @@ sbatch --partition=standard-g --nodes=256 --ntasks=2048 \
   replay.sh 9 /abs/path/plans/plan_<key>.s12142.t8g.<...>.ctg
 ```
 
-`AER_TN_HOIST=0` is required at p = 9: slice-invariant hoisting pins a 27 GB
-frontier into the device pool on top of the 28 GiB the plan already needs,
-which exceeds a 64 GB GCD. At p ≤ 8 hoisting is on by default and fits.
+Result line from that job:
 
-Use `--ntasks` (not `--ntasks-per-node`) and `--gpus-per-task=1` (not
-`--gpus-per-node`) on `standard-g`; otherwise the GPU-affinity wrapper can
-hide the GPUs from the ranks. Keep per-step diagnostic logging (`AER_TN_VERBOSE`)
-off for large runs: at 2048 ranks it pushed ~25 million lines through srun's
-stdio and stretched setup from 30 seconds to over 7 minutes.
-
-#### Results on LUMI-G
-
-| p | Qubits | LUMI-G nodes | GCDs | Slices | Run time | GCD-hours | Diff vs. paper |
-|---|---|---|---|---|---|---|---|
-| 1 | 6 | 1 | 4 | 16 | 12 s | 0.01 | 4e-8 |
-| 2 | 14 | 1 | 4 | 16 | 11 s | 0.01 | 1e-7 |
-| 3 | 30 | 1 | 4 | 16 | 11 s | 0.01 | 3e-7 |
-| 4 | 62 | 1 | 4 | 16 | 12 s | 0.01 | 7e-7 |
-| 5 | 126 | 1 | 4 | 16 | 12 s | 0.01 | 1e-6 |
-| 6 | 254 | 1 | 4 | 128 | 16 s | 0.02 | 3e-6 |
-| 7 | 510 | 1 | 4 | 16 | 20 s | 0.02 | 1e-5 |
-| 8 | 1022 | 1 | 8 | 64 | 34 s | 0.08 | 2e-5 |
-| 9 | 2046 | 256 | 2048 | 16,384 | 325 s | 185 | 5e-5 |
-
-Each AMD MI250X has two GCDs, and each GCD appears to the software as one
-GPU. "Run time" is the simulator's own timer (transpile, contraction and
-reductions); container start is excluded. The p = 9 job was billed as 6:13 of
-wall time on 256 nodes, about 212 GPU-hours. "Diff vs. paper" is the absolute
-difference between the computed C_p and the published value. The published
-values carry their own optimizer residual, so differences below 1e-4 are
-treated as a match. For p ≤ 5 and p = 7 the 16 slices are the forge's
-distribution floor, not a memory requirement; from p = 6 the slice count is set
-by the memory envelope. The p = 9 path search is not included in the
-GCD-hours; it ran on CPU nodes.
-
-### Status
-
-Experimental. Results have been validated by reproducing Table I of
-[arXiv:2107.00677](https://arxiv.org/abs/2107.00677) up to p = 9 (QAOA depth;
-2046 qubits). Larger p was not attempted: cost grew well over 1000× from p = 8
-to p = 9, and the p = 9 run was already at the memory limit of a 64 GB GCD
-(hoisting had to be disabled to fit).
-
-Related: [Quantum simulations on LUMI with Qiskit Aer](https://fiqci.fi/publications/2025-04-01-LUMI-quantum-simulations-qiskit-aer) (FiQCI blog).
+```
+[ROW] p=9 N=2046 ranks=2048 ZZ=-0.746948424903324 C_p=0.873474212451662 C_p_table=0.873521564002300 diff=4.735e-05 t_run_s=324.763 verdict=PASS
+```
 
 ---
 
